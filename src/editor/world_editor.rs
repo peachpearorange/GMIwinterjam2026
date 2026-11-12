@@ -1,6 +1,7 @@
 //! World design: sculpting the terrain, painting ground, placing models and markers.
 
-use {bevy::{ecs::system::SystemParam, prelude::*},
+use {crate::Mode,
+     bevy::{ecs::system::SystemParam, prelude::*},
      bevy_egui::egui,
      std::{f32::consts::TAU, fs},
      winterjam2026::world::{ASSETS_DIR, Ground, MODELS_DIR, Marker, Model, Terrain,
@@ -535,6 +536,7 @@ pub fn plugin(app: &mut App) {
   app.init_resource::<WorldEditor>().add_systems(
     Update,
     (use_tool, draw_markers_and_selection)
-      .run_if(|editor: Res<crate::Editor>| *editor == crate::Editor::World)
+      .run_if(in_state(Mode::Edit))
+      .run_if(|editor: Res<super::Editor>| *editor == super::Editor::World)
   );
 }

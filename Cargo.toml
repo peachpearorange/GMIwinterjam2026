@@ -2,22 +2,19 @@
 name = "winterjam2026"
 version = "0.1.0"
 edition = "2024"
-default-run = "winterjam2026"
 
 [dependencies]
 bevy = { version = "0.20.1", features = ["free_camera", "serialize"] }
-bevy_egui = "0.43.1"
+bevy_egui = { version = "0.43.1", optional = true }
 image = "0.25.10"
 ron = "0.12.3"
 serde = { version = "1.0.229", features = ["derive"] }
 
-[[bin]]
-name = "winterjam2026"
-path = "src/main.rs"
-
-[[bin]]
-name = "content"
-path = "src/content.rs"
+[features]
+default = ["editor"]
+# The content editor, built into the game. Leave it out of releases with
+# `cargo build --release --no-default-features`.
+editor = ["dep:bevy_egui"]
 
 [profile.dev]
 opt-level = 1
