@@ -1,8 +1,9 @@
-//! Low poly models: vertices joined into flat colored polygons. Authored in the model
-//! editor and saved as `{MODELS_DIR}/{name}.model.ron`, which the world places like any
-//! glTF model.
+//! Low poly models: vertices joined into flat polygons, each with a color and optionally
+//! a [`ModelMaterial`] from the shared library. Authored in the model editor and saved
+//! as `{MODELS_DIR}/{name}.model.ron`, which the world places like any glTF model.
 
-use {crate::assets::{self, ASSETS_DIR},
+use {crate::{assets::{self, ASSETS_DIR},
+             material::{Mapping, ModelMaterial, ModelMaterials}},
      bevy::{asset::RenderAssetUsages, platform::collections::HashMap, prelude::*,
             render::render_resource::PrimitiveTopology},
      serde::{Deserialize, Deserializer, Serialize, Serializer},
@@ -53,11 +54,40 @@ impl<'de> Deserialize<'de> for Rgb {
   }
 }
 
+/// How a face looks: its color, and the name of the [`ModelMaterial`] it's made of, or
+/// nothing for a plain one. The color tints the material's texture.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Look {
+  pub color: Rgb,
+  pub material: String
+}
+
+impl Look {
+  pub fn plain(color: Rgb) -> Self { Self { color, material: default() } }
+}
+
 /// A flat polygon through `vertices`, counterclockwise seen from the side it faces.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Face {
   pub vertices: Vec<usize>,
-  pub color: Rgb
+  pub color: Rgb,
+  #[serde(default, skip_serializing_if = "String::is_empty")]
+  pub material: String
+}
+
+impl Face {
+  pub fn new(vertices: Vec<usize>, look: &Look) -> Self {
+    Self { vertices, color: look.color, material: look.material.clone() }
+  }
+
+  pub fn look(&self) -> Look {
+    Look { color: self.color, material: self.material.clone() }
+  }
+
+  pub fn set_look(&mut self, look: &Look) {
+    self.color = look.color;
+    self.material.clone_from(&look.material)
+  }
 }
 
 /// A model as saved on disk. The origin is where it stands when placed in the world.
@@ -131,80 +161,147 @@ impl LowPoly {
       .map(move |i| [vertices[0], vertices[i], vertices[i + 1]].map(|v| self.vertices[v]))
   }
 
-  /// A flat shaded mesh with each face's color as vertex colors. `color` may change the
-  /// color of each face, by index.
-  pub fn mesh_with(&self, color: impl Fn(usize, Rgb, Vec3) -> LinearRgba) -> Mesh {
-    let (positions, rest): (Vec<[f32; 3]>, Vec<([f32; 3], [f32; 4])>) =
-      (0..self.faces.len())
-        .flat_map(|face| {
-          let normal = self.face_normal(face);
-          let color = color(face, self.faces[face].color, normal).to_f32_array();
-          self
-            .face_triangles(face)
-            .flatten()
-            .map(move |corner| (corner.to_array(), (normal.to_array(), color)))
-            .collect::<Vec<_>>()
-        })
-        .unzip();
-    let (normals, colors): (Vec<_>, Vec<_>) = rest.into_iter().unzip();
+  /// Texture coordinates of each corner of face `face`, projected along the axis it
+  /// faces most, so walls show textures upright and nothing gets mirrored.
+  pub fn face_uvs(&self, face: usize, mapping: Mapping, tile: f32) -> Vec<Vec2> {
+    let normal = self.face_normal(face);
+    let abs = normal.abs();
+    let project = |p: Vec3| {
+      if abs.y >= abs.x && abs.y >= abs.z {
+        Vec2::new(p.x, p.z * normal.y.signum())
+      } else if abs.x >= abs.z {
+        Vec2::new(-p.z * normal.x.signum(), -p.y)
+      } else {
+        Vec2::new(p.x * normal.z.signum(), -p.y)
+      }
+    };
+    let uvs = self.corners(face).map(project).collect::<Vec<_>>();
+    match mapping {
+      Mapping::Tile => uvs.into_iter().map(|uv| uv / tile.max(1e-3)).collect(),
+      Mapping::Fit => {
+        let min = uvs.iter().copied().reduce(Vec2::min).unwrap_or_default();
+        let max = uvs.iter().copied().reduce(Vec2::max).unwrap_or_default();
+        let size = (max - min).max(Vec2::splat(1e-6));
+        uvs.into_iter().map(|uv| (uv - min) / size).collect()
+      }
+    }
+  }
+
+  /// Flat shaded meshes, one for each material the faces use, with each face's color as
+  /// vertex colors. `color` may change the color of each face, by index; `material`
+  /// finds the materials by name.
+  pub fn meshes_with<'a>(
+    &self,
+    material: impl Fn(&str) -> Option<&'a ModelMaterial>,
+    color: impl Fn(usize, Rgb, Vec3) -> LinearRgba
+  ) -> Vec<(String, Mesh)> {
+    let mut parts = Vec::<(String, Vec<usize>)>::new();
+    self.faces.iter().enumerate().for_each(|(f, face)| {
+      match parts.iter_mut().find(|(name, _)| *name == face.material) {
+        Some((_, faces)) => faces.push(f),
+        None => parts.push((face.material.clone(), vec![f]))
+      }
+    });
+    parts
+      .into_iter()
+      .map(|(name, faces)| {
+        let (mapping, tile) = material(&name)
+          .map_or((Mapping::Tile, 1.0), |material| (material.mapping, material.tile));
+        let mut mesh = MeshData::default();
+        faces.into_iter().for_each(|f| {
+          let normal = self.face_normal(f).to_array();
+          let color = color(f, self.faces[f].color, self.face_normal(f)).to_f32_array();
+          let uvs = self.face_uvs(f, mapping, tile);
+          let corners = &self.faces[f].vertices;
+          (1..corners.len().saturating_sub(1)).for_each(|i| {
+            [0, i, i + 1].into_iter().for_each(|corner| {
+              mesh.positions.push(self.vertices[corners[corner]].to_array());
+              mesh.normals.push(normal);
+              mesh.colors.push(color);
+              mesh.uvs.push(uvs[corner].to_array())
+            })
+          })
+        });
+        (name, mesh.into())
+      })
+      .collect()
+  }
+
+  /// The meshes as the game renders them, lit by the scene.
+  pub fn meshes(&self, materials: &ModelMaterials) -> Vec<(String, Mesh)> {
+    self.meshes_with(|name| materials.get(name), |_, color, _| color.color().to_linear())
+  }
+}
+
+#[derive(Default)]
+struct MeshData {
+  positions: Vec<[f32; 3]>,
+  normals: Vec<[f32; 3]>,
+  colors: Vec<[f32; 4]>,
+  uvs: Vec<[f32; 2]>
+}
+
+impl From<MeshData> for Mesh {
+  fn from(MeshData { positions, normals, colors, uvs }: MeshData) -> Self {
     Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
       .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
       .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
       .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+      .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
   }
-
-  /// The mesh as the game renders it, lit by the scene.
-  pub fn mesh(&self) -> Mesh { self.mesh_with(|_, color, _| color.color().to_linear()) }
 }
 
-/// Meshes of the low poly models in use, by path, plus the material they all share.
-#[derive(Resource)]
+/// The meshes of the low poly models in use, by path, one for each material.
+#[derive(Resource, Default)]
 pub struct ModelMeshes {
-  meshes: HashMap<String, Handle<Mesh>>,
-  pub material: Handle<StandardMaterial>
+  models: HashMap<String, Vec<(String, Handle<Mesh>)>>,
+  /// Goes up whenever a model changes, so placed models know to show it again.
+  pub generation: u64
 }
 
 impl ModelMeshes {
-  /// The mesh of the model at `path`, loading it the first time.
-  pub fn get(&mut self, path: &str, meshes: &mut Assets<Mesh>) -> Handle<Mesh> {
-    self
-      .meshes
-      .entry(path.to_string())
-      .or_insert_with(|| {
-        meshes.add(
-          LowPoly::load(path)
-            .inspect_err(|error| error!("{error}"))
-            .unwrap_or_default()
-            .mesh()
-        )
-      })
-      .clone()
+  /// The parts of the model at `path`, loading it the first time.
+  pub fn get(
+    &mut self,
+    path: &str,
+    materials: &ModelMaterials,
+    meshes: &mut Assets<Mesh>
+  ) -> &[(String, Handle<Mesh>)] {
+    self.models.entry(path.to_string()).or_insert_with(|| {
+      LowPoly::load(path)
+        .inspect_err(|error| error!("{error}"))
+        .unwrap_or_default()
+        .meshes(materials)
+        .into_iter()
+        .map(|(material, mesh)| (material, meshes.add(mesh)))
+        .collect()
+    })
   }
 
   /// Shows `model` everywhere the model at `path` is placed, as when it's saved.
-  pub fn update(&mut self, path: &str, model: &LowPoly, meshes: &mut Assets<Mesh>) {
-    match self.meshes.get(path) {
-      Some(handle) => {
-        meshes.insert(handle, model.mesh()).ok();
-      }
-      None => {
-        self.meshes.insert(path.to_string(), meshes.add(model.mesh()));
-      }
-    }
+  pub fn update(
+    &mut self,
+    path: &str,
+    model: &LowPoly,
+    materials: &ModelMaterials,
+    meshes: &mut Assets<Mesh>
+  ) {
+    let parts = model
+      .meshes(materials)
+      .into_iter()
+      .map(|(material, mesh)| (material, meshes.add(mesh)))
+      .collect();
+    self.models.insert(path.to_string(), parts);
+    self.generation += 1
   }
-}
 
-impl FromWorld for ModelMeshes {
-  fn from_world(world: &mut World) -> Self {
-    Self {
-      meshes: default(),
-      material: world.resource_mut::<Assets<StandardMaterial>>().add(StandardMaterial {
-        base_color: Color::WHITE,
-        perceptual_roughness: 0.9,
-        reflectance: 0.3,
-        ..default()
-      })
-    }
+  /// Builds every loaded model again, as when a material's texture mapping changed.
+  pub fn reload_all(&mut self, materials: &ModelMaterials, meshes: &mut Assets<Mesh>) {
+    let paths = self.models.keys().cloned().collect::<Vec<_>>();
+    paths.into_iter().for_each(|path| {
+      let model = LowPoly::load(&path).unwrap_or_default();
+      self.update(&path, &model, materials, meshes)
+    })
   }
 }
 
@@ -224,13 +321,63 @@ mod tests {
   fn models_round_trip_through_ron() {
     let model = LowPoly {
       vertices: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
-      faces: vec![Face { vertices: vec![0, 1, 2], color: Rgb([10, 20, 30]) }]
+      faces: vec![Face::new(vec![0, 1, 2], &Look::plain(Rgb([10, 20, 30])))]
     };
     let text = ron::to_string(&model).unwrap();
     assert!(text.contains("\"#0a141e\""));
+    assert!(!text.contains("material"));
     assert_eq!(ron::from_str::<LowPoly>(&text).unwrap(), model);
     assert!(ron::from_str::<LowPoly>(&text.replace("#0a141e", "red")).is_err());
     assert_eq!(model.face_normal(0), Vec3::Z);
-    assert_eq!(model.mesh().count_vertices(), 3)
+    let parts = model.meshes_with(|_| None, |_, color, _| color.color().to_linear());
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].1.count_vertices(), 3)
+  }
+
+  #[test]
+  fn materials_split_meshes_and_map_textures() {
+    let wood = Look { color: Rgb::WHITE, material: "wood".into() };
+    let mut model = LowPoly {
+      vertices: vec![
+        Vec3::ZERO,
+        Vec3::X * 2.0,
+        Vec3::new(2.0, 2.0, 0.0),
+        Vec3::Y * 2.0,
+        Vec3::Z,
+      ],
+      faces: vec![
+        Face::new(vec![0, 1, 2, 3], &wood),
+        Face::new(vec![0, 4, 1], &Look::plain(Rgb::WHITE)),
+      ]
+    };
+    let text = ron::to_string(&model).unwrap();
+    assert!(text.contains("material:\"wood\""));
+    assert_eq!(ron::from_str::<LowPoly>(&text).unwrap(), model);
+    let parts = model.meshes_with(|_| None, |_, color, _| color.color().to_linear());
+    let names = parts.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
+    assert_eq!(names, ["wood", ""]);
+    assert_eq!(parts[0].1.count_vertices(), 6);
+
+    // A wall facing +z: u runs along x, v down y, so the texture is upright.
+    assert_eq!(model.face_uvs(0, Mapping::Tile, 1.0), [
+      Vec2::new(0.0, 0.0),
+      Vec2::new(2.0, 0.0),
+      Vec2::new(2.0, -2.0),
+      Vec2::new(0.0, -2.0)
+    ]);
+    assert_eq!(model.face_uvs(0, Mapping::Fit, 1.0), [
+      Vec2::new(0.0, 1.0),
+      Vec2::new(1.0, 1.0),
+      Vec2::new(1.0, 0.0),
+      Vec2::new(0.0, 0.0)
+    ]);
+    // Turned to face -z, x runs right to left seen from its side, and so does u.
+    model.faces[0].vertices.reverse();
+    assert_eq!(model.face_uvs(0, Mapping::Fit, 1.0), [
+      Vec2::new(1.0, 0.0),
+      Vec2::new(0.0, 0.0),
+      Vec2::new(0.0, 1.0),
+      Vec2::new(1.0, 1.0)
+    ])
   }
 }

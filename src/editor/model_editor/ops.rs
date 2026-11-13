@@ -8,7 +8,7 @@ use {bevy::{math::FloatPow,
             prelude::*},
      std::{collections::BTreeSet,
            f32::consts::{PI, TAU}},
-     winterjam2026::model::{Face, LowPoly, Rgb}};
+     winterjam2026::model::{Face, Look, LowPoly}};
 
 pub type Selection = BTreeSet<usize>;
 
@@ -109,16 +109,16 @@ pub fn extrude(
     let sides = faces
       .iter()
       .flat_map(|&f| {
-        let color = model.faces[f].color;
+        let look = model.faces[f].look();
         face_edges(&model.faces[f])
           .filter(|&edge| uses[&edge_key(edge)] == 1)
-          .map(|edge| (edge, color))
+          .map(|edge| (edge, look.clone()))
           .collect::<Vec<_>>()
       })
       .collect::<Vec<_>>();
-    sides.into_iter().for_each(|((a, b), color)| {
+    sides.into_iter().for_each(|((a, b), look)| {
       let (a2, b2) = (copy(model, a), copy(model, b));
-      model.faces.push(Face { vertices: vec![a, b, b2, a2], color })
+      model.faces.push(Face::new(vec![a, b, b2, a2], &look))
     });
     faces.iter().for_each(|&f| {
       let moved =
@@ -133,12 +133,12 @@ pub fn extrude(
       .faces
       .iter()
       .flat_map(|face| {
-        face_edges(face).map(|edge| (edge, face.color)).collect::<Vec<_>>()
+        face_edges(face).map(|edge| (edge, face.look())).collect::<Vec<_>>()
       })
       .filter(|&((a, b), _)| selection.contains(&a) && selection.contains(&b))
-      .fold(Vec::<((usize, usize), Rgb)>::new(), |mut edges, (edge, color)| {
+      .fold(Vec::<((usize, usize), Look)>::new(), |mut edges, (edge, look)| {
         if !edges.iter().any(|&(seen, _)| edge_key(seen) == edge_key(edge)) {
-          edges.push((edge, color))
+          edges.push((edge, look))
         }
         edges
       });
@@ -146,14 +146,14 @@ pub fn extrude(
       return Err("Select faces or edges to extrude");
     }
     let mut copies = HashMap::<usize, usize>::new();
-    selected_edges.into_iter().for_each(|((a, b), color)| {
+    selected_edges.into_iter().for_each(|((a, b), look)| {
       let [a2, b2] = [a, b].map(|v| {
         *copies.entry(v).or_insert_with(|| {
           model.vertices.push(model.vertices[v]);
           model.vertices.len() - 1
         })
       });
-      model.faces.push(Face { vertices: vec![b, a, a2, b2], color })
+      model.faces.push(Face::new(vec![b, a, a2, b2], &look))
     });
     *selection = copies.values().copied().collect();
     Ok(None)
@@ -168,7 +168,7 @@ pub fn inset(model: &mut LowPoly, selection: &mut Selection, amount: f32) {
   faces.into_iter().for_each(|f| {
     let center = model.face_center(f);
     let corners = model.faces[f].vertices.clone();
-    let color = model.faces[f].color;
+    let look = model.faces[f].look();
     let inner = corners
       .iter()
       .map(|&v| {
@@ -178,9 +178,7 @@ pub fn inset(model: &mut LowPoly, selection: &mut Selection, amount: f32) {
       .collect::<Vec<_>>();
     (0..corners.len()).for_each(|i| {
       let j = (i + 1) % corners.len();
-      model
-        .faces
-        .push(Face { vertices: vec![corners[i], corners[j], inner[j], inner[i]], color })
+      model.faces.push(Face::new(vec![corners[i], corners[j], inner[j], inner[i]], &look))
     });
     inner_vertices.extend(inner.iter().copied());
     model.faces[f].vertices = inner
@@ -208,7 +206,7 @@ pub fn make_face(
   model: &mut LowPoly,
   selection: &Selection,
   toward: Vec3,
-  color: Rgb
+  look: &Look
 ) -> Result<(), &'static str> {
   if selection.len() < 3 {
     return Err("Select at least 3 vertices to make a face");
@@ -235,7 +233,7 @@ pub fn make_face(
   });
   let mut vertices = ordered.into_iter().map(|(v, _)| v).collect::<Vec<_>>();
   let existing = model.faces.iter().flat_map(face_edges).collect::<HashSet<_>>();
-  let face = Face { vertices: vertices.clone(), color };
+  let face = Face::new(vertices.clone(), look);
   let (same, opposite) = face_edges(&face).fold((0, 0), |(same, opposite), (a, b)| {
     (
       same + existing.contains(&(a, b)) as usize,
@@ -245,7 +243,7 @@ pub fn make_face(
   if same > opposite || same == opposite && normal.dot(toward) < 0.0 {
     vertices.reverse()
   }
-  model.faces.push(Face { vertices, color });
+  model.faces.push(Face::new(vertices, look));
   Ok(())
 }
 
@@ -314,7 +312,7 @@ pub fn subdivide(model: &mut LowPoly, selection: &mut Selection) {
     if selected.contains(&f) {
       let mids = mids.into_iter().flatten().collect::<Vec<_>>();
       let n = corners.len();
-      let color = face.color;
+      let look = face.look();
       let mut pieces = if n == 3 {
         vec![
           vec![corners[0], mids[0], mids[2]],
@@ -330,7 +328,7 @@ pub fn subdivide(model: &mut LowPoly, selection: &mut Selection) {
       };
       new_selection.extend(pieces.iter().flatten().copied());
       face.vertices = pieces.remove(0);
-      new_faces.extend(pieces.into_iter().map(|vertices| Face { vertices, color }))
+      new_faces.extend(pieces.into_iter().map(|vertices| Face::new(vertices, &look)))
     } else {
       face.vertices = corners
         .iter()
@@ -411,9 +409,9 @@ pub fn select_linked(model: &LowPoly, selection: &mut Selection) {
   })
 }
 
-/// The faces joined to `start` through edges whose faces all have its color.
-pub fn same_color_region(model: &LowPoly, start: usize) -> Vec<usize> {
-  let color = model.faces[start].color;
+/// The faces joined to `start` through edges whose faces all look like it.
+pub fn same_look_region(model: &LowPoly, start: usize) -> Vec<usize> {
+  let look = model.faces[start].look();
   let mut by_edge = HashMap::<(usize, usize), Vec<usize>>::new();
   model.faces.iter().enumerate().for_each(|(f, face)| {
     face_edges(face).for_each(|edge| by_edge.entry(edge_key(edge)).or_default().push(f))
@@ -424,7 +422,7 @@ pub fn same_color_region(model: &LowPoly, start: usize) -> Vec<usize> {
   while let Some(&f) = region.get(i) {
     face_edges(&model.faces[f]).collect::<Vec<_>>().into_iter().for_each(|edge| {
       by_edge[&edge_key(edge)].iter().for_each(|&g| {
-        if model.faces[g].color == color && seen.insert(g) {
+        if model.faces[g].look() == look && seen.insert(g) {
           region.push(g)
         }
       })
@@ -495,35 +493,34 @@ pub fn symmetrize(model: &mut LowPoly, selection: &mut Selection, axis: usize) {
     .faces
     .iter()
     .filter(|face| !face.vertices.iter().all(|&v| mirrored[v] == v))
-    .map(|face| Face {
-      vertices: face.vertices.iter().rev().map(|&v| mirrored[v]).collect(),
-      color: face.color
+    .map(|face| {
+      Face::new(face.vertices.iter().rev().map(|&v| mirrored[v]).collect(), &face.look())
     })
     .collect::<Vec<_>>();
   model.faces.extend(images)
 }
 
-/// Gives every selected face `color`. Returns how many faces it colored.
-pub fn paint(model: &mut LowPoly, selection: &Selection, color: Rgb) -> usize {
+/// Gives every selected face `look`. Returns how many faces it painted.
+pub fn paint(model: &mut LowPoly, selection: &Selection, look: &Look) -> usize {
   model
     .faces
     .iter_mut()
     .filter(|face| face_selected(face, selection))
-    .map(|face| face.color = color)
+    .map(|face| face.set_look(look))
     .count()
 }
 
-/// Selects every face with the color of a selected face.
-pub fn select_same_color(model: &LowPoly, selection: &mut Selection) {
-  let colors = selected_faces(model, selection)
+/// Selects every face that looks like a selected face.
+pub fn select_same_look(model: &LowPoly, selection: &mut Selection) {
+  let looks = selected_faces(model, selection)
     .into_iter()
-    .map(|f| model.faces[f].color)
+    .map(|f| model.faces[f].look())
     .collect::<HashSet<_>>();
   selection.extend(
     model
       .faces
       .iter()
-      .filter(|face| colors.contains(&face.color))
+      .filter(|face| looks.contains(&face.look()))
       .flat_map(|face| face.vertices.iter().copied())
   )
 }
@@ -585,7 +582,7 @@ impl Primitive {
 
   /// The shape `size` across, standing on the ground at the origin, its faces wound to
   /// face away from its middle. Icospheres take `segments` as subdivisions.
-  pub fn build(self, size: f32, segments: usize, rings: usize, color: Rgb) -> LowPoly {
+  pub fn build(self, size: f32, segments: usize, rings: usize, look: &Look) -> LowPoly {
     let h = size / 2.0;
     let ring = |n: usize, radius: f32, y: f32| -> Vec<Vec3> {
       (0..n)
@@ -777,7 +774,7 @@ impl Primitive {
     };
     let mut model = LowPoly {
       vertices,
-      faces: faces.into_iter().map(|vertices| Face { vertices, color }).collect()
+      faces: faces.into_iter().map(|vertices| Face::new(vertices, look)).collect()
     };
     if self == Self::Torus {
       // Its faces are all wound alike, so the first decides for all: it should face
@@ -838,11 +835,11 @@ pub fn mirror_partners(
 
 #[cfg(test)]
 mod tests {
-  use super::*;
+  use {super::*, winterjam2026::model::Rgb};
 
-  const COLOR: Rgb = Rgb([1, 2, 3]);
+  fn look() -> Look { Look::plain(Rgb([1, 2, 3])) }
 
-  fn cube() -> LowPoly { Primitive::Cube.build(1.0, 0, 0, COLOR) }
+  fn cube() -> LowPoly { Primitive::Cube.build(1.0, 0, 0, &look()) }
 
   /// Every edge has exactly one face on each side, wound the opposite way.
   fn assert_closed(model: &LowPoly) {
@@ -870,7 +867,7 @@ mod tests {
   fn primitives_are_closed_and_face_out() {
     Primitive::ALL.into_iter().filter(|&p| p != Primitive::Plane).for_each(|primitive| {
       (if primitive == Primitive::Icosphere { 0..3 } else { 3..9 }).for_each(|segments| {
-        let model = primitive.build(2.0, segments, 4, COLOR);
+        let model = primitive.build(2.0, segments, 4, &look());
         assert_closed(&model);
         assert!(volume(&model) > 0.0, "{} faces in", primitive.name());
         assert!(
@@ -881,7 +878,7 @@ mod tests {
       })
     });
     assert!((volume(&cube()) - 1.0).abs() < 1e-5);
-    let plane = Primitive::Plane.build(1.0, 3, 0, COLOR);
+    let plane = Primitive::Plane.build(1.0, 3, 0, &look());
     assert_eq!(plane.faces.len(), 9);
     assert!((0..9).all(|f| plane.face_normal(f).y > 0.99))
   }
@@ -917,7 +914,7 @@ mod tests {
 
   #[test]
   fn extruding_an_edge_continues_the_surface() {
-    let mut model = Primitive::Plane.build(1.0, 1, 0, COLOR);
+    let mut model = Primitive::Plane.build(1.0, 1, 0, &look());
     let edge = face_edges(&model.faces[0]).next().unwrap();
     let mut selection = Selection::from([edge.0, edge.1]);
     assert_eq!(extrude(&mut model, &mut selection), Ok(None));
@@ -969,10 +966,10 @@ mod tests {
     assert_eq!((model.vertices.len(), model.faces.len()), (8, 5));
     // The hole's corners, by position since nothing was renumbered away.
     let hole = (0..8).filter(|&v| model.vertices[v].y > 0.5).collect::<Selection>();
-    make_face(&mut model, &hole, Vec3::NEG_Y, COLOR).unwrap();
+    make_face(&mut model, &hole, Vec3::NEG_Y, &look()).unwrap();
     assert_closed(&model);
     assert!(volume(&model) > 0.0);
-    assert!(make_face(&mut model, &Selection::from([0, 1]), Vec3::Y, COLOR).is_err());
+    assert!(make_face(&mut model, &Selection::from([0, 1]), Vec3::Y, &look()).is_err());
 
     let mut selection = Selection::from([0]);
     delete(&mut model, &mut selection, SelectMode::Vertex);
@@ -1025,7 +1022,12 @@ mod tests {
     select_linked(&model, &mut one);
     assert_eq!(one, (0..8).collect());
     model.faces[0].color = Rgb([9, 9, 9]);
-    assert_eq!(same_color_region(&model, 1).len(), 5);
-    assert_eq!(same_color_region(&model, 0), vec![0])
+    assert_eq!(same_look_region(&model, 1).len(), 5);
+    assert_eq!(same_look_region(&model, 0), vec![0]);
+    model.faces[1].material = "wood".into();
+    assert_eq!(same_look_region(&model, 2).len(), 4);
+    let mut faces = Selection::from_iter(model.faces[1].vertices.iter().copied());
+    select_same_look(&model, &mut faces);
+    assert_eq!(faces.len(), 4)
   }
 }

@@ -12,6 +12,7 @@ use {bevy::{ecs::system::SystemParam, prelude::*},
            thread::{self, JoinHandle},
            time::Duration},
      winterjam2026::{assets::{self, ASSETS_DIR},
+                     material::ModelMaterials,
                      world::{Ground, GroundMaterials, TEXTURES_DIR, tiling_pixel_image}}};
 
 fn texture_path(name: &str) -> PathBuf {
@@ -20,7 +21,7 @@ fn texture_path(name: &str) -> PathBuf {
 
 /// Names of the textures in `dir` and its subfolders, relative to [`TEXTURES_DIR`] and
 /// without `.png`, like `enemies/bat`.
-fn texture_names(dir: &Path) -> Vec<String> {
+pub(super) fn texture_names(dir: &Path) -> Vec<String> {
   fs::read_dir(dir)
     .into_iter()
     .flatten()
@@ -1485,13 +1486,14 @@ pub struct PixelEditorUi<'w> {
   palette: ResMut<'w, Palette>,
   images: ResMut<'w, Assets<Image>>,
   materials: ResMut<'w, Assets<StandardMaterial>>,
-  ground_materials: Res<'w, GroundMaterials>
+  ground_materials: Res<'w, GroundMaterials>,
+  model_materials: Res<'w, ModelMaterials>
 }
 
 impl PixelEditorUi<'_> {
   /// Draws the pixel editor over the whole window.
   pub fn ui(&mut self, root: &mut egui::Ui) {
-    let Self { editor, palette, images, materials, ground_materials } = self;
+    let Self { editor, palette, images, materials, ground_materials, model_materials } = self;
     let editor = &mut **editor;
     let ctx = root.ctx().clone();
     let tool = editor.tool;
@@ -1538,6 +1540,13 @@ impl PixelEditorUi<'_> {
           material.base_color_texture = Some(images.add(image))
         }
         material.base_color = Color::WHITE
+      }
+      // Model materials using the texture show it as it's painted too.
+      if let Some(handle) =
+        model_materials.loaded_texture(&format!("textures/{}.png", editor.name))
+      {
+        let image = tiling_pixel_image(canvas.size, canvas.pixels.as_flattened().to_vec());
+        images.insert(handle, image).ok();
       }
       open.shown = Some((canvas.clone(), texture))
     }

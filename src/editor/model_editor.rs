@@ -12,19 +12,25 @@
 //!   amount, Ctrl flips snapping, Enter or a click confirms, Esc or a right click
 //!   cancels. Dragging a selected element moves it directly.
 //! - Also: X deletes, F makes a face, M merges, W subdivides, N flips, Shift N faces
-//!   outward, C paints the selection, B paints by clicking faces (Alt picks a color,
-//!   Shift fills same-colored neighbors), V goes back to selecting.
+//!   outward, C paints the selection, B paints by clicking faces (Alt picks a face's
+//!   look, Shift fills neighbors that look alike), V goes back to selecting.
+//! - Painting gives faces a color and a material from the shared library (see
+//!   [`ModelMaterials`]): a texture, tiled across faces or fitted to each, with
+//!   roughness, metalness, glow, cutout and two-sided settings. The color tints the
+//!   texture, so white shows it as painted.
 //!
 //! The view is a camera rendering to an image on its own render layer, shown in the
 //! central panel with the vertices, edges and hints drawn over it by egui.
 
 mod ops;
 
-use {super::{Editor, pixel_editor::Palette},
+use {super::{Editor,
+             pixel_editor::{Palette, texture_names}},
      crate::Mode,
      bevy::{camera::{RenderTarget, visibility::RenderLayers},
             ecs::system::SystemParam,
             light::NotShadowCaster,
+            platform::collections::HashMap,
             prelude::*,
             render::{render_resource::{Face as CullFace, TextureFormat},
                      view::{DebandDither, Tonemapping}}},
@@ -34,10 +40,12 @@ use {super::{Editor, pixel_editor::Palette},
      ops::{Primitive, SelectMode, Selection},
      std::{f32::consts::{FRAC_PI_2, PI},
            fs,
-           path::Path},
-     winterjam2026::{assets::ASSETS_DIR,
-                     model::{LowPoly, MODEL_EXTENSION, ModelMeshes, Rgb},
-                     world::MODELS_DIR}};
+           path::Path,
+           time::SystemTime},
+     winterjam2026::{assets::{self, ASSETS_DIR},
+                     material::{Mapping, ModelMaterial, ModelMaterials},
+                     model::{Look, LowPoly, MODEL_EXTENSION, ModelMeshes, Rgb},
+                     world::{MODELS_DIR, TEXTURES_DIR}}};
 
 /// Render layer only the model editor's camera sees.
 const LAYER: usize = 1;
@@ -366,16 +374,19 @@ enum BoxMode {
   Remove
 }
 
-/// The offscreen camera and image the viewport shows, and the model mesh it renders.
+/// The offscreen camera and image the viewport shows, and the model it renders: a
+/// child of `model` per material.
 #[derive(Resource)]
 struct Preview {
   camera: Entity,
-  mesh: Entity,
-  mesh_handle: Handle<Mesh>,
+  model: Entity,
   image: Handle<Image>,
-  material: Handle<StandardMaterial>,
-  /// What the mesh was last built from.
-  built: Option<(LowPoly, Selection, Option<usize>)>
+  /// Unlit copies of the materials in use, for the material library revision and
+  /// backface setting they were made for.
+  materials: HashMap<String, Handle<StandardMaterial>>,
+  materials_for: (u64, bool),
+  /// What the model was last built from.
+  built: Option<(LowPoly, Selection, Option<usize>, u64)>
 }
 
 #[derive(Resource)]
@@ -389,8 +400,14 @@ pub struct ModelEditor {
   redo: Vec<(LowPoly, Selection)>,
   mode: SelectMode,
   tool: Tool,
+  /// What painting and new faces use: the color and the material's name.
   color: Rgb,
+  material: String,
   hex: String,
+  /// The material name field, applied by the rename button.
+  rename: String,
+  /// Small pictures of textures, as of when their files were last changed.
+  thumbnails: HashMap<String, (Option<SystemTime>, Option<egui::TextureHandle>)>,
   view: View,
   snap: bool,
   grid_step: f32,
@@ -433,7 +450,10 @@ impl Default for ModelEditor {
       mode: SelectMode::Face,
       tool: Tool::Select,
       color,
+      material: default(),
       hex: color.hex(),
+      rename: default(),
+      thumbnails: default(),
       view: View::DEFAULT,
       snap: true,
       grid_step: 0.125,
@@ -458,7 +478,7 @@ impl Default for ModelEditor {
     ops::append(
       &mut editor.model,
       &mut editor.selection,
-      Primitive::Cube.build(1.0, 0, 0, color)
+      Primitive::Cube.build(1.0, 0, 0, &Look::plain(color))
     );
     editor.selection.clear();
     editor
@@ -530,7 +550,10 @@ impl ModelEditor {
     self.status = default()
   }
 
-  fn save(&mut self, model_meshes: &mut ModelMeshes, meshes: &mut Assets<Mesh>) {
+  /// What painting and new faces use.
+  fn look(&self) -> Look { Look { color: self.color, material: self.material.clone() } }
+
+  fn save(&mut self, library: &mut Library) {
     self.finish_modal(true);
     let name = self.name.trim().to_string();
     self.status = if !valid_name(&name) {
@@ -539,7 +562,12 @@ impl ModelEditor {
       let path = model_path(&name);
       match self.model.save(&path) {
         Ok(()) => {
-          model_meshes.update(&path, &self.model, meshes);
+          library.model_meshes.update(
+            &path,
+            &self.model,
+            &library.model_materials,
+            &mut library.meshes
+          );
           self.name = name;
           self.saved = Some(self.model.clone());
           format!("Saved {ASSETS_DIR}/{path}")
@@ -812,8 +840,7 @@ impl ModelEditor {
     &mut self,
     ctx: &egui::Context,
     pointer: Option<Vec2>,
-    model_meshes: &mut ModelMeshes,
-    meshes: &mut Assets<Mesh>
+    library: &mut Library
   ) {
     let typing = ctx.egui_wants_keyboard_input();
     let (save, redo, undo, invert, keys) = ctx.input_mut(|input| {
@@ -837,7 +864,7 @@ impl ModelEditor {
       )
     });
     if save {
-      self.save(model_meshes, meshes)
+      self.save(library)
     }
     if undo {
       self.undo()
@@ -936,10 +963,10 @@ impl ModelEditor {
 
   fn make_face(&mut self) {
     let toward = -self.view.forward();
-    let color = self.color;
+    let look = self.look();
     let mut result = Ok(());
     self.edit(|editor| {
-      result = ops::make_face(&mut editor.model, &editor.selection, toward, color)
+      result = ops::make_face(&mut editor.model, &editor.selection, toward, &look)
     });
     if let Err(message) = result {
       self.status = message.into()
@@ -947,9 +974,9 @@ impl ModelEditor {
   }
 
   fn paint_selection(&mut self) {
-    let color = self.color;
+    let look = self.look();
     let mut count = 0;
-    self.edit(|editor| count = ops::paint(&mut editor.model, &editor.selection, color));
+    self.edit(|editor| count = ops::paint(&mut editor.model, &editor.selection, &look));
     if count == 0 {
       self.status = "Select faces to paint".into()
     }
@@ -1023,7 +1050,7 @@ impl ModelEditor {
             .on_hover_text(hint)
             .clicked()
           {
-            let part = primitive.build(self.primitive_size, self.segments, self.rings, self.color);
+            let part = primitive.build(self.primitive_size, self.segments, self.rings, &self.look());
             self.edit(|editor| ops::append(&mut editor.model, &mut editor.selection, part))
           }
         })
@@ -1131,7 +1158,7 @@ impl ModelEditor {
             (0..editor.model.vertices.len()).filter(|v| !editor.selection.contains(v)).collect()
         }),
         ("Linked  L", |editor| ops::select_linked(&editor.model, &mut editor.selection)),
-        ("Same color", |editor| ops::select_same_color(&editor.model, &mut editor.selection))
+        ("Same look", |editor| ops::select_same_look(&editor.model, &mut editor.selection))
       ];
       ui.columns(2, |columns| {
         selections.into_iter().enumerate().for_each(|(i, (label, select))| {
@@ -1173,8 +1200,7 @@ impl ModelEditor {
     &mut self,
     ui: &mut egui::Ui,
     palette: &mut Palette,
-    model_meshes: &mut ModelMeshes,
-    meshes: &mut Assets<Mesh>
+    library: &mut Library
   ) {
     egui::ScrollArea::vertical().show(ui, |ui| {
       let width = ui.available_width();
@@ -1194,11 +1220,6 @@ impl ModelEditor {
           && let Some(color) = Rgb::parse(&self.hex)
         {
           self.color = color
-        }
-      });
-      ui.vertical_centered_justified(|ui| {
-        if ui.button("Paint selection  C").clicked() {
-          self.paint_selection()
         }
       });
       let swatches = |ui: &mut egui::Ui,
@@ -1270,6 +1291,9 @@ impl ModelEditor {
       }
 
       ui.separator();
+      self.material_panel(ui, library);
+
+      ui.separator();
       ui.vertical_centered(|ui| ui.strong("FILE"));
       ui.horizontal(|ui| {
         ui.add(
@@ -1281,7 +1305,7 @@ impl ModelEditor {
       });
       ui.vertical_centered_justified(|ui| {
         if ui.button("Save").on_hover_text("Ctrl+S").clicked() {
-          self.save(model_meshes, meshes)
+          self.save(library)
         }
       });
       let mut names = model_names(Path::new(MODELS_DIR));
@@ -1329,6 +1353,274 @@ impl ModelEditor {
         ops::selected_faces(&self.model, &self.selection).len()
       ));
     });
+  }
+
+  /// A small picture of the texture at `path` in [`ASSETS_DIR`], loaded again when its
+  /// file changes.
+  fn thumbnail(&mut self, ctx: &egui::Context, path: &str) -> Option<egui::TextureId> {
+    let modified = fs::metadata(Path::new(ASSETS_DIR).join(path))
+      .and_then(|file| file.modified())
+      .ok();
+    let (loaded, texture) =
+      self.thumbnails.entry(path.to_string()).or_insert((None, None));
+    if texture.is_none() || *loaded != modified {
+      *loaded = modified;
+      *texture = assets::read(path)
+        .and_then(|bytes| image::load_from_memory(&bytes).ok())
+        .map(|image| image.into_rgba8())
+        .map(|image| {
+          ctx.load_texture(
+            path,
+            egui::ColorImage::from_rgba_unmultiplied(
+              [image.width() as usize, image.height() as usize],
+              image.as_raw()
+            ),
+            egui::TextureOptions::NEAREST
+          )
+        })
+    }
+    texture.as_ref().map(egui::TextureHandle::id)
+  }
+
+  /// A row picking what material painting uses, with the picked one's settings below.
+  fn material_panel(&mut self, ui: &mut egui::Ui, library: &mut Library) {
+    const SWATCH: f32 = 18.0;
+    ui.vertical_centered(|ui| ui.strong("MATERIAL"));
+    let mut list = library.model_materials.list().to_vec();
+    let names = [String::new()]
+      .into_iter()
+      .chain(list.iter().map(|m| m.name.clone()))
+      .collect::<Vec<_>>();
+    egui::ScrollArea::vertical().id_salt("materials").max_height(170.0).show(ui, |ui| {
+      names.iter().for_each(|name| {
+        ui.horizontal(|ui| {
+          let texture = list
+            .iter()
+            .find(|m| m.name == *name)
+            .and_then(|m| m.texture.clone())
+            .and_then(|path| self.thumbnail(ui.ctx(), &path));
+          let (rect, _) =
+            ui.allocate_exact_size(egui::Vec2::splat(SWATCH), Sense::hover());
+          match texture {
+            Some(texture) => {
+              let uv = egui::Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0));
+              ui.painter().image(texture, rect, uv, Color32::WHITE);
+            }
+            None => {
+              ui.painter().rect_filled(rect, 2.0, Color32::from_gray(90));
+            }
+          }
+          let used =
+            self.model.faces.iter().filter(|face| face.material == *name).count();
+          let label = if name.is_empty() { "Plain" } else { name };
+          let text =
+            if used > 0 { format!("{label}  ({used})") } else { label.to_string() };
+          let response = ui
+            .selectable_label(self.material == *name, text)
+            .on_hover_text("Click to paint with it · right click selects its faces");
+          if response.clicked() {
+            self.material.clone_from(name);
+            self.rename.clone_from(name)
+          }
+          if response.secondary_clicked() {
+            self.selection = self
+              .model
+              .faces
+              .iter()
+              .filter(|face| face.material == *name)
+              .flat_map(|face| face.vertices.iter().copied())
+              .collect()
+          }
+        });
+      })
+    });
+    ui.columns(2, |columns| {
+      let [new, paint] = columns else { return };
+      if new.add_sized([new.available_width(), 0.0], egui::Button::new("New")).clicked() {
+        let name = (1..)
+          .map(|i| if i == 1 { "material".to_string() } else { format!("material {i}") })
+          .find(|name| !list.iter().any(|m| m.name == *name))
+          .unwrap_or_default();
+        list.push(ModelMaterial { name: name.clone(), ..default() });
+        self.rename.clone_from(&name);
+        self.material = name
+      }
+      if paint
+        .add_sized([paint.available_width(), 0.0], egui::Button::new("Paint sel.  C"))
+        .on_hover_text("Gives the selected faces this material and the color")
+        .clicked()
+      {
+        self.paint_selection()
+      }
+    });
+
+    let mut renamed = None;
+    let mut deleted = None;
+    if let Some(material) = list.iter_mut().find(|m| m.name == self.material) {
+      ui.horizontal(|ui| {
+        ui.add(
+          egui::TextEdit::singleline(&mut self.rename)
+            .desired_width(ui.available_width() - 70.0)
+        );
+        let new_name = self.rename.trim().to_string();
+        let free =
+          !new_name.is_empty() && new_name != material.name && !names.contains(&new_name);
+        if ui.add_enabled(free, egui::Button::new("Rename")).clicked() {
+          renamed = Some((material.name.clone(), new_name))
+        }
+      });
+      let textures = {
+        let mut names = texture_names(Path::new(TEXTURES_DIR));
+        names.sort();
+        names
+      };
+      let shown = material
+        .texture
+        .as_deref()
+        .and_then(|path| path.strip_prefix("textures/"))
+        .and_then(|path| path.strip_suffix(".png"))
+        .unwrap_or("none")
+        .to_string();
+      egui::ComboBox::from_label("texture").selected_text(shown).show_ui(ui, |ui| {
+        ui.selectable_value(&mut material.texture, None, "none");
+        textures.into_iter().for_each(|name| {
+          let path = format!("textures/{name}.png");
+          ui.selectable_value(&mut material.texture, Some(path), name);
+        })
+      });
+      if material.texture.is_some() {
+        ui.horizontal(|ui| {
+          ui.selectable_value(&mut material.mapping, Mapping::Tile, "Tile")
+            .on_hover_text("Repeats across faces, lined up, like bricks or planks");
+          ui.selectable_value(&mut material.mapping, Mapping::Fit, "Fit")
+            .on_hover_text("Stretches once over each face, like a door or a sign");
+          if material.mapping == Mapping::Tile {
+            ui.add(
+              egui::DragValue::new(&mut material.tile)
+                .range(0.05..=64.0)
+                .speed(0.01)
+                .suffix(" m")
+            )
+            .on_hover_text("World units one repeat covers");
+          }
+        });
+        ui.weak("Faces' colors tint the texture; white shows it as painted");
+      }
+      ui.add(egui::Slider::new(&mut material.roughness, 0.0..=1.0).text("rough"));
+      ui.add(egui::Slider::new(&mut material.metallic, 0.0..=1.0).text("metal"));
+      ui.horizontal(|ui| {
+        let mut glow = material.glow.0;
+        if ui.color_edit_button_srgb(&mut glow).changed() {
+          material.glow = Rgb(glow)
+        }
+        ui.label("glow");
+        ui.add(
+          egui::DragValue::new(&mut material.glow_strength).range(0.0..=50.0).speed(0.05)
+        );
+      })
+      .response
+      .on_hover_text("Light it gives off, black for none, times the texture if any");
+      ui.checkbox(&mut material.cutout, "Cutout")
+        .on_hover_text("Holes where the texture is transparent, for leaves or fences");
+      ui.checkbox(&mut material.double_sided, "Two-sided")
+        .on_hover_text("Shows the back of faces, for single sheets like leaves or flags");
+      if ui
+        .button("Delete material")
+        .on_hover_text("Its faces in this model turn plain")
+        .clicked()
+      {
+        deleted = Some(material.name.clone())
+      }
+    } else if !self.material.is_empty() {
+      ui.weak(format!("{} isn't in the library", self.material));
+    }
+
+    if let Some(name) = deleted {
+      list.retain(|m| m.name != name);
+      self.edit(|editor| {
+        editor
+          .model
+          .faces
+          .iter_mut()
+          .filter(|face| face.material == name)
+          .for_each(|face| face.material.clear())
+      });
+      self.material.clear();
+      self.rename.clear()
+    }
+    if let Some((old, new)) = &renamed
+      && let Some(material) = list.iter_mut().find(|m| m.name == *old)
+    {
+      material.name.clone_from(new)
+    }
+
+    let old = library.model_materials.list();
+    if list != old {
+      let mapping = |list: &[ModelMaterial]| {
+        list.iter().map(|m| (m.name.clone(), m.mapping, m.tile)).collect::<Vec<_>>()
+      };
+      let remap = mapping(&list) != mapping(old);
+      let Library { model_meshes, model_materials, meshes, materials, images } = library;
+      model_materials.set(list, materials, images);
+      if let Err(error) = model_materials.save() {
+        self.status = format!("Can't save the materials: {error}")
+      }
+      if let Some((old, new)) = renamed {
+        self.rename_material(&old, &new, model_meshes, model_materials, meshes)
+      }
+      if remap {
+        model_meshes.reload_all(model_materials, meshes)
+      }
+    }
+  }
+
+  /// Renames material `old` to `new` in the open model and every saved one.
+  fn rename_material(
+    &mut self,
+    old: &str,
+    new: &str,
+    model_meshes: &mut ModelMeshes,
+    model_materials: &ModelMaterials,
+    meshes: &mut Assets<Mesh>
+  ) {
+    let rename = |model: &mut LowPoly| {
+      model
+        .faces
+        .iter_mut()
+        .filter(|face| face.material == old)
+        .map(|face| face.material = new.into())
+        .count()
+    };
+    [&mut self.model].into_iter().chain(self.saved.as_mut()).for_each(|model| {
+      rename(model);
+    });
+    self.undo.iter_mut().chain(self.redo.iter_mut()).for_each(|(model, _)| {
+      rename(model);
+    });
+    if self.material == old {
+      self.material = new.into()
+    }
+    let mut changed = 0;
+    let mut failed = Vec::new();
+    model_names(Path::new(MODELS_DIR)).into_iter().for_each(|name| {
+      let path = model_path(&name);
+      if let Ok(mut model) = LowPoly::load(&path)
+        && rename(&mut model) > 0
+      {
+        match model.save(&path) {
+          Ok(()) => {
+            model_meshes.update(&path, &model, model_materials, meshes);
+            changed += 1
+          }
+          Err(error) => failed.push(format!("{name}: {error}"))
+        }
+      }
+    });
+    self.status = if failed.is_empty() {
+      format!("Renamed {old} to {new}, updating {changed} saved models")
+    } else {
+      format!("Renamed {old} to {new}, but couldn't update {}", failed.join(", "))
+    }
   }
 
   // Viewport.
@@ -1462,8 +1754,9 @@ impl ModelEditor {
   /// Paints the face `face`, or with `region` the faces of its color joined to it.
   fn paint_face(&mut self, face: usize, region: bool) {
     let faces =
-      if region { ops::same_color_region(&self.model, face) } else { vec![face] };
-    faces.into_iter().for_each(|f| self.model.faces[f].color = self.color)
+      if region { ops::same_look_region(&self.model, face) } else { vec![face] };
+    let look = self.look();
+    faces.into_iter().for_each(|f| self.model.faces[f].set_look(&look))
   }
 
   fn viewport(&mut self, ui: &mut egui::Ui, palette: &mut Palette) {
@@ -1558,7 +1851,8 @@ impl ModelEditor {
         if self.tool == Tool::Paint {
           if let Some(Hit::Face(f)) = self.hover {
             if modifiers.alt {
-              self.color = self.model.faces[f].color
+              let Look { color, material } = self.model.faces[f].look();
+              (self.color, self.material) = (color, material)
             } else {
               self.stroke = Some(self.snapshot());
               self.paint_face(f, modifiers.shift);
@@ -1671,7 +1965,7 @@ impl ModelEditor {
     } else {
       match self.tool {
         Tool::Select => "Click selects · Shift adds · drag a selection to move it · drag empty space to box select (Shift adds, Ctrl removes)",
-        Tool::Paint => "Click or drag paints faces · Shift fills joined faces of one color · Alt picks a face's color"
+        Tool::Paint => "Click or drag paints faces with the color and material · Shift fills joined faces that look alike · Alt picks a face's color and material"
       }
       .into()
     };
@@ -1810,19 +2104,28 @@ impl ModelEditor {
 pub struct ModelEditorUi<'w> {
   editor: ResMut<'w, ModelEditor>,
   palette: ResMut<'w, Palette>,
+  library: Library<'w>
+}
+
+/// The models and materials the editor saves to, and the asset stores they live in.
+#[derive(SystemParam)]
+pub struct Library<'w> {
   model_meshes: ResMut<'w, ModelMeshes>,
-  meshes: ResMut<'w, Assets<Mesh>>
+  model_materials: ResMut<'w, ModelMaterials>,
+  meshes: ResMut<'w, Assets<Mesh>>,
+  materials: ResMut<'w, Assets<StandardMaterial>>,
+  images: ResMut<'w, Assets<Image>>
 }
 
 impl ModelEditorUi<'_> {
   /// Draws the model editor over the whole window.
   pub fn ui(&mut self, root: &mut egui::Ui) {
-    let Self { editor, palette, model_meshes, meshes } = self;
+    let Self { editor, palette, library } = self;
     let editor = &mut **editor;
     let ctx = root.ctx().clone();
     let palette_before = palette.clone();
     let pointer = ctx.pointer_latest_pos().map(to_vec);
-    editor.shortcuts(&ctx, pointer, model_meshes, meshes);
+    editor.shortcuts(&ctx, pointer, library);
 
     egui::Panel::top("model").show(root, |ui| editor.top_bar(ui));
     egui::Panel::left("model_tools")
@@ -1840,7 +2143,7 @@ impl ModelEditorUi<'_> {
           ))
           .on_hover_text(if unsaved { "Unsaved changes" } else { "Saved" });
         });
-        editor.side_panel(ui, palette, model_meshes, meshes)
+        editor.side_panel(ui, palette, library)
       }
     );
     egui::CentralPanel::default().show(root, |ui| editor.viewport(ui, palette));
@@ -1860,14 +2163,12 @@ fn sync_preview(
   preview: Option<ResMut<Preview>>,
   open: Res<Editor>,
   mode: Res<State<Mode>>,
-  mut images: ResMut<Assets<Image>>,
-  mut meshes: ResMut<Assets<Mesh>>,
-  mut materials: ResMut<Assets<StandardMaterial>>,
+  mut library: Library,
   mut textures: ResMut<EguiUserTextures>,
   mut cameras: Query<(&mut Camera, &mut Transform, &mut Projection, &mut RenderTarget)>,
-  mut visibilities: Query<&mut Visibility>,
   mut commands: Commands
 ) {
+  let Library { model_materials, meshes, materials, images, .. } = &mut library;
   let new_image = |images: &mut Assets<Image>, size: UVec2| {
     images.add(Image::new_target_texture(
       size.x,
@@ -1877,18 +2178,13 @@ fn sync_preview(
     ))
   };
   let shown = *mode.get() == Mode::Edit && *open == Editor::Models;
+  let layer = RenderLayers::layer(LAYER);
   let Some(mut preview) = preview else {
     if !shown {
       return;
     }
-    let image = new_image(&mut images, editor.viewport_pixels);
+    let image = new_image(images, editor.viewport_pixels);
     editor.texture = Some(textures.add_image(EguiTextureHandle::Strong(image.clone())));
-    let layer = RenderLayers::layer(LAYER);
-    let material = materials.add(StandardMaterial {
-      base_color: Color::WHITE,
-      unlit: true,
-      ..default()
-    });
     let camera = commands
       .spawn((
         Camera3d::default(),
@@ -1906,23 +2202,13 @@ fn sync_preview(
         layer.clone()
       ))
       .id();
-    let mesh_handle = meshes.add(Mesh::from(Cuboid::default()));
-    let mesh = commands
-      .spawn((
-        Mesh3d(mesh_handle.clone()),
-        MeshMaterial3d(material.clone()),
-        Transform::default(),
-        Visibility::Hidden,
-        NotShadowCaster,
-        layer
-      ))
-      .id();
+    let model = commands.spawn((Transform::default(), Visibility::default(), layer)).id();
     commands.insert_resource(Preview {
       camera,
-      mesh,
-      mesh_handle,
+      model,
       image,
-      material,
+      materials: default(),
+      materials_for: (u64::MAX, false),
       built: None
     });
     return;
@@ -1940,7 +2226,7 @@ fn sync_preview(
   let size = editor.viewport_pixels;
   if images.get(&preview.image).is_some_and(|image| image.size() != size) {
     textures.remove_image(&preview.image);
-    preview.image = new_image(&mut images, size);
+    preview.image = new_image(images, size);
     editor.texture =
       Some(textures.add_image(EguiTextureHandle::Strong(preview.image.clone())));
     *target = RenderTarget::Image(preview.image.clone().into())
@@ -1948,12 +2234,10 @@ fn sync_preview(
   *transform = editor.view.transform();
   *projection = editor.view.projection();
 
-  if let Some(mut material) = materials.get_mut(&preview.material) {
-    let cull = if editor.backfaces { None } else { Some(CullFace::Back) };
-    if material.cull_mode != cull {
-      material.cull_mode = cull;
-      material.double_sided = editor.backfaces
-    }
+  let materials_for = (model_materials.revision, editor.backfaces);
+  if preview.materials_for != materials_for {
+    preview.materials.clear();
+    preview.materials_for = materials_for
   }
 
   let hovered_face = match editor.hover {
@@ -1963,14 +2247,24 @@ fn sync_preview(
   // Painting shows the colors as they are, without the selection's tint.
   let tinted =
     if editor.tool == Tool::Select { editor.selection.clone() } else { Selection::new() };
-  let state = (editor.model.clone(), tinted, hovered_face);
-  if preview.built.as_ref() != Some(&state) {
-    let (model, selection, hovered) = &state;
-    let light = Vec3::new(0.35, 1.0, 0.55).normalize();
-    let fill = Vec3::new(-0.6, -0.2, -0.4).normalize();
-    let mesh = model.mesh_with(|f, color, normal| {
-      let shade =
-        0.5 + 0.5 * normal.dot(light).max(0.0) + 0.12 * normal.dot(fill).max(0.0);
+  let state = (editor.model.clone(), tinted, hovered_face, model_materials.revision);
+  if preview.built.as_ref() == Some(&state) {
+    return;
+  }
+  let (model, selection, hovered, _) = &state;
+  let light = Vec3::new(0.35, 1.0, 0.55).normalize();
+  let fill = Vec3::new(-0.6, -0.2, -0.4).normalize();
+  let glowing = |f: usize| {
+    model_materials.get(&model.faces[f].material).is_some_and(ModelMaterial::glows)
+  };
+  let parts = model.meshes_with(
+    |name| model_materials.get(name),
+    |f, color, normal| {
+      let shade = if glowing(f) {
+        1.0
+      } else {
+        0.5 + 0.5 * normal.dot(light).max(0.0) + 0.12 * normal.dot(fill).max(0.0)
+      };
       let base = color.color().to_linear();
       let base = if ops::face_selected(&model.faces[f], selection) {
         base.mix(&Color::srgb_u8(0xff, 0x9a, 0x1f).to_linear(), 0.4)
@@ -1980,16 +2274,36 @@ fn sync_preview(
       let base =
         if *hovered == Some(f) { base.mix(&LinearRgba::WHITE, 0.15) } else { base };
       (base * shade).with_alpha(1.0)
-    });
-    if let Ok(mut visibility) = visibilities.get_mut(preview.mesh) {
-      *visibility =
-        if model.faces.is_empty() { Visibility::Hidden } else { Visibility::Visible }
     }
-    if !model.faces.is_empty() {
-      meshes.insert(&preview.mesh_handle, mesh).ok();
-    }
-    preview.built = Some(state)
-  }
+  );
+  let mut root = commands.entity(preview.model);
+  root.despawn_related::<Children>();
+  parts.into_iter().for_each(|(name, mesh)| {
+    let material = preview
+      .materials
+      .entry(name.clone())
+      .or_insert_with(|| {
+        let material = model_materials.get(&name).cloned().unwrap_or_default();
+        let texture = model_materials.texture_of(&name, images);
+        let two_sided = editor.backfaces || material.double_sided;
+        materials.add(StandardMaterial {
+          unlit: true,
+          emissive: LinearRgba::BLACK,
+          emissive_texture: None,
+          double_sided: two_sided,
+          cull_mode: if two_sided { None } else { Some(CullFace::Back) },
+          ..material.standard(texture)
+        })
+      })
+      .clone();
+    root.with_child((
+      Mesh3d(meshes.add(mesh)),
+      MeshMaterial3d(material),
+      NotShadowCaster,
+      layer.clone()
+    ));
+  });
+  preview.built = Some(state)
 }
 
 /// Lines drawn in the model editor's 3D view, so the model hides what's behind it.

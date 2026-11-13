@@ -9,6 +9,7 @@ use {bevy::{asset::RenderAssetUsages,
             render::render_resource::{Extent3d, PrimitiveTopology, TextureDimension,
                                       TextureFormat}},
      crate::{assets::{self, ASSETS_DIR},
+             material::ModelMaterials,
              model::{MODEL_EXTENSION, ModelMeshes}},
      serde::{Deserialize, Serialize},
      std::{fs, io, path::Path}};
@@ -321,22 +322,49 @@ pub struct Model {
 fn attach_model_scenes(
   models: Query<(Entity, &Model), Added<Model>>,
   asset_server: Res<AssetServer>,
-  mut model_meshes: ResMut<ModelMeshes>,
-  mut meshes: ResMut<Assets<Mesh>>,
   mut commands: Commands
 ) {
-  models.iter().for_each(|(entity, Model { path })| {
-    if path.ends_with(MODEL_EXTENSION) {
-      commands.entity(entity).insert((
-        Mesh3d(model_meshes.get(path, &mut meshes)),
-        MeshMaterial3d(model_meshes.material.clone())
-      ));
-    } else {
+  models.iter().filter(|(_, Model { path })| !path.ends_with(MODEL_EXTENSION)).for_each(
+    |(entity, Model { path })| {
       commands.entity(entity).insert(WorldAssetRoot(
         asset_server.load(GltfAssetLabel::Scene(0).from_asset(path.clone()))
       ));
     }
-  });
+  );
+}
+
+/// Which version of its model and the materials a low poly [`Model`] shows, as
+/// [`ModelMeshes::generation`] and [`ModelMaterials::revision`].
+#[derive(Component, PartialEq)]
+struct ShownModel(u64, u64);
+
+/// Gives each low poly model a child per material it uses, again whenever models or
+/// materials change.
+fn show_low_poly_models(
+  models: Query<(Entity, &Model, Option<&ShownModel>)>,
+  mut model_meshes: ResMut<ModelMeshes>,
+  mut model_materials: ResMut<ModelMaterials>,
+  mut meshes: ResMut<Assets<Mesh>>,
+  mut materials: ResMut<Assets<StandardMaterial>>,
+  mut images: ResMut<Assets<Image>>,
+  mut commands: Commands
+) {
+  let version = ShownModel(model_meshes.generation, model_materials.revision);
+  models
+    .iter()
+    .filter(|(_, Model { path }, shown)| path.ends_with(MODEL_EXTENSION) && *shown != Some(&version))
+    .for_each(|(entity, Model { path }, _)| {
+      let parts = model_meshes.get(path, &model_materials, &mut meshes).to_vec();
+      let mut model = commands.entity(entity);
+      model.despawn_related::<Children>().insert((
+        ShownModel(version.0, version.1),
+        Visibility::default()
+      ));
+      parts.into_iter().for_each(|(material, mesh)| {
+        let material = model_materials.handle(&material, &mut materials, &mut images);
+        model.with_child((Mesh3d(mesh), MeshMaterial3d(material)));
+      })
+    });
 }
 
 #[derive(Serialize, Deserialize)]
@@ -466,9 +494,17 @@ pub struct WorldPlugin;
 
 impl Plugin for WorldPlugin {
   fn build(&self, app: &mut App) {
-    app.init_resource::<ModelMeshes>().add_systems(Startup, load_world).add_systems(
-      Update,
-      (rebuild_terrain_meshes.run_if(resource_changed::<Terrain>), attach_model_scenes)
-    );
+    app
+      .init_resource::<ModelMeshes>()
+      .init_resource::<ModelMaterials>()
+      .add_systems(Startup, load_world)
+      .add_systems(
+        Update,
+        (
+          rebuild_terrain_meshes.run_if(resource_changed::<Terrain>),
+          attach_model_scenes,
+          show_low_poly_models
+        )
+      );
   }
 }
