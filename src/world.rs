@@ -9,6 +9,7 @@ use {bevy::{asset::RenderAssetUsages,
             render::render_resource::{Extent3d, PrimitiveTopology, TextureDimension,
                                       TextureFormat}},
      crate::{assets::{self, ASSETS_DIR},
+             billboard::{self, Billboard, PlacedBillboard},
              material::ModelMaterials,
              model::{MODEL_EXTENSION, ModelMeshes}},
      serde::{Deserialize, Serialize},
@@ -393,12 +394,19 @@ impl PlacedModel {
 pub struct WorldFile {
   pub markers: Vec<PlacedMarker>,
   pub models: Vec<PlacedModel>,
+  #[serde(default)]
+  pub billboards: Vec<PlacedBillboard>,
   pub terrain: Terrain
 }
 
 impl Default for WorldFile {
   fn default() -> Self {
-    Self { markers: default(), models: default(), terrain: Terrain::flat(64, 64, 2.0) }
+    Self {
+      markers: default(),
+      models: default(),
+      billboards: default(),
+      terrain: Terrain::flat(64, 64, 2.0)
+    }
   }
 }
 
@@ -429,7 +437,8 @@ impl WorldFile {
   pub fn collect<'a>(
     terrain: &Terrain,
     markers: impl IntoIterator<Item = (&'a Marker, &'a Transform)>,
-    models: impl IntoIterator<Item = (&'a Model, &'a Transform)>
+    models: impl IntoIterator<Item = (&'a Model, &'a Transform)>,
+    billboards: impl IntoIterator<Item = (&'a Billboard, &'a Transform)>
   ) -> Self {
     Self {
       markers: markers
@@ -447,14 +456,19 @@ impl WorldFile {
           yaw: rotation.to_euler(EulerRot::YXZ).0
         })
         .collect(),
+      billboards: billboards
+        .into_iter()
+        .map(|(billboard, transform)| PlacedBillboard::collect(billboard, transform))
+        .collect(),
       terrain: terrain.clone()
     }
   }
 
-  /// Makes this the live world: the [`Terrain`] resource plus [`Marker`] and [`Model`]
-  /// entities. Doesn't remove what is already there.
+  /// Makes this the live world: the [`Terrain`] resource plus [`Marker`], [`Model`] and
+  /// [`Billboard`] entities. Doesn't remove what is already there.
   pub fn spawn(self, commands: &mut Commands) {
-    let Self { markers, models, terrain } = self;
+    let Self { markers, models, billboards, terrain } = self;
+    commands.spawn_batch(billboards.into_iter().map(PlacedBillboard::spawn));
     commands.insert_resource(terrain);
     commands.spawn_batch(markers.into_iter().map(|PlacedMarker { name, position }| {
       (Marker { name }, Transform::from_translation(position))
@@ -497,6 +511,7 @@ impl Plugin for WorldPlugin {
     app
       .init_resource::<ModelMeshes>()
       .init_resource::<ModelMaterials>()
+      .add_plugins(billboard::plugin)
       .add_systems(Startup, load_world)
       .add_systems(
         Update,

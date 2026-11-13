@@ -1,13 +1,16 @@
 //! World design: sculpting the terrain, painting ground, placing models and markers.
 
-use {crate::Mode,
+use {super::pixel_editor::texture_names,
+     crate::Mode,
      bevy::{camera_controller::free_camera::FreeCamera, ecs::system::SystemParam, prelude::*},
      bevy_egui::egui,
      std::{f32::consts::TAU, fs,
            path::{Path, PathBuf}},
      winterjam2026::{assets::ASSETS_DIR,
+                     billboard::{Billboard, BillboardMode, PlacedBillboard},
                      model::MODEL_EXTENSION,
-                     world::{Ground, MODELS_DIR, Marker, Model, Terrain, WorldFile}}};
+                     world::{Ground, MODELS_DIR, Marker, Model, TEXTURES_DIR, Terrain,
+                             WorldFile}}};
 
 /// How a height brush moves the terrain vertices under it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -26,11 +29,12 @@ enum Tool {
   PaintGround,
   PlaceModel,
   PlaceMarker,
+  PlaceBillboard,
   Select
 }
 
 impl Tool {
-  const ALL: [Self; 8] = [
+  const ALL: [Self; 9] = [
     Self::Sculpt(Sculpt::Raise),
     Self::Sculpt(Sculpt::Lower),
     Self::Sculpt(Sculpt::Smooth),
@@ -38,6 +42,7 @@ impl Tool {
     Self::PaintGround,
     Self::PlaceModel,
     Self::PlaceMarker,
+    Self::PlaceBillboard,
     Self::Select
   ];
 
@@ -50,6 +55,7 @@ impl Tool {
       Self::PaintGround => "Paint ground",
       Self::PlaceModel => "Place model",
       Self::PlaceMarker => "Place marker",
+      Self::PlaceBillboard => "Place billboard",
       Self::Select => "Select"
     }
   }
@@ -117,6 +123,34 @@ fn model_paths() -> Vec<String> {
   paths
 }
 
+/// The texture, size and facing of a billboard.
+fn billboard_settings(ui: &mut egui::Ui, billboard: &mut Billboard) {
+  let mut names = texture_names(Path::new(TEXTURES_DIR));
+  names.sort();
+  let shown = billboard
+    .texture
+    .strip_prefix("textures/")
+    .and_then(|name| name.strip_suffix(".png"))
+    .unwrap_or(&billboard.texture)
+    .to_string();
+  egui::ComboBox::from_label("texture").selected_text(shown).show_ui(ui, |ui| {
+    names.into_iter().for_each(|name| {
+      ui.selectable_value(&mut billboard.texture, format!("textures/{name}.png"), name);
+    })
+  });
+  ui.add(
+    egui::DragValue::new(&mut billboard.size)
+      .range(0.05..=100.0)
+      .speed(0.05)
+      .prefix("size: ")
+      .suffix(" m")
+  )
+  .on_hover_text("Height; the width follows the texture's proportions");
+  BillboardMode::ALL.into_iter().for_each(|mode| {
+    ui.radio_value(&mut billboard.mode, mode, mode.name());
+  });
+}
+
 /// A drag over the terrain with the left mouse button.
 #[derive(Clone, Copy)]
 struct Stroke {
@@ -138,6 +172,8 @@ struct WorldEditor {
   model: Option<String>,
   model_yaw_degrees: f32,
   marker_name: String,
+  /// What placing a billboard places.
+  billboard: Billboard,
   selected: Option<Entity>,
   new_world: NewWorld,
   /// Outcome of the last save.
@@ -159,6 +195,11 @@ impl Default for WorldEditor {
       model: None,
       model_yaw_degrees: 0.0,
       marker_name: "marker".into(),
+      billboard: Billboard {
+        texture: "textures/tree.png".into(),
+        size: 3.0,
+        mode: BillboardMode::FacePositionUpright
+      },
       selected: None,
       new_world: NewWorld::DEFAULT,
       status: default(),
@@ -186,8 +227,14 @@ pub struct WorldEditorUi<'w, 's> {
   placed: Query<
     'w,
     's,
-    (Entity, Option<&'static mut Marker>, Option<&'static Model>, &'static mut Transform),
-    Or<(With<Marker>, With<Model>)>
+    (
+      Entity,
+      Option<&'static mut Marker>,
+      Option<&'static Model>,
+      &'static mut Transform,
+      Option<&'static mut Billboard>
+    ),
+    Or<(With<Marker>, With<Model>, With<Billboard>)>
   >,
   commands: Commands<'w, 's>
 }
@@ -206,11 +253,14 @@ impl WorldEditorUi<'_, '_> {
         {
           editor.status = WorldFile::collect(
             terrain,
-            placed.iter().filter_map(|(_, marker, _, transform)| {
+            placed.iter().filter_map(|(_, marker, _, transform, _)| {
               marker.map(|marker| (marker, transform))
             }),
-            placed.iter().filter_map(|(_, _, model, transform)| {
+            placed.iter().filter_map(|(_, _, model, transform, _)| {
               model.map(|model| (model, transform))
+            }),
+            placed.iter().filter_map(|(_, _, _, transform, billboard)| {
+              billboard.map(|billboard| (billboard, transform))
             })
           )
           .save()
@@ -301,10 +351,18 @@ impl WorldEditorUi<'_, '_> {
               ui.text_edit_singleline(&mut editor.marker_name);
             });
           }
+          Tool::PlaceBillboard => billboard_settings(ui, &mut editor.billboard),
           Tool::Select => {
             if let Some(entity) = editor.selected
-              && let Ok((_, marker, model, mut transform)) = placed.get_mut(entity)
+              && let Ok((_, marker, model, mut transform, billboard)) = placed.get_mut(entity)
             {
+              if let Some(mut billboard) = billboard {
+                let mut edited = billboard.clone();
+                billboard_settings(ui, &mut edited);
+                if edited != *billboard {
+                  *billboard = edited
+                }
+              }
               marker.map(|mut marker| {
                 ui.horizontal(|ui| {
                   ui.label("marker");
@@ -338,14 +396,14 @@ impl WorldEditorUi<'_, '_> {
                 editor.selected = None;
               }
             } else {
-              ui.label("Click a marker or model.");
+              ui.label("Click a marker, model or billboard.");
             }
           }
         }
 
         ui.separator();
         ui.heading("Markers");
-        placed.iter().for_each(|(_, marker, _, &Transform { translation, .. })| {
+        placed.iter().for_each(|(_, marker, _, &Transform { translation, .. }, _)| {
           marker.map(|Marker { name }| ui.label(format!("{name}  {translation:.1}")));
         });
       });
@@ -363,7 +421,7 @@ impl WorldEditorUi<'_, '_> {
 
     let (camera, camera_transform) = **camera;
     let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(view);
-    placed.iter().for_each(|(_, marker, _, &Transform { translation, .. })| {
+    placed.iter().for_each(|(_, marker, _, &Transform { translation, .. }, _)| {
       if let Some(Marker { name }) = marker
         && let Ok(Vec2 { x, y }) =
           camera.world_to_viewport(camera_transform, translation + Vec3::Y * MARKER_POLE)
@@ -390,7 +448,7 @@ fn use_tool(
   window: Single<&Window>,
   mouse: Res<ButtonInput<MouseButton>>,
   time: Res<Time>,
-  placed: Query<(Entity, &Transform), Or<(With<Marker>, With<Model>)>>,
+  placed: Query<(Entity, &Transform), Or<(With<Marker>, With<Model>, With<Billboard>)>>,
   mut gizmos: Gizmos,
   mut commands: Commands
 ) {
@@ -494,6 +552,12 @@ fn use_tool(
           ));
         }
       }
+      Tool::PlaceBillboard => {
+        if clicked {
+          let Billboard { texture, size, mode } = editor.billboard.clone();
+          commands.spawn(PlacedBillboard { texture, position: hit, size, mode }.spawn());
+        }
+      }
       Tool::PlaceMarker => {
         if clicked {
           commands.spawn((
@@ -524,7 +588,10 @@ fn use_tool(
 fn draw_markers_and_selection(
   editor: Res<WorldEditor>,
   terrain: Res<Terrain>,
-  placed: Query<(Entity, &Transform, Has<Marker>), Or<(With<Marker>, With<Model>)>>,
+  placed: Query<
+    (Entity, &Transform, Has<Marker>),
+    Or<(With<Marker>, With<Model>, With<Billboard>)>
+  >,
   mut gizmos: Gizmos
 ) {
   placed.iter().for_each(|(entity, &Transform { translation, .. }, is_marker)| {
