@@ -1,10 +1,12 @@
 //! World design: sculpting the terrain, painting ground, placing models and markers.
 
 use {crate::Mode,
-     bevy::{ecs::system::SystemParam, prelude::*},
+     bevy::{camera_controller::free_camera::FreeCamera, ecs::system::SystemParam, prelude::*},
      bevy_egui::egui,
-     std::{f32::consts::TAU, fs},
+     std::{f32::consts::TAU, fs,
+           path::{Path, PathBuf}},
      winterjam2026::{assets::ASSETS_DIR,
+                     model::MODEL_EXTENSION,
                      world::{Ground, MODELS_DIR, Marker, Model, Terrain, WorldFile}}};
 
 /// How a height brush moves the terrain vertices under it.
@@ -84,18 +86,31 @@ impl NewWorld {
   const DEFAULT: Self = Self { cells_x: 64, cells_z: 64, cell_size: 2.0 };
 }
 
-/// Asset paths of the models in [`MODELS_DIR`], like `models/pine.glb`.
-fn model_paths() -> Vec<String> {
-  let mut paths = fs::read_dir(MODELS_DIR)
+/// Every file in `dir` and its subfolders.
+fn files(dir: &Path) -> Vec<PathBuf> {
+  fs::read_dir(dir)
     .into_iter()
     .flatten()
     .flatten()
     .map(|entry| entry.path())
+    .flat_map(|path| if path.is_dir() { files(&path) } else { vec![path] })
+    .collect()
+}
+
+/// Asset paths of the models in [`MODELS_DIR`] and its subfolders, like
+/// `models/pine.glb`.
+fn model_paths() -> Vec<String> {
+  let mut paths = files(Path::new(MODELS_DIR))
+    .into_iter()
     .filter(|path| {
       path.extension().is_some_and(|extension| extension == "glb" || extension == "gltf")
+        || path.to_string_lossy().ends_with(MODEL_EXTENSION)
     })
     .filter_map(|path| {
-      path.strip_prefix(ASSETS_DIR).ok().map(|path| path.to_string_lossy().into_owned())
+      path
+        .strip_prefix(ASSETS_DIR)
+        .ok()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
     })
     .collect::<Vec<_>>();
   paths.sort();
@@ -167,7 +182,7 @@ pub struct WorldEditorUi<'w, 's> {
   editor: ResMut<'w, WorldEditor>,
   terrain: Res<'w, Terrain>,
   keys: Res<'w, ButtonInput<KeyCode>>,
-  camera: Single<'w, 's, (&'static Camera, &'static GlobalTransform), With<Camera3d>>,
+  camera: Single<'w, 's, (&'static Camera, &'static GlobalTransform), With<FreeCamera>>,
   placed: Query<
     'w,
     's,
@@ -267,7 +282,9 @@ impl WorldEditorUi<'_, '_> {
               editor.models = model_paths();
             }
             if editor.models.is_empty() {
-              ui.label(format!("Put .glb or .gltf files in {MODELS_DIR}/"));
+              ui.label(format!(
+                "Make models in the Models tab, or put .glb files in {MODELS_DIR}/"
+              ));
             }
             editor.models.iter().for_each(|path| {
               ui.selectable_value(&mut editor.model, Some(path.clone()), path);
@@ -369,7 +386,7 @@ impl WorldEditorUi<'_, '_> {
 fn use_tool(
   mut editor: ResMut<WorldEditor>,
   mut terrain: ResMut<Terrain>,
-  camera: Single<(&Camera, &GlobalTransform), With<Camera3d>>,
+  camera: Single<(&Camera, &GlobalTransform), With<FreeCamera>>,
   window: Single<&Window>,
   mouse: Res<ButtonInput<MouseButton>>,
   time: Res<Time>,

@@ -1,10 +1,12 @@
-//! Content editor built into the game: world design and texture painting. Comes with
-//! the `editor` feature, which is on by default; build without it for a release.
+//! Content editor built into the game: world design, texture painting and low poly
+//! modeling. Comes with the `editor` feature, which is on by default; build without it
+//! for a release.
 //!
 //! F1 switches between editing and playing. Edits apply to the running world, so play
 //! picks them up straight away, and leaving play puts the camera back where editing
 //! left it.
 
+mod model_editor;
 mod pixel_editor;
 mod world_editor;
 
@@ -14,6 +16,7 @@ use {crate::{Mode, start_transform},
             prelude::*},
      bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui,
                  input::EguiWantsInput},
+     model_editor::ModelEditorUi,
      pixel_editor::PixelEditorUi,
      winterjam2026::world::Markers,
      world_editor::WorldEditorUi};
@@ -25,7 +28,8 @@ const TOGGLE_KEY: KeyCode = KeyCode::F1;
 pub enum Editor {
   #[default]
   World,
-  Textures
+  Textures,
+  Models
 }
 
 /// Where the camera was when play started, to return to after.
@@ -109,8 +113,7 @@ fn edit_ui(
   mut contexts: EguiContexts,
   mut editor: ResMut<Editor>,
   mut next: ResMut<NextState<Mode>>,
-  mut world_editor: WorldEditorUi,
-  mut pixel_editor: PixelEditorUi
+  mut editors: ParamSet<(WorldEditorUi, PixelEditorUi, ModelEditorUi)>
 ) -> Result {
   let ctx = contexts.ctx_mut()?;
   let mut root = root_ui(ctx);
@@ -118,6 +121,7 @@ fn edit_ui(
     ui.horizontal(|ui| {
       ui.selectable_value(&mut *editor, Editor::World, "World");
       ui.selectable_value(&mut *editor, Editor::Textures, "Textures");
+      ui.selectable_value(&mut *editor, Editor::Models, "Models");
       ui.separator();
       if ui.button("▶ Play (F1)").clicked() {
         next.set(Mode::Play);
@@ -125,8 +129,9 @@ fn edit_ui(
     });
   });
   match *editor {
-    Editor::World => world_editor.ui(&mut root),
-    Editor::Textures => pixel_editor.ui(&mut root)
+    Editor::World => editors.p0().ui(&mut root),
+    Editor::Textures => editors.p1().ui(&mut root),
+    Editor::Models => editors.p2().ui(&mut root)
   }
   Ok(())
 }
@@ -145,7 +150,12 @@ fn play_ui(mut contexts: EguiContexts) -> Result {
 
 pub fn plugin(app: &mut App) {
   app
-    .add_plugins((EguiPlugin::default(), world_editor::plugin, pixel_editor::plugin))
+    .add_plugins((
+      EguiPlugin::default(),
+      world_editor::plugin,
+      pixel_editor::plugin,
+      model_editor::plugin
+    ))
     .init_resource::<Editor>()
     .init_resource::<EditCamera>()
     .add_systems(Update, (toggle_mode, enable_camera))

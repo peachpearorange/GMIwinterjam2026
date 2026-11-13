@@ -96,7 +96,7 @@ fn parse_hex(text: &str) -> Option<Rgba> {
 /// The colors offered for painting. Saved to [`Palette::NAME`] in [`ASSETS_DIR`], as hex
 /// codes, whenever they change.
 #[derive(Resource, Clone, PartialEq)]
-struct Palette(Vec<Rgba>);
+pub(super) struct Palette(pub(super) Vec<Rgba>);
 
 impl Palette {
   const NAME: &str = "palette.ron";
@@ -118,7 +118,7 @@ impl Palette {
       })
   }
 
-  fn save(&self) -> Result<(), String> {
+  pub(super) fn save(&self) -> Result<(), String> {
     ron::to_string(&self.0.iter().map(|&color| hex(color)).collect::<Vec<_>>())
       .map_err(|error| error.to_string())
       .and_then(|text| {

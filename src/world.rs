@@ -8,13 +8,14 @@ use {bevy::{asset::RenderAssetUsages,
             prelude::*,
             render::render_resource::{Extent3d, PrimitiveTopology, TextureDimension,
                                       TextureFormat}},
-     crate::assets::{self, ASSETS_DIR},
+     crate::{assets::{self, ASSETS_DIR},
+             model::{MODEL_EXTENSION, ModelMeshes}},
      serde::{Deserialize, Serialize},
      std::{fs, io, path::Path}};
 
 /// Where ground textures live. `{TEXTURES_DIR}/{surface name}.png` textures a ground.
 pub const TEXTURES_DIR: &str = "assets/textures";
-/// Where placeable models (`.glb`/`.gltf`) live.
+/// Where placeable models (`.glb`, `.gltf` and low poly `.model.ron`) live.
 pub const MODELS_DIR: &str = "assets/models";
 
 /// PBR look of a kind of ground.
@@ -320,12 +321,21 @@ pub struct Model {
 fn attach_model_scenes(
   models: Query<(Entity, &Model), Added<Model>>,
   asset_server: Res<AssetServer>,
+  mut model_meshes: ResMut<ModelMeshes>,
+  mut meshes: ResMut<Assets<Mesh>>,
   mut commands: Commands
 ) {
   models.iter().for_each(|(entity, Model { path })| {
-    commands.entity(entity).insert(WorldAssetRoot(
-      asset_server.load(GltfAssetLabel::Scene(0).from_asset(path.clone()))
-    ));
+    if path.ends_with(MODEL_EXTENSION) {
+      commands.entity(entity).insert((
+        Mesh3d(model_meshes.get(path, &mut meshes)),
+        MeshMaterial3d(model_meshes.material.clone())
+      ));
+    } else {
+      commands.entity(entity).insert(WorldAssetRoot(
+        asset_server.load(GltfAssetLabel::Scene(0).from_asset(path.clone()))
+      ));
+    }
   });
 }
 
@@ -456,7 +466,7 @@ pub struct WorldPlugin;
 
 impl Plugin for WorldPlugin {
   fn build(&self, app: &mut App) {
-    app.add_systems(Startup, load_world).add_systems(
+    app.init_resource::<ModelMeshes>().add_systems(Startup, load_world).add_systems(
       Update,
       (rebuild_terrain_meshes.run_if(resource_changed::<Terrain>), attach_model_scenes)
     );
