@@ -3,7 +3,8 @@ mod editor;
 
 use {bevy::{camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
             prelude::*},
-     winterjam2026::world::{Markers, WorldPlugin}};
+     winterjam2026::{assets,
+                     world::{Markers, WorldPlugin}}};
 
 /// Marker the camera starts at, when the world has one.
 const START_MARKER: &str = "start";
@@ -43,6 +44,7 @@ fn spawn_camera(mut commands: Commands, markers: Markers) {
 fn main() {
   let mut app = App::new();
   app
+    .add_plugins(assets::plugin)
     .add_plugins((
       DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window { title: "Winter Jam 2026".into(), ..default() }),

@@ -1,6 +1,6 @@
 //! The designed world: a low poly heightmap terrain with a ground material per cell,
-//! placed 3D models, and named markers. Authored in the `content` bin, saved to
-//! [`WorldFile::PATH`], and loaded by both bins through [`WorldPlugin`].
+//! placed 3D models, and named markers. Authored in the editor, saved to
+//! [`WorldFile::NAME`] in [`ASSETS_DIR`], and loaded through [`WorldPlugin`].
 
 use {bevy::{asset::RenderAssetUsages,
             ecs::system::SystemParam,
@@ -8,11 +8,10 @@ use {bevy::{asset::RenderAssetUsages,
             prelude::*,
             render::render_resource::{Extent3d, PrimitiveTopology, TextureDimension,
                                       TextureFormat}},
+     crate::assets::{self, ASSETS_DIR},
      serde::{Deserialize, Serialize},
-     std::{fs, io, path::PathBuf}};
+     std::{fs, io, path::Path}};
 
-/// Directory bevy loads assets from, relative to the working directory.
-pub const ASSETS_DIR: &str = "assets";
 /// Where ground textures live. `{TEXTURES_DIR}/{surface name}.png` textures a ground.
 pub const TEXTURES_DIR: &str = "assets/textures";
 /// Where placeable models (`.glb`/`.gltf`) live.
@@ -114,15 +113,14 @@ impl Ground {
     }
   }
 
-  pub fn texture_path(self) -> PathBuf {
-    PathBuf::from(TEXTURES_DIR).join(format!("{}.png", self.surface().name))
-  }
+  /// The texture's path in [`ASSETS_DIR`].
+  pub fn texture(self) -> String { format!("textures/{}.png", self.surface().name) }
 
-  /// The surface as a material, textured when [`Self::texture_path`] exists.
+  /// The surface as a material, textured when [`Self::texture`] exists.
   pub fn material(self, images: &mut Assets<Image>) -> StandardMaterial {
     let Surface { color, roughness, metallic, reflectance, .. } = self.surface();
-    let texture = image::open(self.texture_path())
-      .ok()
+    let texture = assets::read(&self.texture())
+      .and_then(|bytes| image::load_from_memory(&bytes).ok())
       .map(|image| image.into_rgba8())
       .map(|image| {
         images.add(tiling_pixel_image(
@@ -352,64 +350,33 @@ impl PlacedModel {
   }
 }
 
-/// The colors offered for painting textures, as unmultiplied sRGB.
-#[derive(Resource, Clone, Serialize, Deserialize)]
-pub struct Palette(pub Vec<[u8; 4]>);
-
-impl Palette {
-  /// CC-29 and a few additions, as `0xRRGGBB`.
-  const DEFAULT: [u32; 37] = [
-    0xf2f0e5, 0xb8b5b9, 0x868188, 0x646365, 0x45444f, 0x3a3858, 0x212123, 0x352b42,
-    0x43436a, 0x4b80ca, 0x68c2d3, 0xa2dcc7, 0xede19e, 0xd3a068, 0xb45252, 0x6a536e,
-    0x4b4158, 0x80493a, 0xa77b5b, 0xe5ceb4, 0xc2d368, 0x8ab060, 0x567b79, 0x4e584a,
-    0x7b7243, 0xb2b47e, 0xedc8c4, 0xcf8acb, 0x5f556a, 0xb13e53, 0xf4d4b8, 0xe8b894,
-    0xde1d1d, 0x61c843, 0x5dbf40, 0x2c7867, 0x256556
-  ];
-}
-
-impl Default for Palette {
-  fn default() -> Self {
-    Self(
-      Self::DEFAULT
-        .map(|hex| {
-          let [_, r, g, b] = hex.to_be_bytes();
-          [r, g, b, u8::MAX]
-        })
-        .to_vec()
-    )
-  }
-}
-
 /// The world as saved on disk.
 #[derive(Serialize, Deserialize)]
 pub struct WorldFile {
   pub markers: Vec<PlacedMarker>,
   pub models: Vec<PlacedModel>,
-  pub terrain: Terrain,
-  #[serde(default)]
-  pub palette: Palette
+  pub terrain: Terrain
 }
 
 impl Default for WorldFile {
   fn default() -> Self {
-    Self {
-      markers: default(),
-      models: default(),
-      terrain: Terrain::flat(64, 64, 2.0),
-      palette: default()
-    }
+    Self { markers: default(), models: default(), terrain: Terrain::flat(64, 64, 2.0) }
   }
 }
 
 impl WorldFile {
-  pub const PATH: &str = "assets/world.ron";
+  /// The file's name in [`ASSETS_DIR`].
+  pub const NAME: &str = "world.ron";
 
   /// The saved world, or a flat snowy one when there is no readable save.
   pub fn load() -> Self {
-    fs::read_to_string(Self::PATH)
-      .ok()
-      .and_then(|text| {
-        ron::from_str(&text).inspect_err(|error| error!("{}: {error}", Self::PATH)).ok()
+    assets::read(Self::NAME)
+      .and_then(|bytes| {
+        str::from_utf8(&bytes)
+          .map_err(|error| error.to_string())
+          .and_then(|text| ron::from_str(text).map_err(|error| error.to_string()))
+          .inspect_err(|error| error!("{}: {error}", Self::NAME))
+          .ok()
       })
       .unwrap_or_default()
   }
@@ -417,13 +384,12 @@ impl WorldFile {
   pub fn save(&self) -> io::Result<()> {
     ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::new().depth_limit(2))
       .map_err(io::Error::other)
-      .and_then(|text| fs::write(Self::PATH, text))
+      .and_then(|text| fs::write(Path::new(ASSETS_DIR).join(Self::NAME), text))
   }
 
   /// Gathers the live world back into a file.
   pub fn collect<'a>(
     terrain: &Terrain,
-    palette: &Palette,
     markers: impl IntoIterator<Item = (&'a Marker, &'a Transform)>,
     models: impl IntoIterator<Item = (&'a Model, &'a Transform)>
   ) -> Self {
@@ -443,17 +409,15 @@ impl WorldFile {
           yaw: rotation.to_euler(EulerRot::YXZ).0
         })
         .collect(),
-      terrain: terrain.clone(),
-      palette: palette.clone()
+      terrain: terrain.clone()
     }
   }
 
-  /// Makes this the live world: the [`Terrain`] and [`Palette`] resources plus
-  /// [`Marker`] and [`Model`] entities. Doesn't remove what is already there.
+  /// Makes this the live world: the [`Terrain`] resource plus [`Marker`] and [`Model`]
+  /// entities. Doesn't remove what is already there.
   pub fn spawn(self, commands: &mut Commands) {
-    let Self { markers, models, terrain, palette } = self;
+    let Self { markers, models, terrain } = self;
     commands.insert_resource(terrain);
-    commands.insert_resource(palette);
     commands.spawn_batch(markers.into_iter().map(|PlacedMarker { name, position }| {
       (Marker { name }, Transform::from_translation(position))
     }));

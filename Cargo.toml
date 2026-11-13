@@ -10,6 +10,9 @@ image = "0.25.10"
 ron = "0.12.3"
 serde = { version = "1.0.229", features = ["derive"] }
 
+[build-dependencies]
+ron = "0.12.3"
+
 [features]
 default = ["editor"]
 # The content editor, built into the game. Leave it out of releases with

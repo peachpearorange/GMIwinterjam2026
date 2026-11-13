@@ -11,8 +11,8 @@ use {bevy::{ecs::system::SystemParam, prelude::*},
            process::Command,
            thread::{self, JoinHandle},
            time::Duration},
-     winterjam2026::world::{Ground, GroundMaterials, Palette, TEXTURES_DIR,
-                            tiling_pixel_image}};
+     winterjam2026::{assets::{self, ASSETS_DIR},
+                     world::{Ground, GroundMaterials, TEXTURES_DIR, tiling_pixel_image}}};
 
 fn texture_path(name: &str) -> PathBuf {
   Path::new(TEXTURES_DIR).join(format!("{name}.png"))
@@ -91,6 +91,54 @@ fn parse_hex(text: &str) -> Option<Rgba> {
       })
     }
   )
+}
+
+/// The colors offered for painting. Saved to [`Palette::NAME`] in [`ASSETS_DIR`], as hex
+/// codes, whenever they change.
+#[derive(Resource, Clone, PartialEq)]
+struct Palette(Vec<Rgba>);
+
+impl Palette {
+  const NAME: &str = "palette.ron";
+  /// CC-29 and a few additions, as `0xRRGGBB`.
+  const DEFAULT: [u32; 37] = [
+    0xf2f0e5, 0xb8b5b9, 0x868188, 0x646365, 0x45444f, 0x3a3858, 0x212123, 0x352b42,
+    0x43436a, 0x4b80ca, 0x68c2d3, 0xa2dcc7, 0xede19e, 0xd3a068, 0xb45252, 0x6a536e,
+    0x4b4158, 0x80493a, 0xa77b5b, 0xe5ceb4, 0xc2d368, 0x8ab060, 0x567b79, 0x4e584a,
+    0x7b7243, 0xb2b47e, 0xedc8c4, 0xcf8acb, 0x5f556a, 0xb13e53, 0xf4d4b8, 0xe8b894,
+    0xde1d1d, 0x61c843, 0x5dbf40, 0x2c7867, 0x256556
+  ];
+
+  /// The saved palette, or the default one when there is no readable save.
+  fn load() -> Self {
+    assets::read(Self::NAME)
+      .and_then(|bytes| ron::de::from_bytes::<Vec<String>>(&bytes).ok())
+      .map_or_else(default, |codes| {
+        Self(codes.iter().filter_map(|code| parse_hex(code)).collect())
+      })
+  }
+
+  fn save(&self) -> Result<(), String> {
+    ron::to_string(&self.0.iter().map(|&color| hex(color)).collect::<Vec<_>>())
+      .map_err(|error| error.to_string())
+      .and_then(|text| {
+        fs::write(Path::new(ASSETS_DIR).join(Self::NAME), text)
+          .map_err(|error| error.to_string())
+      })
+  }
+}
+
+impl Default for Palette {
+  fn default() -> Self {
+    Self(
+      Self::DEFAULT
+        .map(|code| {
+          let [_, r, g, b] = code.to_be_bytes();
+          [r, g, b, u8::MAX]
+        })
+        .to_vec()
+    )
+  }
 }
 
 /// Asks the XDG desktop portal for a color picked off the screen. Prints `#rrggbb` on
@@ -1434,6 +1482,7 @@ impl Default for PixelEditor {
 #[derive(SystemParam)]
 pub struct PixelEditorUi<'w> {
   editor: ResMut<'w, PixelEditor>,
+  palette: ResMut<'w, Palette>,
   images: ResMut<'w, Assets<Image>>,
   materials: ResMut<'w, Assets<StandardMaterial>>,
   ground_materials: Res<'w, GroundMaterials>
@@ -1441,11 +1490,12 @@ pub struct PixelEditorUi<'w> {
 
 impl PixelEditorUi<'_> {
   /// Draws the pixel editor over the whole window.
-  pub fn ui(&mut self, root: &mut egui::Ui, palette: &mut Palette) {
-    let Self { editor, images, materials, ground_materials } = self;
+  pub fn ui(&mut self, root: &mut egui::Ui) {
+    let Self { editor, palette, images, materials, ground_materials } = self;
     let editor = &mut **editor;
     let ctx = root.ctx().clone();
     let tool = editor.tool;
+    let palette_before = palette.clone();
 
     if editor.screen_pick.as_ref().is_some_and(JoinHandle::is_finished)
       && let Some(picking) = editor.screen_pick.take()
@@ -1502,6 +1552,12 @@ impl PixelEditorUi<'_> {
       .show(root, |ui| editor.side_panel(ui, palette, shown));
     egui::CentralPanel::default().show(root, |ui| editor.canvas_view(ui, palette));
 
+    if **palette != palette_before
+      && let Err(error) = palette.save()
+    {
+      editor.status = format!("Can't save the palette: {error}")
+    }
+
     // Switching tools puts the floating selection down.
     if editor.tool != tool {
       editor.gesture = None;
@@ -1510,4 +1566,6 @@ impl PixelEditorUi<'_> {
   }
 }
 
-pub fn plugin(app: &mut App) { app.init_resource::<PixelEditor>(); }
+pub fn plugin(app: &mut App) {
+  app.init_resource::<PixelEditor>().insert_resource(Palette::load());
+}
