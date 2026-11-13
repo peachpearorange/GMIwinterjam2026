@@ -352,17 +352,52 @@ impl PlacedModel {
   }
 }
 
+/// The colors offered for painting textures, as unmultiplied sRGB.
+#[derive(Resource, Clone, Serialize, Deserialize)]
+pub struct Palette(pub Vec<[u8; 4]>);
+
+impl Palette {
+  /// CC-29 and a few additions, as `0xRRGGBB`.
+  const DEFAULT: [u32; 37] = [
+    0xf2f0e5, 0xb8b5b9, 0x868188, 0x646365, 0x45444f, 0x3a3858, 0x212123, 0x352b42,
+    0x43436a, 0x4b80ca, 0x68c2d3, 0xa2dcc7, 0xede19e, 0xd3a068, 0xb45252, 0x6a536e,
+    0x4b4158, 0x80493a, 0xa77b5b, 0xe5ceb4, 0xc2d368, 0x8ab060, 0x567b79, 0x4e584a,
+    0x7b7243, 0xb2b47e, 0xedc8c4, 0xcf8acb, 0x5f556a, 0xb13e53, 0xf4d4b8, 0xe8b894,
+    0xde1d1d, 0x61c843, 0x5dbf40, 0x2c7867, 0x256556
+  ];
+}
+
+impl Default for Palette {
+  fn default() -> Self {
+    Self(
+      Self::DEFAULT
+        .map(|hex| {
+          let [_, r, g, b] = hex.to_be_bytes();
+          [r, g, b, u8::MAX]
+        })
+        .to_vec()
+    )
+  }
+}
+
 /// The world as saved on disk.
 #[derive(Serialize, Deserialize)]
 pub struct WorldFile {
   pub markers: Vec<PlacedMarker>,
   pub models: Vec<PlacedModel>,
-  pub terrain: Terrain
+  pub terrain: Terrain,
+  #[serde(default)]
+  pub palette: Palette
 }
 
 impl Default for WorldFile {
   fn default() -> Self {
-    Self { markers: default(), models: default(), terrain: Terrain::flat(64, 64, 2.0) }
+    Self {
+      markers: default(),
+      models: default(),
+      terrain: Terrain::flat(64, 64, 2.0),
+      palette: default()
+    }
   }
 }
 
@@ -388,6 +423,7 @@ impl WorldFile {
   /// Gathers the live world back into a file.
   pub fn collect<'a>(
     terrain: &Terrain,
+    palette: &Palette,
     markers: impl IntoIterator<Item = (&'a Marker, &'a Transform)>,
     models: impl IntoIterator<Item = (&'a Model, &'a Transform)>
   ) -> Self {
@@ -407,15 +443,17 @@ impl WorldFile {
           yaw: rotation.to_euler(EulerRot::YXZ).0
         })
         .collect(),
-      terrain: terrain.clone()
+      terrain: terrain.clone(),
+      palette: palette.clone()
     }
   }
 
-  /// Makes this the live world: the [`Terrain`] resource plus [`Marker`] and [`Model`]
-  /// entities. Doesn't remove what is already there.
+  /// Makes this the live world: the [`Terrain`] and [`Palette`] resources plus
+  /// [`Marker`] and [`Model`] entities. Doesn't remove what is already there.
   pub fn spawn(self, commands: &mut Commands) {
-    let Self { markers, models, terrain } = self;
+    let Self { markers, models, terrain, palette } = self;
     commands.insert_resource(terrain);
+    commands.insert_resource(palette);
     commands.spawn_batch(markers.into_iter().map(|PlacedMarker { name, position }| {
       (Marker { name }, Transform::from_translation(position))
     }));

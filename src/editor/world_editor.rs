@@ -4,8 +4,8 @@ use {crate::Mode,
      bevy::{ecs::system::SystemParam, prelude::*},
      bevy_egui::egui,
      std::{f32::consts::TAU, fs},
-     winterjam2026::world::{ASSETS_DIR, Ground, MODELS_DIR, Marker, Model, Terrain,
-                            WorldFile}};
+     winterjam2026::world::{ASSETS_DIR, Ground, MODELS_DIR, Marker, Model, Palette,
+                            Terrain, WorldFile}};
 
 /// How a height brush moves the terrain vertices under it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -179,7 +179,7 @@ pub struct WorldEditorUi<'w, 's> {
 
 impl WorldEditorUi<'_, '_> {
   /// Draws the world editor's panels into the window, leaving the 3D view uncovered.
-  pub fn ui(&mut self, root: &mut egui::Ui) {
+  pub fn ui(&mut self, root: &mut egui::Ui, palette: &Palette) {
     let Self { editor, terrain, keys, camera, placed, commands } = self;
     let editor = &mut **editor;
     egui::Panel::left("world_editor").show(root, |ui| {
@@ -191,6 +191,7 @@ impl WorldEditorUi<'_, '_> {
         {
           editor.status = WorldFile::collect(
             terrain,
+            palette,
             placed.iter().filter_map(|(_, marker, _, transform)| {
               marker.map(|marker| (marker, transform))
             }),

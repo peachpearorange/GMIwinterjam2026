@@ -15,7 +15,7 @@ use {crate::{Mode, start_transform},
      bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui,
                  input::EguiWantsInput},
      pixel_editor::PixelEditorUi,
-     winterjam2026::world::Markers,
+     winterjam2026::world::{Markers, Palette},
      world_editor::WorldEditorUi};
 
 const TOGGLE_KEY: KeyCode = KeyCode::F1;
@@ -110,7 +110,8 @@ fn edit_ui(
   mut editor: ResMut<Editor>,
   mut next: ResMut<NextState<Mode>>,
   mut world_editor: WorldEditorUi,
-  mut pixel_editor: PixelEditorUi
+  mut pixel_editor: PixelEditorUi,
+  mut palette: ResMut<Palette>
 ) -> Result {
   let ctx = contexts.ctx_mut()?;
   let mut root = root_ui(ctx);
@@ -125,8 +126,8 @@ fn edit_ui(
     });
   });
   match *editor {
-    Editor::World => world_editor.ui(&mut root),
-    Editor::Textures => pixel_editor.ui(&mut root)
+    Editor::World => world_editor.ui(&mut root, &palette),
+    Editor::Textures => pixel_editor.ui(&mut root, &mut palette)
   }
   Ok(())
 }
