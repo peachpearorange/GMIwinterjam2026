@@ -4,8 +4,10 @@
 //! shape, click it, drag the colored arrows to move it, pick single faces to drag them
 //! out and make shapes longer, and paint. Left drag on empty space turns the view,
 //! right drag slides it, the wheel zooms. Tools have single keys like the pixel
-//! editor: 1 whole pieces, 2 faces, V select and move, B paint, Q pick a color, D copy,
-//! X delete, E pull a face out, R turn 90°, Ctrl Z undo.
+//! editor: 1 whole pieces, 2 faces, 3 points, V select and move, B paint, Q pick a
+//! color, E pull a face out, S resize, M squeeze to a point, D copy, Shift D mirror
+//! copy, X delete, R T turn, Ctrl Z undo. A handful of tools that combine: a cube with
+//! its top face squeezed is a pyramid, a cylinder with its top face resized a cone.
 //!
 //! Advanced mode works like a pocket Blender: select vertices, edges or faces, then
 //! move, rotate, scale, extrude and inset them with the keyboard:
@@ -450,6 +452,8 @@ pub struct ModelEditor {
   simple: bool,
   /// The move arrow under the pointer.
   arrow_hover: Option<Arrow>,
+  /// How far the simple mode's turn keys turn.
+  turn_degrees: f32,
   /// The model before the paint stroke in progress.
   stroke: Option<(LowPoly, Selection)>,
   hover: Option<Hit>,
@@ -495,6 +499,7 @@ impl Default for ModelEditor {
       orbit_pans: false,
       simple: true,
       arrow_hover: None,
+      turn_degrees: 90.0,
       stroke: None,
       hover: None,
       viewport_pixels: UVec2::ONE,
@@ -649,13 +654,13 @@ impl ModelEditor {
     }
   }
 
-  /// Turns the selection a quarter turn around `axis` through its center.
+  /// Turns the selection by [`Self::turn_degrees`] around `axis` through its center.
   fn turn(&mut self, axis: Vec3) {
     let Some(pivot) = ops::selection_center(&self.model, &self.selection) else {
       self.status = "Select something to turn".into();
       return;
     };
-    let rotation = Quat::from_axis_angle(axis, FRAC_PI_2);
+    let rotation = Quat::from_axis_angle(axis, self.turn_degrees.to_radians());
     self.edit(|editor| {
       editor.selection.iter().for_each(|&v| {
         let p = &mut editor.model.vertices[v];
@@ -664,6 +669,35 @@ impl ModelEditor {
         *p = (*p * 1e4).round() / 1e4
       })
     })
+  }
+
+  /// Pulls the selection together into one point, then picks that point to drag.
+  fn squeeze(&mut self) {
+    if self.selection.len() < 2 {
+      self.status = "Select a face or points to squeeze".into();
+      return;
+    }
+    self.edit(|editor| ops::merge(&mut editor.model, &mut editor.selection));
+    self.mode = SelectMode::Vertex
+  }
+
+  /// Copies the selected faces flipped to the other side of the middle (x = 0), for
+  /// building one half of something and getting the other half free.
+  fn mirror_copy(&mut self) {
+    let mut copied = false;
+    self.edit(|editor| {
+      copied = ops::duplicate(&mut editor.model, &mut editor.selection);
+      if copied {
+        ops::mirror(&mut editor.model, &editor.selection, 0, Vec3::ZERO)
+      }
+    });
+    self.status = if !copied {
+      "Select a piece or faces to mirror".into()
+    } else if self.selection.iter().all(|&v| self.model.vertices[v].x.abs() < 0.01) {
+      "Mirrored onto itself: move it off the middle line first".into()
+    } else {
+      "Mirrored to the other side of the blue line".into()
+    }
   }
 
   /// Copies the selected faces and puts the copy right beside them along x.
@@ -998,6 +1032,9 @@ impl ModelEditor {
         let handled = match key {
           Key::Num1 => Some(self.mode = SelectMode::Piece),
           Key::Num2 => Some(self.mode = SelectMode::Face),
+          Key::Num3 => Some(self.mode = SelectMode::Vertex),
+          Key::M => Some(self.squeeze()),
+          Key::D if modifiers.shift => Some(self.mirror_copy()),
           Key::R if modifiers.shift => Some(self.turn(Vec3::X)),
           Key::R => Some(self.turn(Vec3::Y)),
           Key::T => Some(self.turn(Vec3::Z)),
@@ -1134,7 +1171,7 @@ impl ModelEditor {
 
   fn set_simple(&mut self, simple: bool) {
     self.simple = simple;
-    if simple && matches!(self.mode, SelectMode::Vertex | SelectMode::Edge) {
+    if simple && self.mode == SelectMode::Edge {
       self.mode = SelectMode::Face
     }
   }
@@ -1211,6 +1248,7 @@ impl ModelEditor {
       ui.strong("CLICKING PICKS");
       Self::big_choice(ui, &mut self.mode, SelectMode::Piece, "Whole piece", "1", "Clicking a shape picks all of it");
       Self::big_choice(ui, &mut self.mode, SelectMode::Face, "One face", "2", "Clicking picks one side, to drag it out and make the shape longer");
+      Self::big_choice(ui, &mut self.mode, SelectMode::Vertex, "One point", "3", "Clicking picks a corner, to bend shapes into rocks and slopes");
 
       ui.separator();
       ui.strong("TOOL");
@@ -1220,32 +1258,51 @@ impl ModelEditor {
 
       ui.separator();
       ui.strong("CHANGE THE SELECTION");
+      ui.add_space(2.0);
       let at = ui.ctx().pointer_latest_pos().map_or(Vec2::ZERO, to_vec);
-      if Self::big_button(ui, "Copy beside it", "D", "Makes a copy next to the selection") {
-        self.copy_beside()
+      ui.weak("Shape it");
+      if Self::big_button(ui, "Pull out", "E", "Pulls the selected face out into a new block: arms, chimneys, branches. Move the mouse, click to finish") {
+        self.extrude(at)
       }
+      if Self::big_button(ui, "Resize", "S", "Grows or shrinks with the mouse, click to finish. On one face it tapers the shape") {
+        self.start_modal(ModalKind::Scale, at, false)
+      }
+      if Self::big_button(ui, "Squeeze to a point", "M", "Pulls a face or points into one point: a cube's top becomes a pyramid") {
+        self.squeeze()
+      }
+      ui.weak("Turn");
+      ui.columns(3, |columns| {
+        let [a, b, c] = columns else { return };
+        if Self::big_button(a, "Turn", "R", "Around the up axis") {
+          self.turn(Vec3::Y)
+        }
+        if Self::big_button(b, "Tip", "Shift R", "Forward, around the red axis") {
+          self.turn(Vec3::X)
+        }
+        if Self::big_button(c, "Roll", "T", "Sideways, around the blue axis") {
+          self.turn(Vec3::Z)
+        }
+      });
+      ui.horizontal(|ui| {
+        ui.label("by");
+        [90.0, 45.0, 15.0].into_iter().for_each(|degrees| {
+          ui.selectable_value(&mut self.turn_degrees, degrees, format!("{degrees}°"));
+        })
+      });
+      ui.weak("Copy and remove");
+      ui.columns(2, |columns| {
+        let [a, b] = columns else { return };
+        if Self::big_button(a, "Copy", "D", "Makes a copy right beside the selection") {
+          self.copy_beside()
+        }
+        if Self::big_button(b, "Mirror copy", "Shift D", "Copies it to the other side of the blue line, flipped: build one half, get the other free") {
+          self.mirror_copy()
+        }
+      });
       if Self::big_button(ui, "Delete", "X", "Removes the selection") {
         let mode = self.mode;
         self.edit(|editor| ops::delete(&mut editor.model, &mut editor.selection, mode))
       }
-      if Self::big_button(ui, "Pull face out", "E", "Pulls the selected face out into a new block. Move the mouse, click to finish") {
-        self.extrude(at)
-      }
-      if Self::big_button(ui, "Resize", "S", "Grows or shrinks with the mouse, click to finish") {
-        self.start_modal(ModalKind::Scale, at, false)
-      }
-      ui.columns(3, |columns| {
-        let [a, b, c] = columns else { return };
-        if Self::big_button(a, "Turn", "R", "A quarter turn around the up axis") {
-          self.turn(Vec3::Y)
-        }
-        if Self::big_button(b, "Tip", "Shift R", "A quarter turn forward, around the red axis") {
-          self.turn(Vec3::X)
-        }
-        if Self::big_button(c, "Roll", "T", "A quarter turn sideways, around the blue axis") {
-          self.turn(Vec3::Z)
-        }
-      });
       if Self::big_button(ui, "Paint selection", "C", "Gives the selected faces the color and material") {
         self.paint_selection()
       }
@@ -2270,6 +2327,7 @@ impl ModelEditor {
       match self.tool {
         Tool::Select if self.simple => match self.mode {
           SelectMode::Face => "Click a face to pick it · drag the arrows to pull it, making the shape longer or shorter · Shift click picks more",
+          SelectMode::Vertex => "Click a corner to pick it · drag the arrows to bend the shape · Shift click or Shift drag picks more",
           _ => "Click a shape to pick it · drag the arrows to move it · Shift click picks more · drag empty space to turn the view"
         },
         Tool::Picker => "Click a face to take its color and material",
