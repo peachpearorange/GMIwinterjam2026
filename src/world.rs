@@ -427,10 +427,14 @@ impl WorldFile {
       .unwrap_or_default()
   }
 
-  pub fn save(&self) -> io::Result<()> {
+  /// The file's contents as saved.
+  pub fn to_text(&self) -> io::Result<String> {
     ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::new().depth_limit(2))
       .map_err(io::Error::other)
-      .and_then(|text| fs::write(Path::new(ASSETS_DIR).join(Self::NAME), text))
+  }
+
+  pub fn save(&self) -> io::Result<()> {
+    self.to_text().and_then(|text| fs::write(Path::new(ASSETS_DIR).join(Self::NAME), text))
   }
 
   /// Gathers the live world back into a file.

@@ -194,7 +194,7 @@ pub fn delete(model: &mut LowPoly, selection: &mut Selection, mode: SelectMode) 
     SelectMode::Edge => {
       !face_edges(face).any(|(a, b)| selection.contains(&a) && selection.contains(&b))
     }
-    SelectMode::Face => !face_selected(face, selection)
+    SelectMode::Face | SelectMode::Piece => !face_selected(face, selection)
   });
   selection.clear();
   remove_unused(model, selection)
@@ -530,7 +530,9 @@ pub fn select_same_look(model: &LowPoly, selection: &mut Selection) {
 pub enum SelectMode {
   Vertex,
   Edge,
-  Face
+  Face,
+  /// Whole connected pieces, like a cube added from the shapes.
+  Piece
 }
 
 /// Shapes to start from.

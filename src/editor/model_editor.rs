@@ -1,6 +1,14 @@
-//! Low poly model editor for `assets/models/*.model.ron`, working like a pocket Blender:
-//! select vertices, edges or faces, then move, rotate, scale, extrude and inset them
-//! with the keyboard, and paint faces with the texture palette.
+//! Low poly model editor for `assets/models/*.model.ron`.
+//!
+//! It opens in simple mode, made for building out of shapes like in Blockbench: add a
+//! shape, click it, drag the colored arrows to move it, pick single faces to drag them
+//! out and make shapes longer, and paint. Left drag on empty space turns the view,
+//! right drag slides it, the wheel zooms. Tools have single keys like the pixel
+//! editor: 1 whole pieces, 2 faces, V select and move, B paint, Q pick a color, D copy,
+//! X delete, E pull a face out, R turn 90°, Ctrl Z undo.
+//!
+//! Advanced mode works like a pocket Blender: select vertices, edges or faces, then
+//! move, rotate, scale, extrude and inset them with the keyboard:
 //!
 //! - View: right or middle drag orbits, with Shift pans, the wheel zooms. Home frames
 //!   the model, `.` the selection, O switches perspective and orthographic.
@@ -294,7 +302,17 @@ enum Hit {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
   Select,
-  Paint
+  Paint,
+  /// Clicking a face takes its color and material, then goes back to painting.
+  Picker
+}
+
+/// A handle of the move arrows drawn on the selection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arrow {
+  Axis(Axis),
+  /// The dot in the middle, moving freely across the view.
+  Free
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -426,6 +444,12 @@ pub struct ModelEditor {
   box_select: Option<(Vec2, Vec2, BoxMode)>,
   /// The mouse button orbiting or panning the view.
   orbit: Option<PointerButton>,
+  /// Whether that button slides the view rather than turning it.
+  orbit_pans: bool,
+  /// Fewer, plainer tools and Blockbench style mouse controls, for starting out.
+  simple: bool,
+  /// The move arrow under the pointer.
+  arrow_hover: Option<Arrow>,
   /// The model before the paint stroke in progress.
   stroke: Option<(LowPoly, Selection)>,
   hover: Option<Hit>,
@@ -447,7 +471,7 @@ impl Default for ModelEditor {
       saved: None,
       undo: default(),
       redo: default(),
-      mode: SelectMode::Face,
+      mode: SelectMode::Piece,
       tool: Tool::Select,
       color,
       material: default(),
@@ -468,6 +492,9 @@ impl Default for ModelEditor {
       press: None,
       box_select: None,
       orbit: None,
+      orbit_pans: false,
+      simple: true,
+      arrow_hover: None,
       stroke: None,
       hover: None,
       viewport_pixels: UVec2::ONE,
@@ -600,7 +627,59 @@ impl ModelEditor {
     match hit {
       Hit::Vertex(v) => vec![v],
       Hit::Edge(a, b) => vec![a, b],
+      Hit::Face(f) if self.mode == SelectMode::Piece => self.piece_of(f),
       Hit::Face(f) => self.model.faces[f].vertices.clone()
+    }
+  }
+
+  /// The vertices of the whole piece face `f` is part of.
+  fn piece_of(&self, f: usize) -> Vec<usize> {
+    let mut piece = self.model.faces[f].vertices.iter().copied().collect();
+    ops::select_linked(&self.model, &mut piece);
+    piece.into_iter().collect()
+  }
+
+  /// The faces of the piece face `f` is part of, or just `f` outside piece mode.
+  fn hover_faces(&self, f: usize) -> Vec<usize> {
+    if self.mode == SelectMode::Piece {
+      let piece = self.piece_of(f).into_iter().collect();
+      ops::selected_faces(&self.model, &piece)
+    } else {
+      vec![f]
+    }
+  }
+
+  /// Turns the selection a quarter turn around `axis` through its center.
+  fn turn(&mut self, axis: Vec3) {
+    let Some(pivot) = ops::selection_center(&self.model, &self.selection) else {
+      self.status = "Select something to turn".into();
+      return;
+    };
+    let rotation = Quat::from_axis_angle(axis, FRAC_PI_2);
+    self.edit(|editor| {
+      editor.selection.iter().for_each(|&v| {
+        let p = &mut editor.model.vertices[v];
+        *p = pivot + rotation * (*p - pivot);
+        // Keep the corners on the grid rather than a hair off it.
+        *p = (*p * 1e4).round() / 1e4
+      })
+    })
+  }
+
+  /// Copies the selected faces and puts the copy right beside them along x.
+  fn copy_beside(&mut self) {
+    let mut copied = false;
+    self.edit(|editor| {
+      copied = ops::duplicate(&mut editor.model, &mut editor.selection);
+      let xs = editor.selection.iter().map(|&v| editor.model.vertices[v].x);
+      let width = xs.clone().reduce(f32::max).unwrap_or(0.0)
+        - xs.reduce(f32::min).unwrap_or(0.0);
+      let step = editor.grid_step.max(0.01);
+      let offset = ((width / step).ceil() * step).max(step) + step;
+      editor.selection.iter().for_each(|&v| editor.model.vertices[v].x += offset)
+    });
+    if !copied {
+      self.status = "Select a piece or faces to copy".into()
     }
   }
 
@@ -627,7 +706,7 @@ impl ModelEditor {
           .collect(),
         Hit::Face(f) => ops::selected_faces(&self.model, &self.selection)
           .into_iter()
-          .filter(|&g| g != f)
+          .filter(|g| !self.hover_faces(f).contains(g))
           .flat_map(|g| self.model.faces[g].vertices.clone())
           .collect()
       };
@@ -915,12 +994,28 @@ impl ModelEditor {
         }
         return;
       }
+      if self.simple {
+        let handled = match key {
+          Key::Num1 => Some(self.mode = SelectMode::Piece),
+          Key::Num2 => Some(self.mode = SelectMode::Face),
+          Key::R if modifiers.shift => Some(self.turn(Vec3::X)),
+          Key::R => Some(self.turn(Vec3::Y)),
+          Key::T => Some(self.turn(Vec3::Z)),
+          Key::D => Some(self.copy_beside()),
+          _ => None
+        };
+        if handled.is_some() {
+          return;
+        }
+      }
       match key {
         Key::Num1 => self.mode = SelectMode::Vertex,
         Key::Num2 => self.mode = SelectMode::Edge,
         Key::Num3 => self.mode = SelectMode::Face,
+        Key::Num4 => self.mode = SelectMode::Piece,
         Key::V => self.tool = Tool::Select,
         Key::B => self.tool = Tool::Paint,
+        Key::Q => self.tool = Tool::Picker,
         Key::G => self.start_modal(ModalKind::Grab, at, false),
         Key::R => self.start_modal(ModalKind::Rotate, at, false),
         Key::S => self.start_modal(ModalKind::Scale, at, false),
@@ -985,7 +1080,14 @@ impl ModelEditor {
   // Panels.
 
   fn top_bar(&mut self, ui: &mut egui::Ui) {
+    if self.simple {
+      return self.simple_top_bar(ui);
+    }
     ui.horizontal_wrapped(|ui| {
+      if ui.button("Simple mode").on_hover_text("Fewer tools, Blockbench style mouse").clicked() {
+        self.set_simple(true)
+      }
+      ui.separator();
       if ui.button("New").clicked() {
         self.open(default(), default(), false)
       }
@@ -1000,7 +1102,8 @@ impl ModelEditor {
       [
         (SelectMode::Vertex, "Vertex  1"),
         (SelectMode::Edge, "Edge  2"),
-        (SelectMode::Face, "Face  3")
+        (SelectMode::Face, "Face  3"),
+        (SelectMode::Piece, "Piece  4")
       ]
       .into_iter()
       .for_each(|(mode, label)| {
@@ -1009,6 +1112,7 @@ impl ModelEditor {
       ui.separator();
       ui.selectable_value(&mut self.tool, Tool::Select, "Select  V");
       ui.selectable_value(&mut self.tool, Tool::Paint, "Paint  B");
+      ui.selectable_value(&mut self.tool, Tool::Picker, "Pick color  Q");
       ui.separator();
       ui.toggle_value(&mut self.snap, "Snap")
         .on_hover_text("Hold Ctrl to flip while transforming");
@@ -1028,7 +1132,147 @@ impl ModelEditor {
     });
   }
 
+  fn set_simple(&mut self, simple: bool) {
+    self.simple = simple;
+    if simple && matches!(self.mode, SelectMode::Vertex | SelectMode::Edge) {
+      self.mode = SelectMode::Face
+    }
+  }
+
+  fn simple_top_bar(&mut self, ui: &mut egui::Ui) {
+    ui.horizontal_wrapped(|ui| {
+      if ui.button("New").clicked() {
+        self.open(default(), default(), false)
+      }
+      if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo  Ctrl+Z")).clicked() {
+        self.undo()
+      }
+      if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo  Ctrl+Y")).clicked() {
+        self.redo()
+      }
+      ui.separator();
+      ui.toggle_value(&mut self.snap, "Snap to grid")
+        .on_hover_text("Moves in steps. Hold Ctrl while dragging to move freely");
+      ui.toggle_value(&mut self.mirror_x, "Mirror left/right")
+        .on_hover_text("Changing one side of the model changes the other side the same way");
+      ui.separator();
+      if ui.button("Advanced mode").on_hover_text("All the tools, Blender style keys").clicked() {
+        self.set_simple(false)
+      }
+    });
+  }
+
+  /// A big button showing its key, for the simple tools.
+  fn big_button(ui: &mut egui::Ui, label: &str, key: &str, hint: &str) -> bool {
+    let text = if key.is_empty() { label.to_string() } else { format!("{label}   {key}") };
+    ui.add_sized([ui.available_width(), 34.0], egui::Button::new(text))
+      .on_hover_text(hint)
+      .clicked()
+  }
+
+  fn big_choice<T: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    choice: T,
+    label: &str,
+    key: &str,
+    hint: &str
+  ) {
+    let text = format!("{label}   {key}");
+    if ui
+      .add_sized([ui.available_width(), 34.0], egui::Button::selectable(*value == choice, text))
+      .on_hover_text(hint)
+      .clicked()
+    {
+      *value = choice
+    }
+  }
+
+  fn simple_tools_panel(&mut self, ui: &mut egui::Ui) {
+    egui::ScrollArea::vertical().show(ui, |ui| {
+      ui.strong("ADD A SHAPE");
+      ui.add(egui::Slider::new(&mut self.primitive_size, 0.125..=4.0).text("size"));
+      ui.columns(2, |columns| {
+        [Primitive::Cube, Primitive::Wedge, Primitive::Cylinder, Primitive::Cone, Primitive::Sphere, Primitive::Plane]
+          .into_iter()
+          .enumerate()
+          .for_each(|(i, primitive)| {
+            let ui = &mut columns[i % 2];
+            if Self::big_button(ui, primitive.name(), "", "Adds it in the middle, selected, ready to move") {
+              let part = primitive.build(self.primitive_size, 8, 4, &self.look());
+              self.edit(|editor| ops::append(&mut editor.model, &mut editor.selection, part));
+              self.mode = SelectMode::Piece;
+              self.tool = Tool::Select
+            }
+          })
+      });
+
+      ui.separator();
+      ui.strong("CLICKING PICKS");
+      Self::big_choice(ui, &mut self.mode, SelectMode::Piece, "Whole piece", "1", "Clicking a shape picks all of it");
+      Self::big_choice(ui, &mut self.mode, SelectMode::Face, "One face", "2", "Clicking picks one side, to drag it out and make the shape longer");
+
+      ui.separator();
+      ui.strong("TOOL");
+      Self::big_choice(ui, &mut self.tool, Tool::Select, "Select and move", "V", "Click to pick, drag the arrows to move");
+      Self::big_choice(ui, &mut self.tool, Tool::Paint, "Paint", "B", "Click or drag over faces to paint them with the color");
+      Self::big_choice(ui, &mut self.tool, Tool::Picker, "Pick color", "Q", "Click a face to paint with its color and material");
+
+      ui.separator();
+      ui.strong("CHANGE THE SELECTION");
+      let at = ui.ctx().pointer_latest_pos().map_or(Vec2::ZERO, to_vec);
+      if Self::big_button(ui, "Copy beside it", "D", "Makes a copy next to the selection") {
+        self.copy_beside()
+      }
+      if Self::big_button(ui, "Delete", "X", "Removes the selection") {
+        let mode = self.mode;
+        self.edit(|editor| ops::delete(&mut editor.model, &mut editor.selection, mode))
+      }
+      if Self::big_button(ui, "Pull face out", "E", "Pulls the selected face out into a new block. Move the mouse, click to finish") {
+        self.extrude(at)
+      }
+      if Self::big_button(ui, "Resize", "S", "Grows or shrinks with the mouse, click to finish") {
+        self.start_modal(ModalKind::Scale, at, false)
+      }
+      ui.columns(3, |columns| {
+        let [a, b, c] = columns else { return };
+        if Self::big_button(a, "Turn", "R", "A quarter turn around the up axis") {
+          self.turn(Vec3::Y)
+        }
+        if Self::big_button(b, "Tip", "Shift R", "A quarter turn forward, around the red axis") {
+          self.turn(Vec3::X)
+        }
+        if Self::big_button(c, "Roll", "T", "A quarter turn sideways, around the blue axis") {
+          self.turn(Vec3::Z)
+        }
+      });
+      if Self::big_button(ui, "Paint selection", "C", "Gives the selected faces the color and material") {
+        self.paint_selection()
+      }
+
+      ui.separator();
+      ui.strong("VIEW");
+      ui.columns(3, |columns| {
+        [("Front", 0.0, 0.0), ("Side", FRAC_PI_2, 0.0), ("Top", 0.0, -FRAC_PI_2)]
+          .into_iter()
+          .enumerate()
+          .for_each(|(i, (name, yaw, pitch))| {
+            if Self::big_button(&mut columns[i], name, "", "Look straight at it") {
+              self.view = View { yaw, pitch, ortho: true, auto_ortho: true, ..self.view }
+            }
+          })
+      });
+      if Self::big_button(ui, "Show whole model", "Home", "Brings the model back into view") {
+        self.frame(false)
+      }
+      ui.weak("Mouse: left drag on empty space turns the view, right drag slides it, the wheel zooms. Shift drag picks with a box.");
+    });
+  }
+
   fn tools_panel(&mut self, ui: &mut egui::Ui) {
+    if self.simple {
+      return self.simple_tools_panel(ui);
+    }
     egui::ScrollArea::vertical().show(ui, |ui| {
       let at = ui.ctx().pointer_latest_pos().map_or(Vec2::ZERO, to_vec);
       ui.vertical_centered(|ui| ui.strong("ADD"));
@@ -1703,7 +1947,7 @@ impl ModelEditor {
   fn pick(&self, projector: &Projector, at: Vec2) -> Option<Hit> {
     let on_screen = |v: usize| projector.project(self.model.vertices[v]);
     match (self.tool, self.mode) {
-      (Tool::Paint, _) | (_, SelectMode::Face) => {
+      (Tool::Paint | Tool::Picker, _) | (_, SelectMode::Face | SelectMode::Piece) => {
         self.pick_face(projector, at).map(Hit::Face)
       }
       (_, SelectMode::Vertex) => (0..self.model.vertices.len())
@@ -1729,7 +1973,7 @@ impl ModelEditor {
   fn box_select(&mut self, projector: &Projector, from: Vec2, to: Vec2, mode: BoxMode) {
     let rect = egui::Rect::from_two_pos(to_pos(from), to_pos(to));
     let inside = |p: Vec3| projector.project(p).is_some_and(|p| rect.contains(to_pos(p)));
-    let picked = if self.mode == SelectMode::Face {
+    let picked = if matches!(self.mode, SelectMode::Face | SelectMode::Piece) {
       let triangles = self.triangles();
       (0..self.model.faces.len())
         .filter(|&f| {
@@ -1744,6 +1988,10 @@ impl ModelEditor {
         .filter(|&v| self.vertex_visible(v) && inside(self.model.vertices[v]))
         .collect()
     };
+    let mut picked = picked;
+    if self.mode == SelectMode::Piece {
+      ops::select_linked(&self.model, &mut picked)
+    }
     match mode {
       BoxMode::Replace => self.selection = picked,
       BoxMode::Add => self.selection.extend(picked),
@@ -1807,12 +2055,14 @@ impl ModelEditor {
           || b == PointerButton::Secondary && self.modal.is_none()
       })
     {
-      self.orbit = Some(button)
+      self.orbit = Some(button);
+      // Blockbench style: right drag slides the view in simple mode.
+      self.orbit_pans = self.simple && button == PointerButton::Secondary
     }
     if let Some(button) = self.orbit {
       if released.contains(&button) {
         self.orbit = None
-      } else if modifiers.shift {
+      } else if self.orbit_pans || modifiers.shift {
         let rotation = self.view.rotation();
         let scale = self.view.units_per_point(rect);
         self.view.target += (rotation * Vec3::new(-delta.x, delta.y, 0.0)) * scale
@@ -1834,7 +2084,9 @@ impl ModelEditor {
     if self.modal.is_some() {
       self.hover = None;
       let drag = self.modal.as_ref().is_some_and(|modal| modal.drag);
-      if drag && released.contains(&PointerButton::Primary)
+      // A quick click can press and let go within one frame, so check the button too.
+      let up = !ui.input(|input| input.pointer.button_down(PointerButton::Primary));
+      if drag && (released.contains(&PointerButton::Primary) || up)
         || !drag && pressed.contains(&PointerButton::Primary) && response.hovered()
       {
         self.finish_modal(true)
@@ -1844,9 +2096,31 @@ impl ModelEditor {
         self.update_modal(&projector, at, modifiers.command)
       }
       self.press = None
+    } else if self.orbit == Some(PointerButton::Primary) {
+      self.hover = None;
+      self.arrow_hover = None
     } else {
-      self.hover = response.hovered().then(|| self.pick(&projector, at)).flatten();
-      if response.hovered() && pressed.contains(&PointerButton::Primary) {
+      self.arrow_hover = response.hovered().then(|| self.arrow_at(&projector, at)).flatten();
+      self.hover = if self.arrow_hover.is_some() {
+        None
+      } else {
+        response.hovered().then(|| self.pick(&projector, at)).flatten()
+      };
+      let pressed_here = response.hovered() && pressed.contains(&PointerButton::Primary);
+      if pressed_here && let Some(arrow) = self.arrow_hover {
+        // Dragging an arrow moves the selection along it, the dot moves it freely.
+        self.start_modal(ModalKind::Grab, at, true);
+        if let (Some(modal), Arrow::Axis(axis)) = (&mut self.modal, arrow) {
+          modal.axis = Some(axis)
+        }
+        self.press = None
+      } else if pressed_here && self.tool == Tool::Picker {
+        if let Some(Hit::Face(f)) = self.hover {
+          let Look { color, material } = self.model.faces[f].look();
+          (self.color, self.material) = (color, material);
+          self.tool = Tool::Paint
+        }
+      } else if pressed_here {
         self.press = Some(Press { at, hit: self.hover });
         if self.tool == Tool::Paint {
           if let Some(Hit::Face(f)) = self.hover {
@@ -1865,7 +2139,22 @@ impl ModelEditor {
         }
       }
       let down = ui.input(|input| input.pointer.button_down(PointerButton::Primary));
+      // Simple mode: dragging empty space turns the view, unless Shift or Ctrl box
+      // select.
+      if self.simple
+        && !modifiers.shift
+        && !modifiers.command
+        && let Some(press) = &self.press
+        && press.hit.is_none()
+        && down
+        && press.at.distance(at) > DRAG_START
+      {
+        self.press = None;
+        self.orbit = Some(PointerButton::Primary);
+        self.orbit_pans = false
+      }
       match self.tool {
+        Tool::Picker => self.press = None,
         Tool::Paint => {
           if down
             && self.stroke.is_some()
@@ -1931,6 +2220,7 @@ impl ModelEditor {
       );
     }
     self.draw_mesh_overlay(&painter, &projector);
+    self.draw_arrows(&painter, &projector);
     self.draw_axes_gizmo(&painter, rect);
     if let Some((from, to, _)) = self.box_select {
       let selection = egui::Rect::from_two_pos(to_pos(from), to_pos(to));
@@ -1946,7 +2236,21 @@ impl ModelEditor {
         egui::StrokeKind::Inside
       );
     }
-    let hint = if let Some(modal) = &self.modal {
+    let hint = if let Some(modal) = &self.modal
+      && self.simple
+    {
+      format!(
+        "{}  {}{}   ·   {} · Esc cancels",
+        modal.label,
+        modal.amount,
+        modal.axis.map_or(String::new(), |axis| format!("  along {}", axis.name())),
+        if modal.drag {
+          "let go to finish · hold Ctrl to move off the grid"
+        } else {
+          "move the mouse, click to finish · type a number for an exact amount"
+        }
+      )
+    } else if let Some(modal) = &self.modal {
       format!(
         "{}  {}{}{}   ·   X Y Z{} lock an axis · type a number · Ctrl {} snapping · Enter/click done · Esc/right click cancel",
         modal.label,
@@ -1964,6 +2268,11 @@ impl ModelEditor {
       self.status.clone()
     } else {
       match self.tool {
+        Tool::Select if self.simple => match self.mode {
+          SelectMode::Face => "Click a face to pick it · drag the arrows to pull it, making the shape longer or shorter · Shift click picks more",
+          _ => "Click a shape to pick it · drag the arrows to move it · Shift click picks more · drag empty space to turn the view"
+        },
+        Tool::Picker => "Click a face to take its color and material",
         Tool::Select => "Click selects · Shift adds · drag a selection to move it · drag empty space to box select (Shift adds, Ctrl removes)",
         Tool::Paint => "Click or drag paints faces with the color and material · Shift fills joined faces that look alike · Alt picks a face's color and material"
       }
@@ -1989,7 +2298,7 @@ impl ModelEditor {
     let on_screen = |v: usize| projector.project(self.model.vertices[v]).map(to_pos);
     let selected = |v: usize| self.selection.contains(&v);
     // Edges, hidden ones faintly with x-ray.
-    if self.wireframe || self.mode != SelectMode::Face {
+    if self.wireframe || !matches!(self.mode, SelectMode::Face | SelectMode::Piece) {
       edges.iter().for_each(|&(a, b, sees)| {
         if let Some(points) =
           projector.segment(self.model.vertices[a], self.model.vertices[b])
@@ -2034,11 +2343,14 @@ impl ModelEditor {
         }
       }
       Some(Hit::Face(f)) => {
-        let corners = self.model.corners(f).collect::<Vec<_>>();
-        corners.iter().zip(corners.iter().cycle().skip(1)).for_each(|(&a, &b)| {
-          if let Some(points) = projector.segment(a, b) {
-            painter.line_segment(points, Stroke::new(2.0, HOVERED));
-          }
+        let faces = if self.tool == Tool::Select { self.hover_faces(f) } else { vec![f] };
+        faces.into_iter().for_each(|f| {
+          let corners = self.model.corners(f).collect::<Vec<_>>();
+          corners.iter().zip(corners.iter().cycle().skip(1)).for_each(|(&a, &b)| {
+            if let Some(points) = projector.segment(a, b) {
+              painter.line_segment(points, Stroke::new(2.0, HOVERED));
+            }
+          })
         })
       }
       None => ()
@@ -2071,6 +2383,65 @@ impl ModelEditor {
       painter.line_segment([p - egui::vec2(5.0, 0.0), p + egui::vec2(5.0, 0.0)], stroke);
       painter.line_segment([p - egui::vec2(0.0, 5.0), p + egui::vec2(0.0, 5.0)], stroke);
     }
+  }
+
+  /// The move arrows' middle on screen and, for each axis, where its arrow ends. Shown
+  /// on the selection while selecting, without an operation running.
+  fn arrows(&self, projector: &Projector) -> Option<(Vec2, Vec<(Axis, Vec2)>)> {
+    const LENGTH: f32 = 80.0;
+    (self.tool == Tool::Select && self.modal.is_none()).then_some(())?;
+    let center = ops::selection_center(&self.model, &self.selection)?;
+    let middle = projector.project(center)?;
+    let step = self.view.units_per_point(projector.rect) * 10.0;
+    let arrows = [(Axis::X, Vec3::X), (Axis::Y, Vec3::Y), (Axis::Z, Vec3::Z)]
+      .into_iter()
+      .filter_map(|(axis, direction)| {
+        let toward = projector.project(center + direction * step)? - middle;
+        // Hide an arrow pointing straight at the camera: it can't be dragged sensibly.
+        (toward.length() > 2.0).then(|| (axis, middle + toward.normalize() * LENGTH))
+      })
+      .collect();
+    Some((middle, arrows))
+  }
+
+  fn arrow_at(&self, projector: &Projector, at: Vec2) -> Option<Arrow> {
+    let (middle, arrows) = self.arrows(projector)?;
+    if middle.distance(at) < 11.0 {
+      return Some(Arrow::Free);
+    }
+    arrows
+      .into_iter()
+      .map(|(axis, tip)| (axis, segment_distance(at, middle.lerp(tip, 0.2), tip)))
+      .filter(|&(_, distance)| distance < 10.0)
+      .min_by(|(_, a), (_, b)| a.total_cmp(b))
+      .map(|(axis, _)| Arrow::Axis(axis))
+  }
+
+  fn draw_arrows(&self, painter: &egui::Painter, projector: &Projector) {
+    let Some((middle, arrows)) = self.arrows(projector) else { return };
+    let hovered = |arrow: Arrow| self.arrow_hover == Some(arrow);
+    arrows.into_iter().for_each(|(axis, tip)| {
+      let color = AXIS_COLORS[match axis {
+        Axis::X => 0,
+        Axis::Y => 1,
+        _ => 2
+      }];
+      let color = if hovered(Arrow::Axis(axis)) { Color32::WHITE } else { color };
+      let (start, tip) = (to_pos(middle.lerp(tip, 0.15)), to_pos(tip));
+      painter.line_segment([start, tip], Stroke::new(4.0, Color32::from_black_alpha(120)));
+      painter.line_segment([start, tip], Stroke::new(3.0, color));
+      // The head: a triangle pointing along the arrow.
+      let direction = (tip - start).normalized();
+      let side = egui::vec2(-direction.y, direction.x) * 7.0;
+      let base = tip - direction * 14.0;
+      painter.add(egui::Shape::convex_polygon(
+        vec![tip + direction * 2.0, base + side, base - side],
+        color,
+        Stroke::new(1.0, Color32::from_black_alpha(160))
+      ));
+    });
+    let color = if hovered(Arrow::Free) { Color32::WHITE } else { Color32::from_gray(220) };
+    painter.circle(to_pos(middle), 7.0, color, Stroke::new(1.5, Color32::from_black_alpha(160)));
   }
 
   /// Which way the axes point, in the corner of the viewport.

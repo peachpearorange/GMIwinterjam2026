@@ -22,6 +22,9 @@ use {crate::{Mode, start_transform},
      world_editor::WorldEditorUi};
 
 const TOGGLE_KEY: KeyCode = KeyCode::F1;
+/// How much bigger than egui's default the editor's text and buttons are. Ctrl + and
+/// Ctrl - still zoom further from here.
+const UI_ZOOM: f32 = 1.35;
 
 /// Which editor the window shows while editing.
 #[derive(Resource, Default, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +102,21 @@ fn enable_camera(
     || *editor == Editor::World && !egui_wants_input.wants_any_keyboard_input();
 }
 
+/// Makes text and buttons bigger and easier to hit, once the UI exists.
+fn style_ui(mut contexts: EguiContexts, mut done: Local<bool>) -> Result {
+  if !*done {
+    let ctx = contexts.ctx_mut()?;
+    ctx.set_zoom_factor(UI_ZOOM);
+    ctx.all_styles_mut(|style| {
+      style.spacing.button_padding = egui::vec2(8.0, 4.0);
+      style.spacing.item_spacing = egui::vec2(8.0, 5.0);
+      style.spacing.interact_size.y = 24.0;
+    });
+    *done = true
+  }
+  Ok(())
+}
+
 fn root_ui(ctx: &egui::Context) -> egui::Ui {
   egui::Ui::new(
     ctx.clone(),
@@ -163,6 +181,6 @@ pub fn plugin(app: &mut App) {
     .add_systems(OnExit(Mode::Play), stop_play)
     .add_systems(
       EguiPrimaryContextPass,
-      (edit_ui.run_if(in_state(Mode::Edit)), play_ui.run_if(in_state(Mode::Play)))
+      (style_ui, edit_ui.run_if(in_state(Mode::Edit)), play_ui.run_if(in_state(Mode::Play))).chain()
     );
 }

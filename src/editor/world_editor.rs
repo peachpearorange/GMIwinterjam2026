@@ -176,8 +176,14 @@ struct WorldEditor {
   billboard: Billboard,
   selected: Option<Entity>,
   new_world: NewWorld,
+  /// Whether "Create flat world" was clicked and waits for a yes or no.
+  confirm_new_world: bool,
   /// Outcome of the last save.
   status: String,
+  /// The world file as last saved, to tell when there's something new to save.
+  saved: Option<String>,
+  /// Set by Ctrl+S to save on the next autosave check rather than waiting.
+  save_now: bool,
   /// Whether the pointer is over the 3D view rather than the UI.
   pointer_in_view: bool,
   /// Lasts while the left mouse button stays held after pressing it on the terrain.
@@ -202,7 +208,10 @@ impl Default for WorldEditor {
       },
       selected: None,
       new_world: NewWorld::DEFAULT,
-      status: default(),
+      confirm_new_world: false,
+      status: "Saves by itself as you work".into(),
+      saved: None,
+      save_now: false,
       pointer_in_view: false,
       stroke: None
     }
@@ -221,7 +230,6 @@ const BRUSH_COLOR: Color = Color::srgb(0.1, 0.9, 1.0);
 #[derive(SystemParam)]
 pub struct WorldEditorUi<'w, 's> {
   editor: ResMut<'w, WorldEditor>,
-  terrain: Res<'w, Terrain>,
   keys: Res<'w, ButtonInput<KeyCode>>,
   camera: Single<'w, 's, (&'static Camera, &'static GlobalTransform), With<FreeCamera>>,
   placed: Query<
@@ -242,36 +250,17 @@ pub struct WorldEditorUi<'w, 's> {
 impl WorldEditorUi<'_, '_> {
   /// Draws the world editor's panels into the window, leaving the 3D view uncovered.
   pub fn ui(&mut self, root: &mut egui::Ui) {
-    let Self { editor, terrain, keys, camera, placed, commands } = self;
+    let Self { editor, keys, camera, placed, commands } = self;
     let editor = &mut **editor;
     egui::Panel::left("world_editor").show(root, |ui| {
       egui::ScrollArea::vertical().show(ui, |ui| {
         ui.heading("File");
-        if ui.button("Save (Ctrl+S)").clicked()
-          || keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight])
-            && keys.just_pressed(KeyCode::KeyS)
+        if keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight])
+          && keys.just_pressed(KeyCode::KeyS)
         {
-          editor.status = WorldFile::collect(
-            terrain,
-            placed.iter().filter_map(|(_, marker, _, transform, _)| {
-              marker.map(|marker| (marker, transform))
-            }),
-            placed.iter().filter_map(|(_, _, model, transform, _)| {
-              model.map(|model| (model, transform))
-            }),
-            placed.iter().filter_map(|(_, _, _, transform, billboard)| {
-              billboard.map(|billboard| (billboard, transform))
-            })
-          )
-          .save()
-          .map_or_else(
-            |error| format!("Save failed: {error}"),
-            |()| format!("Saved {ASSETS_DIR}/{}", WorldFile::NAME)
-          );
+          editor.save_now = true
         }
-        if !editor.status.is_empty() {
-          ui.label(&editor.status);
-        }
+        ui.label(&editor.status);
         ui.collapsing("New world", |ui| {
           let NewWorld { cells_x, cells_z, cell_size } = &mut editor.new_world;
           ui.add(egui::DragValue::new(cells_x).range(1..=512).prefix("cells x: "));
@@ -282,10 +271,22 @@ impl WorldEditorUi<'_, '_> {
               .speed(0.05)
               .prefix("cell size: ")
           );
-          if ui.button("Create flat world").clicked() {
-            placed.iter().for_each(|(entity, ..)| commands.entity(entity).despawn());
-            commands.insert_resource(Terrain::flat(*cells_x, *cells_z, *cell_size));
-            editor.selected = None;
+          // Autosave keeps whatever happens, so replacing the world asks first.
+          if !editor.confirm_new_world {
+            editor.confirm_new_world = ui.button("Create flat world").clicked();
+          } else {
+            ui.label("Replace the whole world with a flat one?");
+            ui.horizontal(|ui| {
+              if ui.button("Yes, replace it").clicked() {
+                placed.iter().for_each(|(entity, ..)| commands.entity(entity).despawn());
+                commands.insert_resource(Terrain::flat(*cells_x, *cells_z, *cell_size));
+                editor.selected = None;
+                editor.confirm_new_world = false
+              }
+              if ui.button("No").clicked() {
+                editor.confirm_new_world = false
+              }
+            });
           }
         });
 
@@ -616,11 +617,73 @@ fn draw_markers_and_selection(
   });
 }
 
+/// How often autosave looks for changes, in seconds.
+const AUTOSAVE_INTERVAL: f32 = 1.0;
+/// Where the world as it was before this session's first autosave is kept, in case an
+/// edit turns out to be a mistake. Hidden from builds by the leading dot.
+const BACKUP: &str = ".backups/world.before-last-session.ron";
+
+/// Saves the world whenever it differs from what was last saved, checking every
+/// [`AUTOSAVE_INTERVAL`] seconds and never in the middle of a brush stroke.
+fn autosave(
+  mut editor: ResMut<WorldEditor>,
+  terrain: Res<Terrain>,
+  markers: Query<(&Marker, &Transform)>,
+  models: Query<(&Model, &Transform)>,
+  billboards: Query<(&Billboard, &Transform)>,
+  time: Res<Time>,
+  mut since_check: Local<f32>
+) {
+  *since_check += time.delta_secs();
+  let due = *since_check >= AUTOSAVE_INTERVAL && editor.stroke.is_none();
+  if !due && !editor.save_now {
+    return;
+  }
+  *since_check = 0.0;
+  editor.save_now = false;
+  let world = WorldFile::collect(&terrain, &markers, &models, &billboards);
+  let Ok(text) = world.to_text() else { return };
+  let file = Path::new(ASSETS_DIR).join(WorldFile::NAME);
+  let saved = editor.saved.get_or_insert_with(|| fs::read_to_string(&file).unwrap_or_default());
+  if *saved == text {
+    return;
+  }
+  if editor.status.starts_with("Saves by itself") {
+    // First save this session: keep a copy of the world as it was.
+    let backup = Path::new(ASSETS_DIR).join(BACKUP);
+    backup.parent().map(fs::create_dir_all);
+    fs::copy(&file, &backup).ok();
+  }
+  editor.status = match fs::write(&file, &text) {
+    Ok(()) => {
+      editor.saved = Some(text);
+      format!("Saved by itself at {}", clock_time())
+    }
+    Err(error) => format!("Autosave failed: {error}")
+  };
+}
+
+/// The time of day as hours, minutes and seconds in UTC, for the save status.
+fn clock_time() -> String {
+  let seconds = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_or(0, |since| since.as_secs());
+  format!("{:02}:{:02}:{:02} UTC", seconds / 3600 % 24, seconds / 60 % 60, seconds % 60)
+}
+
 pub fn plugin(app: &mut App) {
-  app.init_resource::<WorldEditor>().add_systems(
-    Update,
-    (use_tool, draw_markers_and_selection)
-      .run_if(in_state(Mode::Edit))
-      .run_if(|editor: Res<super::Editor>| *editor == super::Editor::World)
-  );
+  app
+    .init_resource::<WorldEditor>()
+    .add_systems(
+      Update,
+      (use_tool, draw_markers_and_selection)
+        .run_if(in_state(Mode::Edit))
+        .run_if(|editor: Res<super::Editor>| *editor == super::Editor::World)
+    )
+    .add_systems(Update, autosave.run_if(in_state(Mode::Edit)))
+    // Save straight away when play starts, so nothing waits on the next check.
+    .add_systems(OnExit(Mode::Edit), |mut editor: ResMut<WorldEditor>| {
+      editor.save_now = true
+    })
+    .add_systems(OnEnter(Mode::Play), autosave);
 }

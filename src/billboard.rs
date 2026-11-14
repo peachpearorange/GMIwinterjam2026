@@ -4,9 +4,16 @@
 //! [`BillboardMode`].
 
 use {crate::{material::ModelMaterials, model::Rgb},
-     bevy::{asset::RenderAssetUsages, platform::collections::HashMap, prelude::*,
+     bevy::{asset::RenderAssetUsages,
+            light::{NotShadowCaster, NotShadowReceiver},
+            platform::collections::HashMap, prelude::*,
             render::render_resource::PrimitiveTopology, transform::TransformSystems},
      serde::{Deserialize, Serialize}};
+
+/// How bright billboards are next to the ground, from 0 (black) to 1. They turn to
+/// face the camera, so without this they catch the full sun from every side and stand
+/// out brighter than the world around them.
+const BRIGHTNESS: f32 = 0.75;
 
 /// The camera billboards turn toward.
 #[derive(Component)]
@@ -144,7 +151,9 @@ impl FromWorld for BillboardAssets {
   }
 }
 
-/// Gives new billboards, and ones whose texture changed, their quad and material.
+/// Gives new billboards, and ones whose texture changed, their quad and material. They
+/// neither cast shadows nor show them: a flat sprite's shadow turns with the camera,
+/// which looks wrong.
 fn show_billboards(
   billboards: Query<(Entity, &Billboard), Changed<Billboard>>,
   mut assets: ResMut<BillboardAssets>,
@@ -163,7 +172,7 @@ fn show_billboards(
         .map_or(1.0, |image| image.width() as f32 / image.height().max(1) as f32);
       let material = materials.add(StandardMaterial {
         base_color: if image.is_some() {
-          Color::WHITE
+          Color::srgb(BRIGHTNESS, BRIGHTNESS, BRIGHTNESS)
         } else {
           Rgb([0xff, 0, 0xff]).color()
         },
@@ -179,7 +188,12 @@ fn show_billboards(
     });
     commands
       .entity(entity)
-      .insert((Mesh3d(quad.clone()), MeshMaterial3d(material.clone())));
+      .insert((
+        Mesh3d(quad.clone()),
+        MeshMaterial3d(material.clone()),
+        NotShadowCaster,
+        NotShadowReceiver
+      ));
   })
 }
 

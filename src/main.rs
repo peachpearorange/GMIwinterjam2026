@@ -10,6 +10,18 @@ use {bevy::{camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
 /// Marker the camera starts at, when the world has one.
 const START_MARKER: &str = "start";
 
+/// How the flying camera moves. Fast enough to cross the world in a few seconds; hold
+/// Shift to go faster still, and scroll the wheel to speed up or slow down.
+fn free_camera() -> FreeCamera {
+  FreeCamera {
+    walk_speed: 40.0,
+    run_speed: 120.0,
+    // Each wheel notch changes the speed by about 20%.
+    scroll_factor: 0.18,
+    ..default()
+  }
+}
+
 /// Whether the game is being played or its content edited. Gameplay systems should run
 /// `in_state(Mode::Play)`, so editing pauses them.
 #[derive(States, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -41,7 +53,7 @@ fn start_transform(markers: &Markers) -> Transform {
 fn spawn_camera(mut commands: Commands, markers: Markers) {
   commands.spawn((
     Camera3d::default(),
-    FreeCamera::default(),
+    free_camera(),
     WorldCamera,
     start_transform(&markers)
   ));
