@@ -1,16 +1,23 @@
 //! World design: sculpting the terrain, painting ground, placing models and markers.
 
-use {super::pixel_editor::texture_names,
+use {super::{material_editor::Thumbnails,
+             pixel_editor::{Palette, texture_names}},
      crate::Mode,
-     bevy::{camera_controller::free_camera::FreeCamera, ecs::system::SystemParam, prelude::*},
+     bevy::{camera_controller::free_camera::FreeCamera, ecs::system::SystemParam,
+            prelude::*},
      bevy_egui::{egui, input::EguiWantsInput},
-     std::{f32::consts::TAU, fs,
-           path::{Path, PathBuf}},
+     std::{f32::consts::TAU,
+           fs,
+           path::{Path, PathBuf},
+           sync::Arc},
      winterjam2026::{assets::ASSETS_DIR,
                      billboard::{Billboard, BillboardMode, PlacedBillboard},
+                     material::ModelMaterials,
                      model::MODEL_EXTENSION,
-                     world::{Ground, MODELS_DIR, Marker, Model, TEXTURES_DIR, Terrain,
-                             WorldFile}}};
+                     scene::{SceneSettings, apply_scene},
+                     sky::{Brush, Sky, SkyPixels, SkyStroke},
+                     terrain::{Terrain, TerrainShading},
+                     world::{MODELS_DIR, Marker, Model, TEXTURES_DIR, WorldFile}}};
 
 /// How a height brush moves the terrain vertices under it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -30,11 +37,12 @@ enum Tool {
   PlaceModel,
   PlaceMarker,
   PlaceBillboard,
-  Select
+  Select,
+  PaintSky
 }
 
 impl Tool {
-  const ALL: [Self; 9] = [
+  const ALL: [Self; 10] = [
     Self::Sculpt(Sculpt::Raise),
     Self::Sculpt(Sculpt::Lower),
     Self::Sculpt(Sculpt::Smooth),
@@ -43,7 +51,8 @@ impl Tool {
     Self::PlaceModel,
     Self::PlaceMarker,
     Self::PlaceBillboard,
-    Self::Select
+    Self::Select,
+    Self::PaintSky
   ];
 
   const fn name(self) -> &'static str {
@@ -56,7 +65,8 @@ impl Tool {
       Self::PlaceModel => "Place model",
       Self::PlaceMarker => "Place marker",
       Self::PlaceBillboard => "Place billboard",
-      Self::Select => "Select"
+      Self::Select => "Select",
+      Self::PaintSky => "Paint sky"
     }
   }
 }
@@ -156,7 +166,8 @@ fn billboard_settings(ui: &mut egui::Ui, billboard: &mut Billboard) {
 struct PlacementPreview;
 
 /// The markers, models and billboards placed in the world.
-type Placed = (Or<(With<Marker>, With<Model>, With<Billboard>)>, Without<PlacementPreview>);
+type Placed =
+  (Or<(With<Marker>, With<Model>, With<Billboard>)>, Without<PlacementPreview>);
 
 /// A drag over the terrain with the left mouse button.
 #[derive(Clone, Copy)]
@@ -172,7 +183,8 @@ struct Stroke {
 struct WorldEditor {
   tool: Tool,
   height_brush: HeightBrush,
-  ground: Ground,
+  /// The library material painting the ground lays down.
+  ground: Option<String>,
   /// World units. Under half a cell, only the cell under the cursor gets painted.
   ground_radius: f32,
   models: Vec<String>,
@@ -181,8 +193,12 @@ struct WorldEditor {
   marker_name: String,
   /// What placing a billboard places.
   billboard: Billboard,
-  selected: Option<Entity>,
+  selected: Vec<Entity>,
+  /// The outline being dragged with the select tool, in window coordinates.
+  lasso: Option<Vec<Vec2>>,
   new_world: NewWorld,
+  /// Cells to add on each side along x and z when resizing, fewer where negative.
+  grow: IVec2,
   /// Whether "Create flat world" was clicked and waits for a yes or no.
   confirm_new_world: bool,
   /// Outcome of the last save.
@@ -194,7 +210,13 @@ struct WorldEditor {
   /// Whether the pointer is over the 3D view rather than the UI.
   pointer_in_view: bool,
   /// Lasts while the left mouse button stays held after pressing it on the terrain.
-  stroke: Option<Stroke>
+  stroke: Option<Stroke>,
+  sky_brush: Brush,
+  /// Texels along each side of a sky face, for a new sky or resizing it.
+  sky_size: u32,
+  /// While painting the sky: where the brush pointed on the previous frame, and the
+  /// stroke so far.
+  sky_stroke: Option<(Vec3, SkyStroke)>
 }
 
 impl Default for WorldEditor {
@@ -202,8 +224,8 @@ impl Default for WorldEditor {
     Self {
       tool: Tool::Sculpt(Sculpt::Raise),
       height_brush: HeightBrush::DEFAULT,
-      ground: Ground::Rock,
-      ground_radius: 0.0,
+      ground: None,
+      ground_radius: 2.0,
       models: model_paths(),
       model: None,
       model_yaw_degrees: 0.0,
@@ -213,20 +235,36 @@ impl Default for WorldEditor {
         size: 3.0,
         mode: BillboardMode::FacePositionUpright
       },
-      selected: None,
+      selected: default(),
+      lasso: None,
       new_world: NewWorld::DEFAULT,
+      grow: IVec2::splat(16),
       confirm_new_world: false,
       status: "Saves by itself as you work".into(),
       saved: None,
       save_now: false,
       pointer_in_view: false,
-      stroke: None
+      stroke: None,
+      sky_brush: Brush {
+        radius_degrees: 8.0,
+        softness: 0.8,
+        strength: 0.5,
+        color: [0xff; 4]
+      },
+      sky_size: SKY_SIZES[1],
+      sky_stroke: None
     }
   }
 }
 
+/// The face sizes a sky can have, in texels. Shown smoothly filtered, so a few hundred
+/// is plenty for soft skies.
+const SKY_SIZES: [u32; 4] = [128, 256, 512, 1024];
+
 /// How far from the clicked point the select tool looks for markers and models.
 const SELECT_RADIUS: f32 = 4.0;
+/// How far, in window pixels, the select tool's drag must go to be a lasso, not a click.
+const LASSO_MIN: f32 = 6.0;
 /// Height of the editor-only pole drawn at every marker.
 const MARKER_POLE: f32 = 3.0;
 const MARKER_COLOR: Color = Color::srgb(1.0, 0.3, 0.9);
@@ -251,13 +289,34 @@ pub struct WorldEditorUi<'w, 's> {
     ),
     Placed
   >,
+  palette: Res<'w, Palette>,
+  model_materials: Res<'w, ModelMaterials>,
+  thumbnails: ResMut<'w, Thumbnails>,
+  /// Missing until the world has loaded.
+  terrain: Option<Res<'w, Terrain>>,
+  sky: ResMut<'w, Sky>,
+  images: ResMut<'w, Assets<Image>>,
+  clear_color: Res<'w, ClearColor>,
   commands: Commands<'w, 's>
 }
 
 impl WorldEditorUi<'_, '_> {
   /// Draws the world editor's panels into the window, leaving the 3D view uncovered.
   pub fn ui(&mut self, root: &mut egui::Ui) {
-    let Self { editor, keys, camera, placed, commands } = self;
+    let Self {
+      editor,
+      keys,
+      camera,
+      placed,
+      palette,
+      model_materials,
+      thumbnails,
+      terrain,
+      sky,
+      images,
+      clear_color,
+      commands
+    } = self;
     let editor = &mut **editor;
     egui::Panel::left("world_editor").show(root, |ui| {
       egui::ScrollArea::vertical().show(ui, |ui| {
@@ -269,6 +328,26 @@ impl WorldEditorUi<'_, '_> {
         }
         ui.label(&editor.status);
         ui.weak("Ctrl+Z undoes, Ctrl+Y redoes");
+        if let Some(terrain) = terrain {
+          ui.collapsing("Resize world", |ui| {
+            let (cells_x, cells_z) = terrain.cells();
+            let IVec2 { x, y: z } = &mut editor.grow;
+            let range = |cells: usize| -(cells as i32 - 1) / 2..=(512 - cells as i32) / 2;
+            ui.add(egui::DragValue::new(x).range(range(cells_x)).prefix("cells x: +"))
+              .on_hover_text("On each side; negative takes them away");
+            ui.add(egui::DragValue::new(z).range(range(cells_z)).prefix("cells z: +"));
+            let after = (cells_x as i32 + *x * 2, cells_z as i32 + *z * 2);
+            ui.weak(format!("{cells_x}×{cells_z} cells now, {}×{} after", after.0, after.1));
+            let material = editor.ground.as_deref().unwrap_or("snow");
+            ui.weak(format!(
+              "Everything stays where it is. New ground continues the edges' height and is \
+               painted {material}, the Paint ground material"
+            ));
+            if ui.button("Resize").clicked() {
+              commands.insert_resource(terrain.resized(editor.grow, material))
+            }
+          });
+        }
         ui.collapsing("New world", |ui| {
           let NewWorld { cells_x, cells_z, cell_size } = &mut editor.new_world;
           ui.add(egui::DragValue::new(cells_x).range(1..=512).prefix("cells x: "));
@@ -287,8 +366,13 @@ impl WorldEditorUi<'_, '_> {
             ui.horizontal(|ui| {
               if ui.button("Yes, replace it").clicked() {
                 placed.iter().for_each(|(entity, ..)| commands.entity(entity).despawn());
-                commands.insert_resource(Terrain::flat(*cells_x, *cells_z, *cell_size));
-                editor.selected = None;
+                commands.insert_resource(Terrain::flat(
+                  *cells_x,
+                  *cells_z,
+                  *cell_size,
+                  editor.ground.as_deref().unwrap_or("snow")
+                ));
+                editor.selected.clear();
                 editor.confirm_new_world = false
               }
               if ui.button("No").clicked() {
@@ -316,24 +400,40 @@ impl WorldEditorUi<'_, '_> {
             ui.add(egui::Slider::new(strength, 0.5..=30.0).text("strength"));
           }
           Tool::PaintGround => {
-            Ground::ALL.into_iter().for_each(|ground| {
-              ui.horizontal(|ui| {
-                let Srgba { red, green, blue, .. } = ground.surface().color.to_srgba();
-                egui::color_picker::show_color(
-                  ui,
-                  egui::Rgba::from_srgba_unmultiplied(
-                    (red * 255.0) as u8,
-                    (green * 255.0) as u8,
-                    (blue * 255.0) as u8,
-                    255
-                  ),
-                  egui::Vec2::splat(ui.spacing().interact_size.y)
-                );
-                ui.selectable_value(&mut editor.ground, ground, ground.surface().name);
+            let list = model_materials.list();
+            if editor
+              .ground
+              .as_ref()
+              .is_none_or(|name| !list.iter().any(|m| m.name == *name))
+            {
+              editor.ground = list
+                .iter()
+                .find(|m| m.name == "snow")
+                .or(list.first())
+                .map(|m| m.name.clone())
+            }
+            if list.is_empty() {
+              ui.label("Make materials in the Materials tab to paint with");
+            }
+            egui::ScrollArea::vertical()
+              .id_salt("ground_materials")
+              .max_height(320.0)
+              .show(ui, |ui| {
+                list.iter().for_each(|material| {
+                  ui.horizontal(|ui| {
+                    thumbnails.swatch(ui, material, 22.0);
+                    ui.selectable_value(
+                      &mut editor.ground,
+                      Some(material.name.clone()),
+                      &material.name
+                    );
+                  });
+                })
               });
-            });
             ui.add(
-              egui::Slider::new(&mut editor.ground_radius, 0.0..=20.0).text("radius")
+              egui::Slider::new(&mut editor.ground_radius, 0.0..=20.0)
+                .suffix(" m")
+                .text("radius")
             );
           }
           Tool::PlaceModel => {
@@ -362,8 +462,9 @@ impl WorldEditorUi<'_, '_> {
           }
           Tool::PlaceBillboard => billboard_settings(ui, &mut editor.billboard),
           Tool::Select => {
-            if let Some(entity) = editor.selected
-              && let Ok((_, marker, model, mut transform, billboard)) = placed.get_mut(entity)
+            if let [entity] = editor.selected[..]
+              && let Ok((_, marker, model, mut transform, billboard)) =
+                placed.get_mut(entity)
             {
               if let Some(mut billboard) = billboard {
                 let mut edited = billboard.clone();
@@ -400,14 +501,24 @@ impl WorldEditorUi<'_, '_> {
               {
                 transform.translation.y = height;
               }
-              if ui.button("Delete").clicked() {
-                commands.entity(entity).despawn();
-                editor.selected = None;
-              }
+            } else if editor.selected.is_empty() {
+              ui.label("Click or drag around markers, models and billboards.");
             } else {
-              ui.label("Click a marker, model or billboard.");
+              ui.label(format!("{} selected", editor.selected.len()));
+            }
+            let delete_key = !ui.ctx().egui_wants_keyboard_input()
+              && ui.input(|input| {
+                input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
+              });
+            if !editor.selected.is_empty()
+              && (ui.button("Delete").on_hover_text("Delete key").clicked() || delete_key)
+            {
+              editor.selected.drain(..).for_each(|entity| {
+                commands.entity(entity).try_despawn();
+              })
             }
           }
+          Tool::PaintSky => sky_settings(ui, editor, palette, sky, images, clear_color)
         }
 
         ui.separator();
@@ -430,6 +541,14 @@ impl WorldEditorUi<'_, '_> {
 
     let (camera, camera_transform) = **camera;
     let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(view);
+    // Window coordinates are egui's points times its zoom.
+    let zoom = ctx.zoom_factor();
+    editor.lasso.iter().for_each(|lasso| {
+      painter.add(egui::Shape::closed_line(
+        lasso.iter().map(|&Vec2 { x, y }| egui::pos2(x, y) / zoom).collect(),
+        egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 140, 255))
+      ));
+    });
     placed.iter().for_each(|(_, marker, _, &Transform { translation, .. }, _)| {
       if let Some(Marker { name }) = marker
         && let Ok(Vec2 { x, y }) =
@@ -449,6 +568,176 @@ impl WorldEditorUi<'_, '_> {
   }
 }
 
+/// The sky brush's color, size, softness and strength, the sky's detail, and filling
+/// all of it.
+fn sky_settings(
+  ui: &mut egui::Ui,
+  editor: &mut WorldEditor,
+  palette: &Palette,
+  // Kept as `ResMut` so only actual changes count as changing the sky.
+  sky: &mut ResMut<Sky>,
+  images: &mut Assets<Image>,
+  clear_color: &ClearColor
+) {
+  let brush = &mut editor.sky_brush;
+  let [r, g, b, _] = brush.color;
+  let mut rgb = [r, g, b];
+  ui.horizontal(|ui| {
+    if ui.color_edit_button_srgb(&mut rgb).changed() {
+      let [r, g, b] = rgb;
+      brush.color = [r, g, b, u8::MAX]
+    }
+    ui.label("color");
+  });
+  ui.horizontal_wrapped(|ui| {
+    ui.spacing_mut().item_spacing = egui::Vec2::splat(2.0);
+    palette.0.iter().for_each(|&[r, g, b, _]| {
+      let (rect, response) =
+        ui.allocate_exact_size(egui::Vec2::splat(18.0), egui::Sense::click());
+      ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
+      if [r, g, b, u8::MAX] == brush.color {
+        ui.painter().rect_stroke(
+          rect,
+          2.0,
+          egui::Stroke::new(2.0, egui::Color32::WHITE),
+          egui::StrokeKind::Inside
+        );
+      }
+      if response.clicked() {
+        brush.color = [r, g, b, u8::MAX]
+      }
+    })
+  });
+  ui.add(
+    egui::Slider::new(&mut brush.radius_degrees, 0.5..=60.0)
+      .logarithmic(true)
+      .suffix("°")
+      .text("size")
+  )
+  .on_hover_text("How far across the sky it reaches from its middle");
+  ui.add(egui::Slider::new(&mut brush.softness, 0.0..=1.0).text("softness"))
+    .on_hover_text("0 is a hard edge, 1 fades all the way from the middle");
+  ui.add(egui::Slider::new(&mut brush.strength, 0.01..=1.0).text("strength"))
+    .on_hover_text("How much color one stroke lays down. Go over it again for more");
+
+  let size = sky.pixels.as_ref().map_or(editor.sky_size, |pixels| pixels.size);
+  let mut wanted = size;
+  egui::ComboBox::from_label("detail")
+    .selected_text(size.to_string())
+    .show_ui(ui, |ui| {
+      SKY_SIZES.into_iter().for_each(|size| {
+        ui.selectable_value(&mut wanted, size, size.to_string());
+      })
+    })
+    .response
+    .on_hover_text("Texels along each side of the sky cube's faces");
+  let filled =
+    ui.button("Fill whole sky").on_hover_text("With the brush color").clicked();
+  let changed = if filled {
+    sky.pixels = Some(Arc::new(SkyPixels::filled(size, editor.sky_brush.color)));
+    true
+  } else if wanted != size {
+    editor.sky_size = wanted;
+    sky.pixels = sky.pixels.as_ref().map(|pixels| Arc::new(pixels.resized(wanted)));
+    sky.pixels.is_some()
+  } else {
+    false
+  };
+  if changed {
+    sky.upload(images);
+    if let Err(error) = sky.save() {
+      editor.status = format!("Can't save the sky: {error}")
+    }
+  }
+  if sky.pixels.is_none() {
+    let Srgba { red, green, blue, .. } = clear_color.0.to_srgba();
+    ui.weak(format!(
+      "No sky yet: painting starts one in the background color #{:02x}{:02x}{:02x}",
+      (red * 255.0) as u8,
+      (green * 255.0) as u8,
+      (blue * 255.0) as u8
+    ));
+  }
+  ui.weak("Drag on the sky to paint it. Hold the right mouse button to look around");
+}
+
+/// Airbrushes the sky where the cursor points while the left mouse button is held, and
+/// outlines the brush around the cursor.
+fn paint_sky(
+  mut editor: ResMut<WorldEditor>,
+  mut sky: ResMut<Sky>,
+  mut images: ResMut<Assets<Image>>,
+  clear_color: Res<ClearColor>,
+  camera: Single<(&Camera, &GlobalTransform), With<FreeCamera>>,
+  window: Single<&Window>,
+  mouse: Res<ButtonInput<MouseButton>>,
+  mut gizmos: Gizmos
+) {
+  let (camera, camera_transform) = *camera;
+  let pointing = if editor.tool == Tool::PaintSky
+    && !mouse.pressed(MouseButton::Right)
+    && (editor.pointer_in_view || editor.sky_stroke.is_some())
+    && let Some(cursor) = window.cursor_position()
+    && let Ok(ray) = camera.viewport_to_world(camera_transform, cursor)
+  {
+    Some(ray)
+  } else {
+    None
+  };
+  let brush = editor.sky_brush;
+  let radius = brush.radius_degrees.to_radians();
+  if let Some(Ray3d { origin, direction }) = pointing {
+    // Just past the near plane, so the terrain never hides it.
+    let distance = 0.5;
+    let rotation = Quat::from_rotation_arc(Vec3::Z, *direction);
+    gizmos.circle(
+      Isometry3d::new(origin + *direction * distance, rotation),
+      distance * radius.tan(),
+      BRUSH_COLOR
+    );
+    if brush.softness > 0.0 {
+      let inner = radius * (1.0 - brush.softness);
+      gizmos.circle(
+        Isometry3d::new(origin + *direction * distance, rotation),
+        distance * inner.tan(),
+        BRUSH_COLOR.with_alpha(0.4)
+      );
+    }
+  }
+  let direction = pointing
+    .filter(|_| mouse.pressed(MouseButton::Left))
+    .map(|Ray3d { direction, .. }| *direction);
+  // Saved once the stroke ends, rather than every frame of it.
+  if direction.is_none()
+    && editor.sky_stroke.take().is_some()
+    && let Err(error) = sky.save()
+  {
+    editor.status = format!("Can't save the sky: {error}")
+  }
+  if let Some(direction) = direction {
+    let Srgba { red, green, blue, .. } = clear_color.0.to_srgba();
+    let [r, g, b] = [red, green, blue].map(|channel| (channel * 255.0).round() as u8);
+    let size = editor.sky_size;
+    let pixels = Arc::make_mut(
+      sky
+        .pixels
+        .get_or_insert_with(|| Arc::new(SkyPixels::filled(size, [r, g, b, u8::MAX])))
+    );
+    let (previous, stroke) =
+      editor.sky_stroke.get_or_insert_with(|| (direction, SkyStroke::new(pixels)));
+    // Dabs close enough together along the way from the last frame to blend smoothly.
+    let step = (radius * 0.2).max(std::f32::consts::FRAC_PI_4 / pixels.size as f32);
+    let dabs = (previous.angle_between(direction) / step).ceil().max(1.0) as usize;
+    (1..=dabs).for_each(|i| {
+      let along =
+        previous.lerp(direction, i as f32 / dabs as f32).normalize_or(direction);
+      stroke.dab(pixels, along, brush)
+    });
+    *previous = direction;
+    sky.upload(&mut images)
+  }
+}
+
 /// Applies the active tool where the cursor points at the terrain.
 fn use_tool(
   mut editor: ResMut<WorldEditor>,
@@ -456,6 +745,7 @@ fn use_tool(
   camera: Single<(&Camera, &GlobalTransform), With<FreeCamera>>,
   window: Single<&Window>,
   mouse: Res<ButtonInput<MouseButton>>,
+  keys: Res<ButtonInput<KeyCode>>,
   time: Res<Time>,
   placed: Query<(Entity, &Transform), Placed>,
   mut preview: Query<
@@ -529,28 +819,21 @@ fn use_tool(
         }
       }
       Tool::PaintGround => {
-        let (radius, ground) = (editor.ground_radius, editor.ground);
-        brush_circle(radius.max(cell_size / 2.0));
-        if let Some(Stroke { previous, .. }) = editor.stroke {
+        let radius = editor.ground_radius.max(terrain.paint_step() * 0.75);
+        brush_circle(radius);
+        if let Some(Stroke { previous, .. }) = editor.stroke
+          && let Some(material) = editor.ground.clone()
+        {
           // Sampling the cursor's path since the last frame keeps fast drags gapless.
-          let previous = terrain.to_grid(previous);
-          let samples = (previous.distance(center) * 2.0).ceil().max(1.0) as usize;
+          let samples =
+            (previous.distance(hit.xz()) / (radius * 0.5)).ceil().max(1.0) as usize;
           let path = (0..=samples)
-            .map(|i| previous.lerp(center, i as f32 / samples as f32))
+            .map(|i| previous.lerp(hit.xz(), i as f32 / samples as f32))
             .collect::<Vec<_>>();
-          let under_brush = (0..cells_z)
-            .flat_map(|z| (0..cells_x).map(move |x| (x, z)))
-            .filter(|&(x, z)| {
-              let cell = Vec2::new(x as f32, z as f32);
-              path.iter().any(|&point| {
-                cell == point.floor() || (cell + 0.5).distance(point) * cell_size < radius
-              })
-            })
-            .filter(|&(x, z)| terrain.ground[z][x] != ground)
-            .collect::<Vec<_>>();
-          // Only touch the terrain when a cell changes, so meshes aren't rebuilt for nothing.
-          if !under_brush.is_empty() {
-            under_brush.into_iter().for_each(|(x, z)| terrain.ground[z][x] = ground);
+          let points = terrain.unpainted(&path, radius, &material);
+          // Only touch the terrain when paint changes, so chunks aren't rebuilt for nothing.
+          if !points.is_empty() {
+            terrain.paint(&points, &material)
           }
         }
       }
@@ -582,59 +865,112 @@ fn use_tool(
           ));
         }
       }
-      Tool::Select => {
-        if clicked {
-          editor.selected = placed
+      // Picked below, wherever the cursor is, as a lasso can go over the sky.
+      // Painted by `paint_sky`, wherever the cursor points rather than on the terrain.
+      Tool::Select | Tool::PaintSky => {}
+    }
+    editor.stroke.iter_mut().for_each(|stroke| stroke.previous = hit.xz());
+  }
+
+  // Selecting: a click picks the nearest thing, a drag draws a lasso around several.
+  // Shift adds to the selection, and Shift-clicking something picked lets go of it.
+  let cursor = window.cursor_position();
+  if editor.tool != Tool::Select {
+    editor.lasso = None
+  } else if clicked && editor.pointer_in_view {
+    editor.lasso = cursor.map(|cursor| vec![cursor])
+  } else if mouse.pressed(MouseButton::Left)
+    && let Some(lasso) = &mut editor.lasso
+    && let Some(cursor) = cursor
+    && lasso.last().is_none_or(|last| last.distance(cursor) > 2.0)
+  {
+    lasso.push(cursor)
+  } else if !mouse.pressed(MouseButton::Left)
+    && let Some(lasso) = editor.lasso.take()
+  {
+    let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    let (min, max) = lasso
+      .iter()
+      .fold((Vec2::MAX, Vec2::MIN), |(min, max), &point| (min.min(point), max.max(point)));
+    let dragged = (max - min).max_element() > LASSO_MIN;
+    let picked = if dragged {
+      placed
+        .iter()
+        .filter(|&(_, &Transform { translation, .. })| {
+          camera
+            .world_to_viewport(camera_transform, translation)
+            .is_ok_and(|point| super::in_lasso(&lasso, point))
+        })
+        .map(|(entity, _)| entity)
+        .collect()
+    } else {
+      hit
+        .and_then(|hit| {
+          placed
             .iter()
             .map(|(entity, &Transform { translation, .. })| {
               (entity, translation.xz().distance(hit.xz()))
             })
             .filter(|&(_, distance)| distance < SELECT_RADIUS)
             .min_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(entity, _)| entity);
+        })
+        .map(|(entity, _)| entity)
+        .into_iter()
+        .collect::<Vec<_>>()
+    };
+    if !shift {
+      editor.selected = picked
+    } else if let [entity] = picked[..]
+      && !dragged
+      && editor.selected.contains(&entity)
+    {
+      editor.selected.retain(|&selected| selected != entity)
+    } else {
+      picked.into_iter().for_each(|entity| {
+        if !editor.selected.contains(&entity) {
+          editor.selected.push(entity)
         }
-      }
+      })
     }
-    editor.stroke.iter_mut().for_each(|stroke| stroke.previous = hit.xz());
   }
 
   // The model or billboard a click would place, where it would go.
   let yaw = Quat::from_rotation_y(editor.model_yaw_degrees.to_radians());
   let placing = hit.and_then(|hit| match editor.tool {
-    Tool::PlaceModel => editor
-      .model
-      .clone()
-      .map(|path| (Some(path), None, Transform::from_translation(hit).with_rotation(yaw))),
+    Tool::PlaceModel => editor.model.clone().map(|path| {
+      (Some(path), None, Transform::from_translation(hit).with_rotation(yaw))
+    }),
     Tool::PlaceBillboard => {
       Some((None, Some(editor.billboard.clone()), Transform::from_translation(hit)))
     }
     _ => None
   });
-  let shown = preview.iter_mut().fold(false, |shown, (entity, model, billboard, mut transform)| {
-    match &placing {
-      Some((path, wanted, at))
-        if !shown
-          && model.map(|Model { path }| path) == path.as_ref()
-          && billboard.is_some() == wanted.is_some() =>
-      {
-        if let (Some(mut billboard), Some(wanted)) = (billboard, wanted)
-          && *billboard != *wanted
+  let shown =
+    preview.iter_mut().fold(false, |shown, (entity, model, billboard, mut transform)| {
+      match &placing {
+        Some((path, wanted, at))
+          if !shown
+            && model.map(|Model { path }| path) == path.as_ref()
+            && billboard.is_some() == wanted.is_some() =>
         {
-          *billboard = wanted.clone()
+          if let (Some(mut billboard), Some(wanted)) = (billboard, wanted)
+            && *billboard != *wanted
+          {
+            *billboard = wanted.clone()
+          }
+          transform.translation = at.translation;
+          // Billboards turn themselves toward the camera.
+          if path.is_some() {
+            transform.rotation = at.rotation
+          }
+          true
         }
-        transform.translation = at.translation;
-        // Billboards turn themselves toward the camera.
-        if path.is_some() {
-          transform.rotation = at.rotation
+        _ => {
+          commands.entity(entity).despawn();
+          shown
         }
-        true
       }
-      _ => {
-        commands.entity(entity).despawn();
-        shown
-      }
-    }
-  });
+    });
   if !shown && let Some((path, billboard, at)) = placing {
     let mut entity = commands.spawn((PlacementPreview, at, Visibility::default()));
     if let Some(path) = path {
@@ -646,8 +982,29 @@ fn use_tool(
   }
 }
 
+/// Shows the ground faceted while a sculpting tool is picked in the world editor, to see
+/// its shape, and smooth otherwise.
+fn shade_terrain(
+  mode: Res<State<Mode>>,
+  editor_tab: Res<super::Editor>,
+  editor: Res<WorldEditor>,
+  mut shading: ResMut<TerrainShading>
+) {
+  let sculpting = *mode.get() == Mode::Edit
+    && *editor_tab == super::Editor::World
+    && matches!(editor.tool, Tool::Sculpt(_));
+  let wanted = if sculpting { TerrainShading::Flat } else { TerrainShading::Smooth };
+  // Only writing when it differs, so the ground isn't rebuilt every frame.
+  if *shading != wanted {
+    *shading = wanted
+  }
+}
+
 /// Takes the placement preview away when the world editor isn't showing.
-fn remove_preview(preview: Query<Entity, With<PlacementPreview>>, mut commands: Commands) {
+fn remove_preview(
+  preview: Query<Entity, With<PlacementPreview>>,
+  mut commands: Commands
+) {
   preview.iter().for_each(|entity| commands.entity(entity).despawn())
 }
 
@@ -655,16 +1012,17 @@ fn remove_preview(preview: Query<Entity, With<PlacementPreview>>, mut commands: 
 /// of what's being built.
 const EDIT_FOV: f32 = 70.0_f32.to_radians();
 
-/// Widens the camera's view in the world editor, and puts it back otherwise.
+/// Widens the camera's view in the world editor, and puts the in-game one back otherwise.
 fn set_fov(
   mode: Res<State<Mode>>,
   editor: Res<super::Editor>,
+  settings: Res<SceneSettings>,
   mut projection: Single<&mut Projection, With<FreeCamera>>
 ) {
   let wanted = if *mode.get() == Mode::Edit && *editor == super::Editor::World {
     EDIT_FOV
   } else {
-    PerspectiveProjection::default().fov
+    settings.camera.fov_degrees.to_radians()
   };
   // Only writing when it differs, so the projection isn't marked changed every frame.
   if let Projection::Perspective(PerspectiveProjection { fov, .. }) = **projection
@@ -684,7 +1042,7 @@ fn draw_markers_and_selection(
   mut gizmos: Gizmos
 ) {
   placed.iter().for_each(|(entity, &Transform { translation, .. }, is_marker)| {
-    let selected = editor.selected == Some(entity);
+    let selected = editor.selected.contains(&entity);
     let color = if selected { SELECTION_COLOR } else { MARKER_COLOR };
     if is_marker {
       let top = translation + Vec3::Y * MARKER_POLE;
@@ -708,14 +1066,21 @@ fn draw_markers_and_selection(
 /// How many changes back undo goes.
 const MAX_UNDO: usize = 100;
 
-/// The world as saved text before each change, for undo, and before each undo, for redo.
+/// The world as saved text and the sky's pixels, at one point in time.
+#[derive(Clone, PartialEq)]
+struct Snapshot {
+  world: String,
+  sky: Option<Arc<SkyPixels>>
+}
+
+/// Snapshots from before each change, for undo, and before each undo, for redo.
 #[derive(Resource, Default)]
 struct History {
-  undo: Vec<String>,
-  redo: Vec<String>,
+  undo: Vec<Snapshot>,
+  redo: Vec<Snapshot>,
   /// The world after the last change seen, to tell when another happens. `None` until
   /// it's next looked at, as after undoing.
-  current: Option<String>
+  current: Option<Snapshot>
 }
 
 /// Notes each finished change, and undoes them with Ctrl+Z, redoing with Ctrl+Y or
@@ -731,16 +1096,24 @@ fn undo_redo(
   models: Query<(&Model, &Transform), Without<PlacementPreview>>,
   billboards: Query<(&Billboard, &Transform), Without<PlacementPreview>>,
   placed: Query<Entity, Placed>,
+  mut sky: ResMut<Sky>,
+  mut images: ResMut<Assets<Image>>,
   mut commands: Commands
 ) {
-  let now = || WorldFile::collect(&terrain, &markers, &models, &billboards).to_text().ok();
+  let now = |sky: &Sky| {
+    WorldFile::collect(&terrain, &markers, &models, &billboards)
+      .to_text()
+      .ok()
+      .map(|world| Snapshot { world, sky: sky.pixels.clone() })
+  };
   let History { undo, redo, current } = &mut *history;
   let busy = editor.stroke.is_some() || mouse.pressed(MouseButton::Left);
   // A change counts once it's done: the mouse let go, or a key typed.
-  let done = mouse.just_released(MouseButton::Left) || keys.get_just_released().next().is_some();
+  let done =
+    mouse.just_released(MouseButton::Left) || keys.get_just_released().next().is_some();
   if !busy
     && (done || current.is_none())
-    && let Some(text) = now()
+    && let Some(text) = now(&sky)
     && current.as_ref() != Some(&text)
     && let Some(before) = current.replace(text)
   {
@@ -758,14 +1131,21 @@ fn undo_redo(
   if (undoing || redoing)
     && !busy
     && !egui_wants_input.wants_any_keyboard_input()
-    && let Some(text) = from.pop()
-    && let Some(now) = now()
-    && let Ok(world) = ron::from_str::<WorldFile>(&text)
+    && let Some(Snapshot { world, sky: sky_then }) = from.pop()
+    && let Some(now) = now(&sky)
+    && let Ok(world) = ron::from_str::<WorldFile>(&world)
   {
+    if sky_then != now.sky {
+      sky.pixels = sky_then;
+      sky.upload(&mut images);
+      if let Err(error) = sky.save() {
+        editor.status = format!("Can't save the sky: {error}")
+      }
+    }
     to.push(now);
     placed.iter().for_each(|entity| commands.entity(entity).despawn());
     world.spawn(&mut commands);
-    editor.selected = None;
+    editor.selected.clear();
     // Looked at again once the restored world is in place.
     *current = None
   }
@@ -798,7 +1178,8 @@ fn autosave(
   let world = WorldFile::collect(&terrain, &markers, &models, &billboards);
   let Ok(text) = world.to_text() else { return };
   let file = Path::new(ASSETS_DIR).join(WorldFile::NAME);
-  let saved = editor.saved.get_or_insert_with(|| fs::read_to_string(&file).unwrap_or_default());
+  let saved =
+    editor.saved.get_or_insert_with(|| fs::read_to_string(&file).unwrap_or_default());
   if *saved == text {
     return;
   }
@@ -834,13 +1215,17 @@ pub fn plugin(app: &mut App) {
     .init_resource::<History>()
     .add_systems(
       Update,
-      (
-        (use_tool, undo_redo).chain(),
-        draw_markers_and_selection
-      )
+      ((use_tool, paint_sky, undo_redo).chain(), draw_markers_and_selection)
         .run_if(editing_world)
     )
-    .add_systems(Update, (set_fov, remove_preview.run_if(not(editing_world))))
+    .add_systems(
+      Update,
+      (
+        set_fov.after(apply_scene),
+        shade_terrain,
+        remove_preview.run_if(not(editing_world))
+      )
+    )
     .add_systems(Update, autosave.run_if(in_state(Mode::Edit)))
     // Save straight away when play starts, so nothing waits on the next check.
     .add_systems(OnExit(Mode::Edit), |mut editor: ResMut<WorldEditor>| {

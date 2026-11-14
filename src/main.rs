@@ -1,29 +1,16 @@
 #[cfg(feature = "editor")]
 mod editor;
 
-use {bevy::{camera_controller::free_camera::{run_freecamera_controller, FreeCamera,
+use {bevy::{camera_controller::free_camera::{run_freecamera_controller,
                                              FreeCameraPlugin, FreeCameraState},
             prelude::*},
      winterjam2026::{assets,
                      billboard::WorldCamera,
+                     scene::SceneSettings,
                      world::{Markers, WorldPlugin}}};
 
 /// Marker the camera starts at, when the world has one.
 const START_MARKER: &str = "start";
-
-/// How the flying camera moves. Fast enough to cross the world in a few seconds; hold
-/// Shift to go faster still, and scroll the wheel to speed up or slow down.
-fn free_camera() -> FreeCamera {
-  FreeCamera {
-    // Twice Bevy's default, for turning around quickly.
-    sensitivity: 0.4,
-    walk_speed: 40.0,
-    run_speed: 120.0,
-    // Each wheel notch changes the speed by about 20%.
-    scroll_factor: 0.18,
-    ..default()
-  }
-}
 
 /// Makes forward and back fly level whatever the camera's pitch, by redoing the free
 /// camera's forward movement along the ground.
@@ -79,10 +66,12 @@ fn start_transform(markers: &Markers) -> Transform {
   .looking_to(Vec3::NEG_Z, Vec3::Y)
 }
 
-fn spawn_camera(mut commands: Commands, markers: Markers) {
+/// The camera, flying as the scene settings say: hold Shift to go faster, and scroll the
+/// wheel to speed up or slow down.
+fn spawn_camera(mut commands: Commands, markers: Markers, settings: Res<SceneSettings>) {
   commands.spawn((
     Camera3d::default(),
-    free_camera(),
+    settings.camera.fly.free_camera(),
     FlyLevel::default(),
     WorldCamera,
     start_transform(&markers)

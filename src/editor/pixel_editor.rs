@@ -14,7 +14,7 @@ use {super::name_problem,
            time::Duration},
      winterjam2026::{assets::{self, ASSETS_DIR},
                      material::ModelMaterials,
-                     world::{Ground, GroundMaterials, TEXTURES_DIR, tiling_pixel_image}}};
+                     world::{TEXTURES_DIR, tiling_pixel_image}}};
 
 fn texture_path(name: &str) -> PathBuf {
   Path::new(TEXTURES_DIR).join(format!("{name}.png"))
@@ -317,7 +317,18 @@ struct Floating {
   at: IVec2,
   /// Outline of a lasso selection, relative to `at`.
   hull: Option<Vec<IVec2>>,
-  warp: Option<Warp>
+  warp: Option<Warp>,
+  /// Loops around the frame's borders, coming back in on the other side, as the texture
+  /// tiles.
+  wraps: bool
+}
+
+impl Floating {
+  /// Where frame pixel `at` falls in the selection, on a frame of `size`.
+  fn local(&self, at: IVec2, size: UVec2) -> IVec2 {
+    let offset = at - self.at;
+    if self.wraps { offset.rem_euclid(size.as_ivec2()) } else { offset }
+  }
 }
 
 /// The animation being painted. Every frame has the same size.
@@ -394,8 +405,10 @@ impl OpenTexture {
 
   /// Drops the floating selection where it is.
   fn commit(&mut self) {
-    if let Some(Floating { pixels, at, .. }) = self.floating.take() {
-      self.frames.canvas_mut().paste(&pixels, at)
+    if let Some(floating) = self.floating.take() {
+      let size = self.frames.size();
+      let layer = Canvas::from_fn(size, |at| floating.pixels.at(floating.local(at, size)));
+      self.frames.canvas_mut().paste(&layer, IVec2::ZERO)
     }
     self.finish()
   }
@@ -458,7 +471,8 @@ impl OpenTexture {
         }),
         pixels,
         at: min,
-        hull
+        hull,
+        wraps: tool == Tool::Move
       })
     }
   }
@@ -606,7 +620,7 @@ struct PixelEditor {
   /// Shows the previous frame faintly where the current one is transparent.
   onion: bool,
   gesture: Option<(PointerButton, Gesture)>,
-  /// The canvas size fields, for New, Set and created ground textures.
+  /// The canvas size fields, for New and Set.
   new_size: UVec2,
   /// The canvas size the size fields last followed.
   followed_size: UVec2,
@@ -632,10 +646,8 @@ impl PixelEditor {
   const BAR_HEIGHT: f32 = 18.0;
   const BAR_STEPS: usize = 64;
   const PALETTE_COLUMNS: usize = 8;
-  /// The least height of the file list, which otherwise goes down to the bottom.
-  const FILE_LIST_HEIGHT: f32 = 240.0;
-  /// Room left under the file list for the hint and create buttons.
-  const BELOW_FILE_LIST: f32 = 90.0;
+  /// How much of the side panel's height the file pane starts with.
+  const FILE_PANE_SHARE: f32 = 0.5;
   /// Opacity of the onion skin.
   const ONION: f32 = 0.35;
   const CHECKERS: [Rgba; 2] = [[90, 90, 90, 255], [140, 140, 140, 255]];
@@ -952,6 +964,57 @@ impl PixelEditor {
   }
 
   fn side_panel(&mut self, ui: &mut egui::Ui, palette: &mut Palette) {
+    // The file list gets its own pane filling the bottom of the panel, so nothing above
+    // it can squeeze it.
+    let height = ui.available_height();
+    egui::Panel::bottom("pixel_files")
+      .resizable(true)
+      .default_size(height * Self::FILE_PANE_SHARE)
+      .show(ui, |ui| {
+        ui.vertical_centered(|ui| ui.strong("FILE"));
+        ui.horizontal(|ui| {
+          ui.add(
+            egui::TextEdit::singleline(&mut self.name).desired_width(ui.available_width() - 40.0)
+          );
+          ui.label(".png");
+        });
+        ui.vertical_centered_justified(|ui| {
+          if ui.button("Save").on_hover_text("Ctrl+S").clicked() {
+            self.save()
+          }
+        });
+        let mut names = texture_names(Path::new(TEXTURES_DIR));
+        names.sort();
+        let unsaved = self.open.has_unsaved_work();
+        if names.is_empty() {
+          ui.weak(format!("No textures in {TEXTURES_DIR} yet"));
+        } else if unsaved {
+          ui.weak("Unsaved changes: double click to open another anyway");
+        }
+        let opened = egui::ScrollArea::vertical()
+          .id_salt("textures")
+          .auto_shrink(false)
+          .show(ui, |ui| {
+            names
+              .iter()
+              .filter(|&name| {
+                let response = ui.selectable_label(*name == self.name, name);
+                response.double_clicked() || response.clicked() && !unsaved
+              })
+              .last()
+              .cloned()
+          })
+          .inner;
+        if let Some(name) = opened {
+          match Canvas::open(&texture_path(&name)) {
+            Ok(canvas) if canvas.size.max_element() <= Canvas::MAX_SIDE => {
+              self.open_canvas(name, canvas, true)
+            }
+            Ok(_) => self.status = format!("{name} is over {}px a side", Canvas::MAX_SIDE),
+            Err(error) => self.status = format!("Can't open {name}: {error}")
+          }
+        }
+      });
     egui::ScrollArea::vertical().show(ui, |ui| {
       let width = ui.available_width();
       ui.vertical_centered(|ui| ui.strong("COLOR"));
@@ -1104,62 +1167,6 @@ impl PixelEditor {
         }
       });
 
-      ui.separator();
-      ui.vertical_centered(|ui| ui.strong("FILE"));
-      ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(width - 40.0));
-        ui.label(".png");
-      });
-      ui.vertical_centered_justified(|ui| {
-        if ui.button("Save").on_hover_text("Ctrl+S").clicked() {
-          self.save()
-        }
-      });
-      let mut names = texture_names(Path::new(TEXTURES_DIR));
-      names.sort();
-      let unsaved = self.open.has_unsaved_work();
-      // Down to the bottom of the panel, leaving room for what's below.
-      let height = (ui.clip_rect().bottom() - ui.cursor().top() - Self::BELOW_FILE_LIST)
-        .max(Self::FILE_LIST_HEIGHT);
-      let opened = egui::ScrollArea::vertical()
-        .id_salt("textures")
-        .max_height(height)
-        .show(ui, |ui| {
-          names
-            .iter()
-            .filter(|&name| {
-              let response = ui.selectable_label(*name == self.name, name);
-              response.double_clicked() || response.clicked() && !unsaved
-            })
-            .last()
-            .cloned()
-        })
-        .inner;
-      if names.is_empty() {
-        ui.weak(format!("No textures in {TEXTURES_DIR} yet"));
-      } else if unsaved {
-        ui.weak("Unsaved changes: double click to open another anyway");
-      }
-      if let Some(name) = opened {
-        match Canvas::open(&texture_path(&name)) {
-          Ok(canvas) if canvas.size.max_element() <= Canvas::MAX_SIDE => {
-            self.open_canvas(name, canvas, true)
-          }
-          Ok(_) => self.status = format!("{name} is over {}px a side", Canvas::MAX_SIDE),
-          Err(error) => self.status = format!("Can't open {name}: {error}")
-        }
-      }
-      Ground::ALL
-        .into_iter()
-        .map(Ground::surface)
-        .filter(|surface| !names.iter().any(|name| name == surface.name))
-        .filter(|surface| ui.button(format!("+ create {}", surface.name)).clicked())
-        .last()
-        .into_iter()
-        .for_each(|surface| {
-          let canvas = Canvas::filled(self.new_size, surface.color.to_srgba().to_u8_array());
-          self.open_canvas(surface.name.into(), canvas, false)
-        });
     });
   }
 
@@ -1194,9 +1201,10 @@ impl PixelEditor {
         Tool::Copy | Tool::Move | Tool::Warp => {
           if let Some(floating) = &self.open.floating
             && self.tool != Tool::Warp
-            && floating.pixels.contains(at - floating.at)
+            && let offset = floating.local(at, self.open.frames.size())
+            && floating.pixels.contains(offset)
           {
-            Gesture::Grab { offset: at - floating.at }
+            Gesture::Grab { offset }
           } else {
             self.open.commit();
             Gesture::Marquee(if self.lasso && self.tool != Tool::Warp {
@@ -1262,7 +1270,8 @@ impl PixelEditor {
       }
       Gesture::Grab { offset } => {
         if let Some(floating) = &mut self.open.floating {
-          floating.at = at - *offset
+          let moved = at - *offset;
+          floating.at = if floating.wraps { moved.rem_euclid(size) } else { moved }
         }
       }
       &mut Gesture::Corner(corner) => {
@@ -1359,7 +1368,7 @@ impl PixelEditor {
     let shown = Canvas::from_fn(size, |at| {
       let pixel = canvas.at(at);
       let pixel = open.floating.as_ref().map_or(pixel, |floating| {
-        over(floating.pixels.at(at - floating.at), pixel)
+        over(floating.pixels.at(floating.local(at, size)), pixel)
       });
       let pixel = if pixel[3] == 0
         && let Some([r, g, b, alpha]) = previous.map(|previous| previous.at(at))
@@ -1398,25 +1407,35 @@ impl PixelEditor {
       })
     }
 
-    let outline = |points: Vec<Vec2>, color: Color32| {
+    // A wrapping selection's outline shows only on the frame, where its pieces are.
+    let on_art = painter.with_clip_rect(art.intersect(view));
+    let outline_on = |painter: &egui::Painter, points: Vec<Vec2>, color: Color32| {
       let mut points = points.into_iter().map(to_screen).collect::<Vec<_>>();
       points.extend(points.first().copied());
       painter.extend(egui::Shape::dashed_line(&points, egui::Stroke::new(2.0, color), 4.0, 3.0));
     };
+    let outline = |points: Vec<Vec2>, color: Color32| outline_on(&painter, points, color);
     let box_outline = |min: IVec2, max: IVec2| {
       let [min, max] = [min.as_vec2(), max.as_vec2() + 1.0];
       vec![min, Vec2::new(max.x, min.y), max, Vec2::new(min.x, max.y)]
     };
     let hull_outline =
       |hull: &[IVec2], offset: IVec2| hull.iter().map(|&corner| (corner + offset).as_vec2() + 0.5).collect();
-    if let Some(Floating { pixels, at, hull, warp }) = &self.open.floating {
-      outline(
+    if let &Some(Floating { ref pixels, at, ref hull, ref warp, wraps }) = &self.open.floating {
+      let selection = |at: IVec2| {
         hull.as_ref().map_or_else(
-          || box_outline(*at, *at + pixels.size.as_ivec2() - 1),
-          |hull| hull_outline(hull, *at)
-        ),
-        Self::SELECTION_COLOR
-      );
+          || box_outline(at, at + pixels.size.as_ivec2() - 1),
+          |hull| hull_outline(hull, at)
+        )
+      };
+      if wraps {
+        let size = size.as_ivec2();
+        [IVec2::ZERO, size.with_y(0), size.with_x(0), size].into_iter().for_each(|shift| {
+          outline_on(&on_art, selection(at - shift), Self::SELECTION_COLOR)
+        })
+      } else {
+        outline(selection(at), Self::SELECTION_COLOR)
+      }
       warp.iter().for_each(|Warp { corners, .. }| {
         outline(corners.map(|corner| corner.as_vec2() + 0.5).to_vec(), Self::WARP_COLOR);
         corners.iter().for_each(|corner| {
@@ -1447,7 +1466,7 @@ impl Default for PixelEditor {
       open: OpenTexture::new(Canvas::filled(Self::START_SIZE, TRANSPARENT), false),
       name: default(),
       tool: Tool::Pencil,
-      lasso: true,
+      lasso: false,
       brush: 1,
       color: to_hsva([0xb1, 0x3e, 0x53, u8::MAX]),
       hex: default(),
@@ -1474,15 +1493,13 @@ pub struct PixelEditorUi<'w> {
   editor: ResMut<'w, PixelEditor>,
   palette: ResMut<'w, Palette>,
   images: ResMut<'w, Assets<Image>>,
-  materials: ResMut<'w, Assets<StandardMaterial>>,
-  ground_materials: Res<'w, GroundMaterials>,
   model_materials: Res<'w, ModelMaterials>
 }
 
 impl PixelEditorUi<'_> {
   /// Draws the pixel editor over the whole window.
   pub fn ui(&mut self, root: &mut egui::Ui) {
-    let Self { editor, palette, images, materials, ground_materials, model_materials } = self;
+    let Self { editor, palette, images, model_materials } = self;
     let editor = &mut **editor;
     let ctx = root.ctx().clone();
     let tool = editor.tool;
@@ -1512,23 +1529,11 @@ impl PixelEditorUi<'_> {
       editor.followed_size = size
     }
 
-    // Upload the frame when it changed, to egui and to the ground named like it.
+    // Upload the frame when it changed, so materials using the texture show it as it's
+    // painted.
     let open = &mut editor.open;
     let canvas = open.frames.canvas();
     if open.shown.as_ref() != Some(canvas) {
-      if let Some(ground) =
-        Ground::ALL.into_iter().find(|ground| ground.surface().name == editor.name)
-        && let Some(mut material) = materials.get_mut(ground_materials.of(ground))
-      {
-        let image = tiling_pixel_image(canvas.size, canvas.pixels.as_flattened().to_vec());
-        if let Some(texture) = &material.base_color_texture {
-          images.insert(texture, image).ok();
-        } else {
-          material.base_color_texture = Some(images.add(image))
-        }
-        material.base_color = Color::WHITE
-      }
-      // Model materials using the texture show it as it's painted too.
       if let Some(handle) =
         model_materials.loaded_texture(&format!("textures/{}.png", editor.name))
       {

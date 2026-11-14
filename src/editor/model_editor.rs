@@ -33,7 +33,7 @@
 
 mod ops;
 
-use {super::{Editor, name_problem,
+use {super::{Editor, in_lasso, name_problem,
              material_editor::{MaterialEditor, Thumbnails, free_name}},
      crate::Mode,
      bevy::{camera::{RenderTarget, visibility::RenderLayers},
@@ -452,6 +452,8 @@ struct Modal {
   normal: Option<Vec3>,
   /// A value typed in, used instead of the pointer.
   typed: String,
+  /// Wheel steps a free move has pushed away from the camera, negative toward it.
+  depth: f32,
   /// Vertices mirroring selected ones across x = 0, with the X mirror on.
   partners: Vec<(usize, usize)>,
   /// Confirms when the left button comes up, for dragging things directly.
@@ -842,6 +844,7 @@ impl ModelEditor {
       axis: normal.map(|_| Axis::Normal),
       normal,
       typed: default(),
+      depth: 0.0,
       drag,
       label,
       amount: default()
@@ -995,7 +998,8 @@ impl ModelEditor {
             - projector.on_plane(modal.start, pivot))
           .to_array()
           .map(|component| round(component, grid));
-          let offset = Vec3::from_array(offset);
+          // The wheel pushes it straight along the view, a grid step a notch.
+          let offset = Vec3::from_array(offset) + projector.forward * grid * modal.depth;
           modal.amount = format!("{:.3}, {:.3}, {:.3}", offset.x, offset.y, offset.z);
           offset
         };
@@ -1862,22 +1866,9 @@ impl ModelEditor {
   /// Adds the corners inside `lasso` to the selection, hidden ones too, so drawing
   /// around a shape picks all of it.
   fn lasso_select(&mut self, projector: &Projector, lasso: &[Vec2]) {
-    let inside = |p: Vec2| {
-      // Even-odd rule: a ray to the right crosses the outline an odd number of times.
-      lasso
-        .iter()
-        .zip(lasso.iter().cycle().skip(1))
-        .filter(|&(a, b)| {
-          (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x)
-        })
-        .count()
-        % 2
-        == 1
-    };
-    self.selection.extend(
-      (0..self.model.vertices.len())
-        .filter(|&v| projector.project(self.model.vertices[v]).is_some_and(inside))
-    )
+    self.selection.extend((0..self.model.vertices.len()).filter(|&v| {
+      projector.project(self.model.vertices[v]).is_some_and(|p| in_lasso(lasso, p))
+    }))
   }
 
   fn box_select(&mut self, projector: &Projector, from: Vec2, to: Vec2, mode: BoxMode) {
@@ -1953,8 +1944,16 @@ impl ModelEditor {
     let hovered = response.hovered() || response.dragged();
     let at = pointer.unwrap_or(to_vec(rect.center()));
 
-    // Moving the view.
-    if hovered && scroll != 0.0 {
+    // Moving the view, or while moving something freely, moving it toward or away from
+    // the camera.
+    if hovered
+      && scroll != 0.0
+      && let Some(modal) = &mut self.modal
+      && modal.kind == ModalKind::Grab
+      && modal.axis.is_none()
+    {
+      modal.depth += scroll
+    } else if hovered && scroll != 0.0 {
       self.view.distance =
         (self.view.distance * 0.88f32.powf(scroll.signum())).clamp(0.2, 200.0)
     }
@@ -2190,11 +2189,18 @@ impl ModelEditor {
         egui::StrokeKind::Inside
       );
     }
+    let wheel = |modal: &Modal| {
+      if modal.kind == ModalKind::Grab && modal.axis.is_none() {
+        " · wheel moves it nearer or farther"
+      } else {
+        ""
+      }
+    };
     let hint = if let Some(modal) = &self.modal
       && self.simple
     {
       format!(
-        "{}  {}{}   ·   {} · Esc cancels",
+        "{}  {}{}   ·   {}{} · Esc cancels",
         modal.label,
         modal.amount,
         modal.axis.map_or(String::new(), |axis| format!("  along {}", axis.name())),
@@ -2202,11 +2208,12 @@ impl ModelEditor {
           "let go to finish · hold Ctrl to move off the grid"
         } else {
           "move the mouse, click to finish · type a number for an exact amount"
-        }
+        },
+        wheel(modal)
       )
     } else if let Some(modal) = &self.modal {
       format!(
-        "{}  {}{}{}   ·   X Y Z{} lock an axis · type a number · Ctrl {} snapping · Enter/click done · Esc/right click cancel",
+        "{}  {}{}{}   ·   X Y Z{} lock an axis{} · type a number · Ctrl {} snapping · Enter/click done · Esc/right click cancel",
         modal.label,
         if modal.typed.is_empty() {
           modal.amount.clone()
@@ -2216,6 +2223,7 @@ impl ModelEditor {
         modal.axis.map_or(String::new(), |axis| format!("  along {}", axis.name())),
         if (self.snap) != modifiers.command { "  snapped" } else { "" },
         if modal.normal.is_some() { " N" } else { "" },
+        wheel(modal),
         if self.snap { "frees" } else { "turns on" }
       )
     } else if !self.status.is_empty() {

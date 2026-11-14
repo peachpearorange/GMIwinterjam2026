@@ -9,6 +9,7 @@
 mod material_editor;
 mod model_editor;
 mod pixel_editor;
+mod scene_editor;
 mod world_editor;
 
 use {crate::{Mode, start_transform},
@@ -20,6 +21,7 @@ use {crate::{Mode, start_transform},
      material_editor::{MaterialEditor, MaterialEditorUi},
      model_editor::ModelEditorUi,
      pixel_editor::PixelEditorUi,
+     scene_editor::SceneEditorUi,
      winterjam2026::world::Markers,
      world_editor::WorldEditorUi};
 
@@ -27,6 +29,21 @@ const TOGGLE_KEY: KeyCode = KeyCode::F1;
 /// How much bigger than egui's default the editor's text and buttons are. Ctrl + and
 /// Ctrl - still zoom further from here.
 const UI_ZOOM: f32 = 1.35;
+
+/// Whether `point` is inside the outline `lasso`, by the even-odd rule: a ray to the
+/// right crosses the outline an odd number of times.
+fn in_lasso(lasso: &[Vec2], point: Vec2) -> bool {
+  lasso
+    .iter()
+    .zip(lasso.iter().cycle().skip(1))
+    .filter(|&(a, b)| {
+      (a.y > point.y) != (b.y > point.y)
+        && point.x < a.x + (point.y - a.y) / (b.y - a.y) * (b.x - a.x)
+    })
+    .count()
+    % 2
+    == 1
+}
 
 /// What's wrong with `name` as a file name, if anything. Names take letters, digits,
 /// spaces, `_` and `-`, with `/` between folders.
@@ -60,7 +77,9 @@ pub enum Editor {
   World,
   Textures,
   Models,
-  Materials
+  Materials,
+  /// The in-game camera and the light, over the live world.
+  Scene
 }
 
 /// Where the camera was when play started, to return to after.
@@ -118,8 +137,8 @@ fn stop_play(
   }
 }
 
-/// The camera always flies in play. While editing, only in the world editor, and not
-/// while typing into the UI.
+/// The camera always flies in play. While editing, only in the world and scene editors,
+/// and not while typing into the UI.
 fn enable_camera(
   mode: Res<State<Mode>>,
   editor: Res<Editor>,
@@ -127,7 +146,8 @@ fn enable_camera(
   mut camera: Single<&mut FreeCameraState>
 ) {
   camera.enabled = *mode.get() == Mode::Play
-    || *editor == Editor::World && !egui_wants_input.wants_any_keyboard_input();
+    || matches!(*editor, Editor::World | Editor::Scene)
+      && !egui_wants_input.wants_any_keyboard_input();
 }
 
 /// Makes text and buttons bigger and easier to hit, once the UI exists.
@@ -164,7 +184,8 @@ fn edit_ui(
     PixelEditorUi,
     ModelEditorUi,
     MaterialEditorUi,
-    ResMut<MaterialEditor>
+    ResMut<MaterialEditor>,
+    SceneEditorUi
   )>
 ) -> Result {
   let ctx = contexts.ctx_mut()?;
@@ -175,6 +196,7 @@ fn edit_ui(
       ui.selectable_value(&mut *editor, Editor::Textures, "Textures");
       ui.selectable_value(&mut *editor, Editor::Models, "Models");
       ui.selectable_value(&mut *editor, Editor::Materials, "Materials");
+      ui.selectable_value(&mut *editor, Editor::Scene, "Scene");
       ui.separator();
       if ui.button("▶ Play (F1)").clicked() {
         next.set(Mode::Play);
@@ -185,7 +207,8 @@ fn edit_ui(
     Editor::World => editors.p0().ui(&mut root),
     Editor::Textures => editors.p1().ui(&mut root),
     Editor::Models => editors.p2().ui(&mut root),
-    Editor::Materials => editors.p3().ui(&mut root)
+    Editor::Materials => editors.p3().ui(&mut root),
+    Editor::Scene => editors.p5().ui(&mut root)
   }
   // The model editor making a material opens it here.
   if std::mem::take(&mut editors.p4().show) {

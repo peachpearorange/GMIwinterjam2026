@@ -39,6 +39,29 @@ pub struct ModelMaterial {
   pub tile: f32,
   pub roughness: f32,
   pub metallic: f32,
+  /// How much light a non-metal reflects head on, as Bevy's
+  /// [`StandardMaterial::reflectance`].
+  pub reflectance: f32,
+  /// The color of a non-metal's reflections.
+  pub specular_tint: Rgb,
+  /// A clear glossy layer on top, like varnish or a wet look, 0..1.
+  pub clearcoat: f32,
+  pub clearcoat_roughness: f32,
+  /// Light passing through and scattering, like wax, leaves or snow, 0..1.
+  pub diffuse_transmission: f32,
+  /// Light passing straight through, like glass or ice, 0..1.
+  pub specular_transmission: f32,
+  /// How thick it is for light passing through, in world units.
+  pub thickness: f32,
+  /// How much light bends passing through: 1.31 for ice, 1.5 for glass.
+  pub ior: f32,
+  /// How far light passing through goes before taking on `attenuation_color`.
+  pub attenuation_distance: f32,
+  pub attenuation_color: Rgb,
+  /// Shows its color as is, ignoring light and shadow.
+  pub unlit: bool,
+  /// Whether distance fog covers it.
+  pub fog: bool,
   /// Light the surface gives off, times the texture when there is one. Black for none.
   pub glow: Rgb,
   pub glow_strength: f32,
@@ -58,6 +81,18 @@ impl Default for ModelMaterial {
       tile: 1.0,
       roughness: 0.9,
       metallic: 0.0,
+      reflectance: 0.3,
+      specular_tint: Rgb::WHITE,
+      clearcoat: 0.0,
+      clearcoat_roughness: 0.5,
+      diffuse_transmission: 0.0,
+      specular_transmission: 0.0,
+      thickness: 0.0,
+      ior: 1.5,
+      attenuation_distance: f32::INFINITY,
+      attenuation_color: Rgb::WHITE,
+      unlit: false,
+      fog: true,
       glow: Rgb([0; 3]),
       glow_strength: 1.0,
       cutout: false,
@@ -76,7 +111,18 @@ impl ModelMaterial {
       base_color_texture: texture,
       perceptual_roughness: self.roughness,
       metallic: self.metallic,
-      reflectance: 0.3,
+      reflectance: self.reflectance,
+      specular_tint: self.specular_tint.color(),
+      clearcoat: self.clearcoat,
+      clearcoat_perceptual_roughness: self.clearcoat_roughness,
+      diffuse_transmission: self.diffuse_transmission,
+      specular_transmission: self.specular_transmission,
+      thickness: self.thickness,
+      ior: self.ior,
+      attenuation_distance: self.attenuation_distance,
+      attenuation_color: self.attenuation_color.color(),
+      unlit: self.unlit,
+      fog_enabled: self.fog,
       alpha_mode: if self.cutout { AlphaMode::Mask(0.5) } else { AlphaMode::Opaque },
       double_sided: self.double_sided,
       cull_mode: if self.double_sided { None } else { Some(CullFace::Back) },

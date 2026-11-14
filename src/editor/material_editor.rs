@@ -11,12 +11,23 @@ use {super::{model_editor::{Library, ModelEditor},
      winterjam2026::{assets::{self, ASSETS_DIR},
                      material::{Mapping, ModelMaterial},
                      model::Rgb,
+                     terrain::Terrain,
                      world::TEXTURES_DIR}};
 
 const LIST_WIDTH: f32 = 240.0;
 const THUMBNAIL: f32 = 64.0;
 
 pub(super) fn color32(Rgb([r, g, b]): Rgb) -> Color32 { Color32::from_rgb(r, g, b) }
+
+fn color_row(ui: &mut egui::Ui, label: &str, color: &mut Rgb) {
+  ui.horizontal(|ui| {
+    let mut rgb = color.0;
+    if ui.color_edit_button_srgb(&mut rgb).changed() {
+      *color = Rgb(rgb)
+    }
+    ui.label(label);
+  });
+}
 
 /// A material name no material in `list` has yet.
 pub(super) fn free_name(list: &[ModelMaterial]) -> String {
@@ -191,19 +202,30 @@ impl MaterialEditor {
           }
           textures.into_iter().for_each(|name| {
             let path = format!("textures/{name}.png");
-            let (rect, response) =
-              ui.allocate_exact_size(egui::Vec2::splat(THUMBNAIL), Sense::click());
-            if let Some(texture) = thumbnails.get(ui.ctx(), &path) {
-              let uv = egui::Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0));
-              ui.painter().image(texture, rect, uv, Color32::WHITE);
-            }
-            let stroke = if material.texture.as_deref() == Some(path.as_str()) {
-              Stroke::new(3.0, Color32::WHITE)
-            } else {
-              Stroke::new(1.0, Color32::from_gray(30))
-            };
-            ui.painter().rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
-            if response.on_hover_text(&name).clicked() {
+            // The thumbnail with the texture's name under it, cut short to its width.
+            let clicked = ui
+              .vertical(|ui| {
+                ui.set_width(THUMBNAIL);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let (rect, response) =
+                  ui.allocate_exact_size(egui::Vec2::splat(THUMBNAIL), Sense::click());
+                if let Some(texture) = thumbnails.get(ui.ctx(), &path) {
+                  let uv = egui::Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0));
+                  ui.painter().image(texture, rect, uv, Color32::WHITE);
+                }
+                let stroke = if material.texture.as_deref() == Some(path.as_str()) {
+                  Stroke::new(3.0, Color32::WHITE)
+                } else {
+                  Stroke::new(1.0, Color32::from_gray(30))
+                };
+                ui.painter().rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+                let label = ui.add(
+                  egui::Label::new(egui::RichText::new(&name).small()).truncate().sense(Sense::click())
+                );
+                response.on_hover_text(&name).clicked() || label.clicked()
+              })
+              .inner;
+            if clicked {
               material.texture = Some(path)
             }
           })
@@ -231,16 +253,73 @@ impl MaterialEditor {
         ui.spacing_mut().slider_width = 200.0;
         ui.add(egui::Slider::new(&mut material.roughness, 0.0..=1.0).text("rough"));
         ui.add(egui::Slider::new(&mut material.metallic, 0.0..=1.0).text("metal"));
-        ui.horizontal(|ui| {
-          let mut glow = material.glow.0;
-          if ui.color_edit_button_srgb(&mut glow).changed() {
-            material.glow = Rgb(glow)
+        ui.add(egui::Slider::new(&mut material.reflectance, 0.0..=1.0).text("reflectance"))
+          .on_hover_text("How much light a non-metal reflects head on");
+        color_row(ui, "reflection tint", &mut material.specular_tint);
+        ui.checkbox(&mut material.unlit, "Unlit")
+          .on_hover_text("Shows its color as is, ignoring light and shadow");
+        ui.checkbox(&mut material.fog, "Fogged").on_hover_text("Whether distance fog covers it");
+
+        let mut glows = material.glow != Rgb([0; 3]);
+        if ui
+          .checkbox(&mut glows, "Glow")
+          .on_hover_text("Gives off light, times the texture if any")
+          .changed()
+        {
+          material.glow = if glows { Rgb::WHITE } else { Rgb([0; 3]) }
+        }
+        if glows {
+          ui.horizontal(|ui| {
+            let mut glow = material.glow.0;
+            if ui.color_edit_button_srgb(&mut glow).changed() {
+              material.glow = Rgb(glow)
+            }
+            ui.add(
+              egui::DragValue::new(&mut material.glow_strength)
+                .range(0.0..=50.0)
+                .speed(0.05)
+                .prefix("strength: ")
+            );
+          });
+        }
+
+        ui.collapsing("Clear coat", |ui| {
+          ui.add(egui::Slider::new(&mut material.clearcoat, 0.0..=1.0).text("coat"))
+            .on_hover_text("A clear glossy layer on top, like varnish or a wet look");
+          ui.add(egui::Slider::new(&mut material.clearcoat_roughness, 0.0..=1.0).text("coat rough"));
+        });
+        ui.collapsing("Light through it", |ui| {
+          ui.add(
+            egui::Slider::new(&mut material.diffuse_transmission, 0.0..=1.0).text("scattering")
+          )
+          .on_hover_text("Light passing through and spreading, like wax, leaves or snow");
+          ui.add(
+            egui::Slider::new(&mut material.specular_transmission, 0.0..=1.0).text("clear")
+          )
+          .on_hover_text("Light passing straight through, like glass or ice");
+          ui.add(
+            egui::Slider::new(&mut material.thickness, 0.0..=10.0).suffix(" m").text("thickness")
+          );
+          ui.add(egui::Slider::new(&mut material.ior, 1.0..=3.0).text("refraction"))
+            .on_hover_text("How much light bends: 1.31 for ice, 1.5 for glass");
+          let mut tinted = material.attenuation_distance.is_finite();
+          if ui
+            .checkbox(&mut tinted, "Tinted inside")
+            .on_hover_text("Light passing through takes on a color over a distance")
+            .changed()
+          {
+            material.attenuation_distance = if tinted { 1.0 } else { f32::INFINITY }
           }
-          ui.label("glow");
-          ui.add(egui::DragValue::new(&mut material.glow_strength).range(0.0..=50.0).speed(0.05));
-        })
-        .response
-        .on_hover_text("Light it gives off, black for none, times the texture if any");
+          if tinted {
+            color_row(ui, "tint", &mut material.attenuation_color);
+            ui.add(
+              egui::Slider::new(&mut material.attenuation_distance, 0.01..=100.0)
+                .logarithmic(true)
+                .suffix(" m")
+                .text("over")
+            );
+          }
+        });
         ui.checkbox(&mut material.double_sided, "Two-sided")
           .on_hover_text("Shows the back of faces, for single sheets like leaves or flags");
 
@@ -261,13 +340,15 @@ pub struct MaterialEditorUi<'w> {
   model_editor: ResMut<'w, ModelEditor>,
   palette: ResMut<'w, Palette>,
   thumbnails: ResMut<'w, Thumbnails>,
+  /// Painted ground follows renames too. Missing until the world has loaded.
+  terrain: Option<ResMut<'w, Terrain>>,
   library: Library<'w>
 }
 
 impl MaterialEditorUi<'_> {
   /// Draws the material editor over the whole window.
   pub fn ui(&mut self, root: &mut egui::Ui) {
-    let Self { editor, model_editor, palette, thumbnails, library } = self;
+    let Self { editor, model_editor, palette, thumbnails, terrain, library } = self;
     let palette_before = palette.clone();
     let mut list = library.model_materials.list().to_vec();
 
@@ -335,6 +416,9 @@ impl MaterialEditorUi<'_> {
         model_editor.status = format!("Can't save the materials: {error}")
       }
       if let Some((old, new)) = renamed {
+        if let Some(terrain) = terrain {
+          terrain.rename_material(&old, &new)
+        }
         model_editor.rename_material(&old, &new, model_meshes, model_materials, meshes)
       }
       if remap {
