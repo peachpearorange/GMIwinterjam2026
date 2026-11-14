@@ -1,5 +1,6 @@
 #[cfg(feature = "editor")]
 mod editor;
+mod play;
 
 use {bevy::{camera_controller::free_camera::{run_freecamera_controller,
                                              FreeCameraPlugin, FreeCameraState},
@@ -88,7 +89,8 @@ fn main() {
         ..default()
       }),
       FreeCameraPlugin,
-      WorldPlugin
+      WorldPlugin,
+      play::plugin
     ))
     .insert_state(Mode::START)
     .add_systems(PostStartup, spawn_camera)

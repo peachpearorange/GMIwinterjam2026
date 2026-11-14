@@ -137,17 +137,17 @@ fn stop_play(
   }
 }
 
-/// The camera always flies in play. While editing, only in the world and scene editors,
-/// and not while typing into the UI.
+/// The camera flies while editing in the world and scene editors, when not typing into
+/// the UI. In play it follows the player instead.
 fn enable_camera(
   mode: Res<State<Mode>>,
   editor: Res<Editor>,
   egui_wants_input: Res<EguiWantsInput>,
   mut camera: Single<&mut FreeCameraState>
 ) {
-  camera.enabled = *mode.get() == Mode::Play
-    || matches!(*editor, Editor::World | Editor::Scene)
-      && !egui_wants_input.wants_any_keyboard_input();
+  camera.enabled = *mode.get() == Mode::Edit
+    && matches!(*editor, Editor::World | Editor::Scene)
+    && !egui_wants_input.wants_any_keyboard_input();
 }
 
 /// Makes text and buttons bigger and easier to hit, once the UI exists.

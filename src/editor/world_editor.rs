@@ -71,6 +71,37 @@ impl Tool {
   }
 }
 
+/// The keys that pick each tool in [`Tool::ALL`], in order, and what the buttons show.
+const TOOL_KEYS: [(KeyCode, &str); 10] = [
+  (KeyCode::Digit1, "1"),
+  (KeyCode::Digit2, "2"),
+  (KeyCode::Digit3, "3"),
+  (KeyCode::Digit4, "4"),
+  (KeyCode::Digit5, "5"),
+  (KeyCode::Digit6, "6"),
+  (KeyCode::Digit7, "7"),
+  (KeyCode::Digit8, "8"),
+  (KeyCode::Digit9, "9"),
+  (KeyCode::Digit0, "0")
+];
+
+/// Degrees a model being placed turns per window pixel the mouse moves sideways.
+const PLACE_TURN_PER_PIXEL: f32 = 0.6;
+
+/// Brings an angle in degrees into -180..180.
+fn wrap_degrees(degrees: f32) -> f32 { (degrees + 180.0).rem_euclid(360.0) - 180.0 }
+
+/// A model pressed onto the ground and not yet let go of: moving the mouse sideways
+/// turns it, and releasing the button places it.
+#[derive(Clone, Copy)]
+struct Placing {
+  position: Vec3,
+  /// The cursor's window x when the button went down.
+  cursor_x: f32,
+  /// The yaw when the button went down.
+  yaw_degrees: f32
+}
+
 #[derive(Clone, Copy)]
 struct HeightBrush {
   /// World units.
@@ -133,21 +164,62 @@ fn model_paths() -> Vec<String> {
   paths
 }
 
-/// The texture, size and facing of a billboard.
-fn billboard_settings(ui: &mut egui::Ui, billboard: &mut Billboard) {
+/// Asset paths of the textures in [`TEXTURES_DIR`] and its subfolders, like
+/// `textures/tree.png`.
+fn texture_paths() -> Vec<String> {
   let mut names = texture_names(Path::new(TEXTURES_DIR));
   names.sort();
-  let shown = billboard
-    .texture
-    .strip_prefix("textures/")
-    .and_then(|name| name.strip_suffix(".png"))
-    .unwrap_or(&billboard.texture)
-    .to_string();
-  egui::ComboBox::from_label("texture").selected_text(shown).show_ui(ui, |ui| {
-    names.into_iter().for_each(|name| {
-      ui.selectable_value(&mut billboard.texture, format!("textures/{name}.png"), name);
+  names.into_iter().map(|name| format!("textures/{name}.png")).collect()
+}
+
+/// How tall the model and billboard texture lists can grow before scrolling.
+const PICKER_HEIGHT: f32 = 320.0;
+
+/// A list to pick a model or texture from, one click each, with a picture beside each
+/// entry when `picture` gives one.
+fn picker(
+  ui: &mut egui::Ui,
+  id: &str,
+  paths: &[String],
+  selected: &mut Option<String>,
+  mut picture: impl FnMut(&egui::Context, &str) -> Option<egui::TextureId>
+) {
+  egui::ScrollArea::vertical().id_salt(id).max_height(PICKER_HEIGHT).show(ui, |ui| {
+    paths.iter().for_each(|path| {
+      ui.horizontal(|ui| {
+        if let Some(texture) = picture(ui.ctx(), path) {
+          let (rect, _) =
+            ui.allocate_exact_size(egui::Vec2::splat(22.0), egui::Sense::hover());
+          let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+          ui.painter().image(texture, rect, uv, egui::Color32::WHITE);
+        }
+        let name = path
+          .strip_prefix("textures/")
+          .or_else(|| path.strip_prefix("models/"))
+          .unwrap_or(path);
+        let name = name.strip_suffix(".png").unwrap_or(name);
+        ui.selectable_value(selected, Some(path.clone()), name);
+      });
     })
   });
+}
+
+/// The texture, size and facing of a billboard.
+fn billboard_settings(
+  ui: &mut egui::Ui,
+  billboard: &mut Billboard,
+  textures: &[String],
+  thumbnails: &mut Thumbnails
+) {
+  let mut texture = Some(billboard.texture.clone());
+  picker(ui, "billboard_textures", textures, &mut texture, |ctx, path| {
+    thumbnails.get(ctx, path)
+  });
+  if let Some(texture) = texture
+    && texture != billboard.texture
+  {
+    billboard.texture = texture
+  }
   ui.add(
     egui::DragValue::new(&mut billboard.size)
       .range(0.05..=100.0)
@@ -190,6 +262,10 @@ struct WorldEditor {
   models: Vec<String>,
   model: Option<String>,
   model_yaw_degrees: f32,
+  /// While the button is held after pressing a model onto the ground.
+  placing: Option<Placing>,
+  /// Textures billboards can show.
+  textures: Vec<String>,
   marker_name: String,
   /// What placing a billboard places.
   billboard: Billboard,
@@ -229,6 +305,8 @@ impl Default for WorldEditor {
       models: model_paths(),
       model: None,
       model_yaw_degrees: 0.0,
+      placing: None,
+      textures: texture_paths(),
       marker_name: "marker".into(),
       billboard: Billboard {
         texture: "textures/tree.png".into(),
@@ -384,15 +462,22 @@ impl WorldEditorUi<'_, '_> {
 
         ui.separator();
         ui.heading("Tool");
+        let before = editor.tool;
+        let typing = ui.ctx().egui_wants_keyboard_input()
+          || keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
         ui.horizontal_wrapped(|ui| {
-          Tool::ALL.into_iter().for_each(|tool| {
-            if ui.selectable_value(&mut editor.tool, tool, tool.name()).clicked()
-              && tool == Tool::PlaceModel
-            {
-              editor.models = model_paths();
+          Tool::ALL.into_iter().zip(TOOL_KEYS).for_each(|(tool, (key, label))| {
+            if !typing && keys.just_pressed(key) {
+              editor.tool = tool
             }
+            ui.selectable_value(&mut editor.tool, tool, format!("{label} {}", tool.name()));
           });
         });
+        // Picking up whatever was added since, as the lists are read once otherwise.
+        if editor.tool != before {
+          editor.models = model_paths();
+          editor.textures = texture_paths();
+        }
         match editor.tool {
           Tool::Sculpt(_) => {
             let HeightBrush { radius, strength } = &mut editor.height_brush;
@@ -445,14 +530,13 @@ impl WorldEditorUi<'_, '_> {
                 "Make models in the Models tab, or put .glb files in {MODELS_DIR}/"
               ));
             }
-            editor.models.iter().for_each(|path| {
-              ui.selectable_value(&mut editor.model, Some(path.clone()), path);
-            });
+            picker(ui, "models", &editor.models, &mut editor.model, |_, _| None);
             ui.add(
               egui::Slider::new(&mut editor.model_yaw_degrees, -180.0..=180.0)
                 .suffix("°")
                 .text("yaw")
-            );
+            )
+            .on_hover_text("Or hold the click and move the mouse sideways to turn it");
           }
           Tool::PlaceMarker => {
             ui.horizontal(|ui| {
@@ -460,7 +544,12 @@ impl WorldEditorUi<'_, '_> {
               ui.text_edit_singleline(&mut editor.marker_name);
             });
           }
-          Tool::PlaceBillboard => billboard_settings(ui, &mut editor.billboard),
+          Tool::PlaceBillboard => {
+            if ui.button("Refresh").clicked() {
+              editor.textures = texture_paths();
+            }
+            billboard_settings(ui, &mut editor.billboard, &editor.textures, thumbnails)
+          }
           Tool::Select => {
             if let [entity] = editor.selected[..]
               && let Ok((_, marker, model, mut transform, billboard)) =
@@ -468,7 +557,7 @@ impl WorldEditorUi<'_, '_> {
             {
               if let Some(mut billboard) = billboard {
                 let mut edited = billboard.clone();
-                billboard_settings(ui, &mut edited);
+                billboard_settings(ui, &mut edited, &editor.textures, thumbnails);
                 if edited != *billboard {
                   *billboard = edited
                 }
@@ -838,14 +927,15 @@ fn use_tool(
         }
       }
       Tool::PlaceModel => {
-        if clicked && let Some(path) = editor.model.clone() {
-          commands.spawn((
-            Model { path },
-            Transform::from_translation(hit).with_rotation(Quat::from_rotation_y(
-              editor.model_yaw_degrees.to_radians()
-            )),
-            Visibility::default()
-          ));
+        if clicked
+          && editor.model.is_some()
+          && let Some(cursor) = window.cursor_position()
+        {
+          editor.placing = Some(Placing {
+            position: hit,
+            cursor_x: cursor.x,
+            yaw_degrees: editor.model_yaw_degrees
+          })
         }
       }
       Tool::PlaceBillboard => {
@@ -870,6 +960,36 @@ fn use_tool(
       Tool::Select | Tool::PaintSky => {}
     }
     editor.stroke.iter_mut().for_each(|stroke| stroke.previous = hit.xz());
+  }
+
+  // A pressed model turns with the mouse's sideways movement, and lands on release.
+  if editor.tool != Tool::PlaceModel || mouse.pressed(MouseButton::Right) {
+    editor.placing = None
+  }
+  if let Some(Placing { position, cursor_x, yaw_degrees }) = editor.placing {
+    if let Some(cursor) = window.cursor_position() {
+      editor.model_yaw_degrees =
+        wrap_degrees(yaw_degrees + (cursor.x - cursor_x) * PLACE_TURN_PER_PIXEL)
+    }
+    gizmos.lineloop(
+      (0..48).map(|i| {
+        let xz = position.xz() + Vec2::from_angle(i as f32 / 48.0 * TAU) * 1.5;
+        Vec3::new(xz.x, terrain.height(xz) + 0.1, xz.y)
+      }),
+      BRUSH_COLOR
+    );
+    if !mouse.pressed(MouseButton::Left) {
+      editor.placing = None;
+      if let Some(path) = editor.model.clone() {
+        commands.spawn((
+          Model { path },
+          Transform::from_translation(position).with_rotation(Quat::from_rotation_y(
+            editor.model_yaw_degrees.to_radians()
+          )),
+          Visibility::default()
+        ));
+      }
+    }
   }
 
   // Selecting: a click picks the nearest thing, a drag draws a lasso around several.
@@ -936,15 +1056,16 @@ fn use_tool(
 
   // The model or billboard a click would place, where it would go.
   let yaw = Quat::from_rotation_y(editor.model_yaw_degrees.to_radians());
-  let placing = hit.and_then(|hit| match editor.tool {
-    Tool::PlaceModel => editor.model.clone().map(|path| {
-      (Some(path), None, Transform::from_translation(hit).with_rotation(yaw))
+  let model_at = editor.placing.map(|Placing { position, .. }| position).or(hit);
+  let placing = match editor.tool {
+    Tool::PlaceModel => model_at.zip(editor.model.clone()).map(|(at, path)| {
+      (Some(path), None, Transform::from_translation(at).with_rotation(yaw))
     }),
-    Tool::PlaceBillboard => {
-      Some((None, Some(editor.billboard.clone()), Transform::from_translation(hit)))
-    }
+    Tool::PlaceBillboard => hit.map(|hit| {
+      (None, Some(editor.billboard.clone()), Transform::from_translation(hit))
+    }),
     _ => None
-  });
+  };
   let shown =
     preview.iter_mut().fold(false, |shown, (entity, model, billboard, mut transform)| {
       match &placing {
