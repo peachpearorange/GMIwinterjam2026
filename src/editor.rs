@@ -1,11 +1,12 @@
-//! Content editor built into the game: world design, texture painting and low poly
-//! modeling. Comes with the `editor` feature, which is on by default; build without it
+//! Content editor built into the game: world design, texture painting, low poly
+//! modeling and the materials models are made of. Comes with the `editor` feature, which is on by default; build without it
 //! for a release.
 //!
 //! F1 switches between editing and playing. Edits apply to the running world, so play
 //! picks them up straight away, and leaving play puts the camera back where editing
 //! left it.
 
+mod material_editor;
 mod model_editor;
 mod pixel_editor;
 mod world_editor;
@@ -16,6 +17,7 @@ use {crate::{Mode, start_transform},
             prelude::*},
      bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui,
                  input::EguiWantsInput},
+     material_editor::{MaterialEditor, MaterialEditorUi},
      model_editor::ModelEditorUi,
      pixel_editor::PixelEditorUi,
      winterjam2026::world::Markers,
@@ -26,13 +28,39 @@ const TOGGLE_KEY: KeyCode = KeyCode::F1;
 /// Ctrl - still zoom further from here.
 const UI_ZOOM: f32 = 1.35;
 
+/// What's wrong with `name` as a file name, if anything. Names take letters, digits,
+/// spaces, `_` and `-`, with `/` between folders.
+fn name_problem(name: &str) -> Option<String> {
+  const RULE: &str = "use letters, digits, spaces, _ or -, and / for folders";
+  name
+    .chars()
+    .find(|&c| !(c.is_ascii_alphanumeric() || " _-/".contains(c)))
+    .map(|c| format!("No {c} in names: {RULE}"))
+    .or_else(|| {
+      name.split('/').any(str::is_empty).then(|| {
+        if name.is_empty() {
+          format!("Give it a name: {RULE}")
+        } else {
+          format!("Nothing between two /: {RULE}")
+        }
+      })
+    })
+    .or_else(|| {
+      name
+        .split('/')
+        .any(|part| part.trim() != part)
+        .then(|| "No spaces at the start or end of a name or folder".to_string())
+    })
+}
+
 /// Which editor the window shows while editing.
 #[derive(Resource, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Editor {
   #[default]
   World,
   Textures,
-  Models
+  Models,
+  Materials
 }
 
 /// Where the camera was when play started, to return to after.
@@ -131,7 +159,13 @@ fn edit_ui(
   mut contexts: EguiContexts,
   mut editor: ResMut<Editor>,
   mut next: ResMut<NextState<Mode>>,
-  mut editors: ParamSet<(WorldEditorUi, PixelEditorUi, ModelEditorUi)>
+  mut editors: ParamSet<(
+    WorldEditorUi,
+    PixelEditorUi,
+    ModelEditorUi,
+    MaterialEditorUi,
+    ResMut<MaterialEditor>
+  )>
 ) -> Result {
   let ctx = contexts.ctx_mut()?;
   let mut root = root_ui(ctx);
@@ -140,6 +174,7 @@ fn edit_ui(
       ui.selectable_value(&mut *editor, Editor::World, "World");
       ui.selectable_value(&mut *editor, Editor::Textures, "Textures");
       ui.selectable_value(&mut *editor, Editor::Models, "Models");
+      ui.selectable_value(&mut *editor, Editor::Materials, "Materials");
       ui.separator();
       if ui.button("▶ Play (F1)").clicked() {
         next.set(Mode::Play);
@@ -149,7 +184,12 @@ fn edit_ui(
   match *editor {
     Editor::World => editors.p0().ui(&mut root),
     Editor::Textures => editors.p1().ui(&mut root),
-    Editor::Models => editors.p2().ui(&mut root)
+    Editor::Models => editors.p2().ui(&mut root),
+    Editor::Materials => editors.p3().ui(&mut root)
+  }
+  // The model editor making a material opens it here.
+  if std::mem::take(&mut editors.p4().show) {
+    *editor = Editor::Materials
   }
   Ok(())
 }
@@ -172,7 +212,8 @@ pub fn plugin(app: &mut App) {
       EguiPlugin::default(),
       world_editor::plugin,
       pixel_editor::plugin,
-      model_editor::plugin
+      model_editor::plugin,
+      material_editor::plugin
     ))
     .init_resource::<Editor>()
     .init_resource::<EditCamera>()

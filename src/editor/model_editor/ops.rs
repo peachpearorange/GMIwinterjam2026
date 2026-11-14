@@ -342,6 +342,59 @@ pub fn subdivide(model: &mut LowPoly, selection: &mut Selection) {
   *selection = new_selection
 }
 
+/// Splits each selected face into triangles around a new vertex in its middle. The new
+/// vertices end up selected.
+pub fn poke(model: &mut LowPoly, selection: &mut Selection) {
+  let faces = selected_faces(model, selection);
+  *selection = faces
+    .iter()
+    .map(|&f| {
+      model.vertices.push(model.face_center(f));
+      let middle = model.vertices.len() - 1;
+      let look = model.faces[f].look();
+      let triangles = face_edges(&model.faces[f])
+        .map(|(a, b)| Face::new(vec![a, b, middle], &look))
+        .collect::<Vec<_>>();
+      model.faces.extend(triangles);
+      middle
+    })
+    .collect();
+  model.faces = std::mem::take(&mut model.faces)
+    .into_iter()
+    .enumerate()
+    .filter(|(f, _)| !faces.contains(f))
+    .map(|(_, face)| face)
+    .collect()
+}
+
+/// Puts a new vertex in the middle of the edge from `a` to `b`, and splits each face
+/// along it into triangles meeting there, so they stay flat however it moves.
+pub fn split_edge(model: &mut LowPoly, (a, b): (usize, usize)) {
+  model.vertices.push(model.vertices[a].midpoint(model.vertices[b]));
+  let middle = model.vertices.len() - 1;
+  model.faces = std::mem::take(&mut model.faces)
+    .into_iter()
+    .flat_map(|face| {
+      let n = face.vertices.len();
+      (0..n)
+        .find(|&i| {
+          let ends = (face.vertices[i], face.vertices[(i + 1) % n]);
+          ends == (a, b) || ends == (b, a)
+        })
+        .map(|i| {
+          // The corners from the edge's far end round to its near end, in winding order.
+          let around = (0..n).map(|k| face.vertices[(i + 1 + k) % n]).collect::<Vec<_>>();
+          let look = face.look();
+          around
+            .windows(2)
+            .map(|pair| Face::new(vec![middle, pair[0], pair[1]], &look))
+            .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![face])
+    })
+    .collect()
+}
+
 /// Turns the selected faces around.
 pub fn flip(model: &mut LowPoly, selection: &Selection) {
   model
@@ -837,9 +890,9 @@ pub fn mirror_partners(
 
 #[cfg(test)]
 mod tests {
-  use {super::*, winterjam2026::model::Rgb};
+  use super::*;
 
-  fn look() -> Look { Look::plain(Rgb([1, 2, 3])) }
+  fn look() -> Look { Look::default() }
 
   fn cube() -> LowPoly { Primitive::Cube.build(1.0, 0, 0, &look()) }
 
@@ -895,6 +948,37 @@ mod tests {
     selection.iter().for_each(|&v| model.vertices[v].y += 1.0);
     assert_closed(&model);
     assert!((volume(&model) - 2.0).abs() < 1e-5)
+  }
+
+  #[test]
+  fn poking_a_face_makes_a_closed_peak() {
+    let mut model = cube();
+    let mut selection = model.faces[top_face(&model)].vertices.iter().copied().collect();
+    poke(&mut model, &mut selection);
+    assert_eq!((model.vertices.len(), model.faces.len(), selection.len()), (9, 9, 1));
+    selection.iter().for_each(|&v| model.vertices[v].y += 1.0);
+    assert_closed(&model);
+    // The cube and a pyramid one high on top of it.
+    assert!((volume(&model) - 4.0 / 3.0).abs() < 1e-5)
+  }
+
+  #[test]
+  fn splitting_an_edge_fans_both_faces_from_the_corner() {
+    let mut model = cube();
+    let top = top_face(&model);
+    let (a, b) = (model.faces[top].vertices[0], model.faces[top].vertices[1]);
+    split_edge(&mut model, (a, b));
+    assert_eq!((model.vertices.len(), model.faces.len()), (9, 10));
+    assert!(
+      model
+        .faces
+        .iter()
+        .filter(|face| face.vertices.contains(&8))
+        .all(|face| face.vertices.len() == 3)
+    );
+    model.vertices[8] += Vec3::new(0.3, 0.5, 0.2);
+    assert_closed(&model);
+    assert!(volume(&model) > 1.0)
   }
 
   #[test]
@@ -1023,7 +1107,7 @@ mod tests {
     let mut one = Selection::from([0]);
     select_linked(&model, &mut one);
     assert_eq!(one, (0..8).collect());
-    model.faces[0].color = Rgb([9, 9, 9]);
+    model.faces[0].material = "stone".into();
     assert_eq!(same_look_region(&model, 1).len(), 5);
     assert_eq!(same_look_region(&model, 0), vec![0]);
     model.faces[1].material = "wood".into();

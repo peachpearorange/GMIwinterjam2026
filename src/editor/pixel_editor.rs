@@ -2,7 +2,8 @@
 
 mod canvas;
 
-use {bevy::{ecs::system::SystemParam, prelude::*},
+use {super::name_problem,
+     bevy::{ecs::system::SystemParam, prelude::*},
      bevy_egui::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, PointerButton,
                        Sense},
      canvas::{Canvas, Reshape, Rgba, TRANSPARENT, convex_hull, in_hull, over},
@@ -48,12 +49,6 @@ pub(super) fn texture_names(dir: &Path) -> Vec<String> {
     .collect()
 }
 
-/// Whether `name` can be saved as: letters, digits, `_` and `-`, with `/` between folders.
-fn valid_name(name: &str) -> bool {
-  name.split('/').all(|part| {
-    !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-  })
-}
 
 /// `name` without the `_N` that saving several frames puts after it.
 fn frame_base(name: &str) -> &str {
@@ -350,8 +345,8 @@ struct OpenTexture {
   /// The frames before the edit in progress.
   before: Option<Frames>,
   floating: Option<Floating>,
-  /// The current frame as last uploaded, for the tiled preview and the terrain.
-  shown: Option<(Canvas, egui::TextureHandle)>,
+  /// The current frame as last uploaded to the terrain and model materials.
+  shown: Option<Canvas>,
   /// What the canvas view last showed: the frame with the selection, onion skin and
   /// transparency checkers.
   view: Option<(Canvas, egui::TextureHandle)>
@@ -371,6 +366,13 @@ impl OpenTexture {
       shown: None,
       view: None
     }
+  }
+
+  /// Whether opening something else would lose work: changes since saving, or for a
+  /// texture never saved, any change at all.
+  fn has_unsaved_work(&self) -> bool {
+    self.floating.is_some()
+      || self.saved.as_ref().map_or(!self.undo.is_empty(), |saved| *saved != self.frames.all)
   }
 
   fn begin(&mut self) {
@@ -625,14 +627,15 @@ impl PixelEditor {
   /// Side of a freshly opened canvas on screen.
   const OPENED_SIDE: f32 = 512.0;
   const GRID_MIN_ZOOM: f32 = 6.0;
-  /// Side of one repeat in the tiled preview.
-  const PREVIEW_TILE: f32 = 64.0;
   const TOOLS_PANEL_WIDTH: f32 = 140.0;
   const SIDE_PANEL_WIDTH: f32 = 224.0;
   const BAR_HEIGHT: f32 = 18.0;
   const BAR_STEPS: usize = 64;
   const PALETTE_COLUMNS: usize = 8;
-  const FILE_LIST_HEIGHT: f32 = 200.0;
+  /// The least height of the file list, which otherwise goes down to the bottom.
+  const FILE_LIST_HEIGHT: f32 = 240.0;
+  /// Room left under the file list for the hint and create buttons.
+  const BELOW_FILE_LIST: f32 = 90.0;
   /// Opacity of the onion skin.
   const ONION: f32 = 0.35;
   const CHECKERS: [Rgba; 2] = [[90, 90, 90, 255], [140, 140, 140, 255]];
@@ -705,7 +708,7 @@ impl PixelEditor {
     } else {
       (0..frames.len()).map(|i| format!("{}_{i}", frame_base(&name))).collect::<Vec<_>>()
     };
-    self.status = if valid_name(&name) {
+    self.status = name_problem(&name).unwrap_or_else(|| {
       names
         .iter()
         .zip(&frames)
@@ -729,9 +732,7 @@ impl PixelEditor {
             }
           }
         )
-    } else {
-      "Name it with letters, digits, _ or -, and / for folders".into()
-    }
+    })
   }
 
   /// Saves the frames side by side as `{name}_sheet.png`.
@@ -741,8 +742,8 @@ impl PixelEditor {
     let name = format!("{}_sheet", frame_base(self.name.trim()));
     self.status = if all.len() == 1 {
       "Only one frame. Use Save for a single texture".into()
-    } else if !valid_name(&name) {
-      "Name it with letters, digits, _ or -, and / for folders".into()
+    } else if let Some(problem) = name_problem(&name) {
+      problem
     } else {
       let size = all[0].size.as_ivec2();
       let sheet = Canvas::from_fn(UVec2::new(size.x as u32 * all.len() as u32, size.y as u32), |at| {
@@ -950,12 +951,7 @@ impl PixelEditor {
     });
   }
 
-  fn side_panel(
-    &mut self,
-    ui: &mut egui::Ui,
-    palette: &mut Palette,
-    shown: Option<egui::TextureId>
-  ) {
+  fn side_panel(&mut self, ui: &mut egui::Ui, palette: &mut Palette) {
     egui::ScrollArea::vertical().show(ui, |ui| {
       let width = ui.available_width();
       ui.vertical_centered(|ui| ui.strong("COLOR"));
@@ -1071,7 +1067,6 @@ impl PixelEditor {
       if let Some(i) = removed {
         palette.0.remove(i);
       }
-      ui.weak("Drawing adds the color; right click removes one");
 
       ui.separator();
       let Frames { all, current } = &self.open.frames;
@@ -1110,19 +1105,6 @@ impl PixelEditor {
       });
 
       ui.separator();
-      ui.vertical_centered(|ui| ui.strong("TILED"));
-      let (preview, painter) = ui
-        .allocate_painter(egui::Vec2::splat(Self::PREVIEW_TILE * 3.0), Sense::hover());
-      shown.into_iter().for_each(|texture| {
-        painter.image(
-          texture,
-          preview.rect,
-          egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(3.0, 3.0)),
-          Color32::WHITE
-        );
-      });
-
-      ui.separator();
       ui.vertical_centered(|ui| ui.strong("FILE"));
       ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(width - 40.0));
@@ -1135,21 +1117,28 @@ impl PixelEditor {
       });
       let mut names = texture_names(Path::new(TEXTURES_DIR));
       names.sort();
+      let unsaved = self.open.has_unsaved_work();
+      // Down to the bottom of the panel, leaving room for what's below.
+      let height = (ui.clip_rect().bottom() - ui.cursor().top() - Self::BELOW_FILE_LIST)
+        .max(Self::FILE_LIST_HEIGHT);
       let opened = egui::ScrollArea::vertical()
         .id_salt("textures")
-        .max_height(Self::FILE_LIST_HEIGHT)
+        .max_height(height)
         .show(ui, |ui| {
           names
             .iter()
-            .filter(|&name| ui.selectable_label(*name == self.name, name).double_clicked())
+            .filter(|&name| {
+              let response = ui.selectable_label(*name == self.name, name);
+              response.double_clicked() || response.clicked() && !unsaved
+            })
             .last()
             .cloned()
         })
         .inner;
       if names.is_empty() {
         ui.weak(format!("No textures in {TEXTURES_DIR} yet"));
-      } else {
-        ui.weak("Double click to open");
+      } else if unsaved {
+        ui.weak("Unsaved changes: double click to open another anyway");
       }
       if let Some(name) = opened {
         match Canvas::open(&texture_path(&name)) {
@@ -1526,9 +1515,7 @@ impl PixelEditorUi<'_> {
     // Upload the frame when it changed, to egui and to the ground named like it.
     let open = &mut editor.open;
     let canvas = open.frames.canvas();
-    if open.shown.as_ref().is_none_or(|(shown, _)| shown != canvas) {
-      let texture =
-        upload(&ctx, "pixel_editor_shown", canvas, egui::TextureOptions::NEAREST_REPEAT);
+    if open.shown.as_ref() != Some(canvas) {
       if let Some(ground) =
         Ground::ALL.into_iter().find(|ground| ground.surface().name == editor.name)
         && let Some(mut material) = materials.get_mut(ground_materials.of(ground))
@@ -1548,9 +1535,8 @@ impl PixelEditorUi<'_> {
         let image = tiling_pixel_image(canvas.size, canvas.pixels.as_flattened().to_vec());
         images.insert(handle, image).ok();
       }
-      open.shown = Some((canvas.clone(), texture))
+      open.shown = Some(canvas.clone())
     }
-    let shown = open.shown.as_ref().map(|(_, texture)| texture.id());
 
     egui::Panel::top("texture").show(root, |ui| editor.top_bar(ui));
     egui::Panel::left("tools")
@@ -1558,7 +1544,7 @@ impl PixelEditorUi<'_> {
       .show(root, |ui| editor.tools_panel(ui));
     egui::Panel::right("color")
       .default_size(PixelEditor::SIDE_PANEL_WIDTH)
-      .show(root, |ui| editor.side_panel(ui, palette, shown));
+      .show(root, |ui| editor.side_panel(ui, palette));
     egui::CentralPanel::default().show(root, |ui| editor.canvas_view(ui, palette));
 
     if **palette != palette_before

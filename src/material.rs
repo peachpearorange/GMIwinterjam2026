@@ -1,5 +1,5 @@
-//! Materials low poly model faces can be made of: a texture from `assets/textures` and
-//! how it lies on the faces, plus how the surface catches light. Shared by every model,
+//! Materials low poly model faces can be made of: a color, optionally a texture from
+//! `assets/textures` and how it lies on the faces, plus how the surface catches light. Shared by every model,
 //! so a material changes everywhere it's used, and saved to [`MATERIALS_FILE`] in
 //! [`ASSETS_DIR`].
 
@@ -30,8 +30,9 @@ pub enum Mapping {
 pub struct ModelMaterial {
   /// What faces name it by.
   pub name: String,
-  /// The texture's path in [`ASSETS_DIR`], like `textures/planks.png`. Faces' colors
-  /// tint it, so white faces show it as painted.
+  /// Tints the texture when there is one, so white shows it as painted.
+  pub color: Rgb,
+  /// The texture's path in [`ASSETS_DIR`], like `textures/planks.png`.
   pub texture: Option<String>,
   pub mapping: Mapping,
   /// World units one repeat of the texture covers, with [`Mapping::Tile`].
@@ -51,6 +52,7 @@ impl Default for ModelMaterial {
   fn default() -> Self {
     Self {
       name: default(),
+      color: Rgb([0xc8; 3]),
       texture: None,
       mapping: Mapping::Tile,
       tile: 1.0,
@@ -65,10 +67,10 @@ impl Default for ModelMaterial {
 }
 
 impl ModelMaterial {
-  /// How it renders, lit by the scene. Faces' colors come in as vertex colors.
+  /// How it renders, lit by the scene.
   pub fn standard(&self, texture: Option<Handle<Image>>) -> StandardMaterial {
     StandardMaterial {
-      base_color: Color::WHITE,
+      base_color: self.color.color(),
       emissive: self.glow.color().to_linear() * self.glow_strength,
       emissive_texture: texture.clone().filter(|_| self.glow != Rgb([0; 3])),
       base_color_texture: texture,

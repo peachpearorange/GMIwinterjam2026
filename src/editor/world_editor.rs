@@ -3,7 +3,7 @@
 use {super::pixel_editor::texture_names,
      crate::Mode,
      bevy::{camera_controller::free_camera::FreeCamera, ecs::system::SystemParam, prelude::*},
-     bevy_egui::egui,
+     bevy_egui::{egui, input::EguiWantsInput},
      std::{f32::consts::TAU, fs,
            path::{Path, PathBuf}},
      winterjam2026::{assets::ASSETS_DIR,
@@ -151,6 +151,13 @@ fn billboard_settings(ui: &mut egui::Ui, billboard: &mut Billboard) {
   });
 }
 
+/// What a click would place, shown where it would go. Not part of the world.
+#[derive(Component)]
+struct PlacementPreview;
+
+/// The markers, models and billboards placed in the world.
+type Placed = (Or<(With<Marker>, With<Model>, With<Billboard>)>, Without<PlacementPreview>);
+
 /// A drag over the terrain with the left mouse button.
 #[derive(Clone, Copy)]
 struct Stroke {
@@ -242,7 +249,7 @@ pub struct WorldEditorUi<'w, 's> {
       &'static mut Transform,
       Option<&'static mut Billboard>
     ),
-    Or<(With<Marker>, With<Model>, With<Billboard>)>
+    Placed
   >,
   commands: Commands<'w, 's>
 }
@@ -261,6 +268,7 @@ impl WorldEditorUi<'_, '_> {
           editor.save_now = true
         }
         ui.label(&editor.status);
+        ui.weak("Ctrl+Z undoes, Ctrl+Y redoes");
         ui.collapsing("New world", |ui| {
           let NewWorld { cells_x, cells_z, cell_size } = &mut editor.new_world;
           ui.add(egui::DragValue::new(cells_x).range(1..=512).prefix("cells x: "));
@@ -449,7 +457,11 @@ fn use_tool(
   window: Single<&Window>,
   mouse: Res<ButtonInput<MouseButton>>,
   time: Res<Time>,
-  placed: Query<(Entity, &Transform), Or<(With<Marker>, With<Model>, With<Billboard>)>>,
+  placed: Query<(Entity, &Transform), Placed>,
+  mut preview: Query<
+    (Entity, Option<&Model>, Option<&mut Billboard>, &mut Transform),
+    With<PlacementPreview>
+  >,
   mut gizmos: Gizmos,
   mut commands: Commands
 ) {
@@ -560,6 +572,9 @@ fn use_tool(
         }
       }
       Tool::PlaceMarker => {
+        let top = hit + Vec3::Y * MARKER_POLE;
+        gizmos.line(hit, top, MARKER_COLOR);
+        gizmos.sphere(top, 0.4, MARKER_COLOR);
         if clicked {
           commands.spawn((
             Marker { name: editor.marker_name.clone() },
@@ -582,6 +597,82 @@ fn use_tool(
     }
     editor.stroke.iter_mut().for_each(|stroke| stroke.previous = hit.xz());
   }
+
+  // The model or billboard a click would place, where it would go.
+  let yaw = Quat::from_rotation_y(editor.model_yaw_degrees.to_radians());
+  let placing = hit.and_then(|hit| match editor.tool {
+    Tool::PlaceModel => editor
+      .model
+      .clone()
+      .map(|path| (Some(path), None, Transform::from_translation(hit).with_rotation(yaw))),
+    Tool::PlaceBillboard => {
+      Some((None, Some(editor.billboard.clone()), Transform::from_translation(hit)))
+    }
+    _ => None
+  });
+  let shown = preview.iter_mut().fold(false, |shown, (entity, model, billboard, mut transform)| {
+    match &placing {
+      Some((path, wanted, at))
+        if !shown
+          && model.map(|Model { path }| path) == path.as_ref()
+          && billboard.is_some() == wanted.is_some() =>
+      {
+        if let (Some(mut billboard), Some(wanted)) = (billboard, wanted)
+          && *billboard != *wanted
+        {
+          *billboard = wanted.clone()
+        }
+        transform.translation = at.translation;
+        // Billboards turn themselves toward the camera.
+        if path.is_some() {
+          transform.rotation = at.rotation
+        }
+        true
+      }
+      _ => {
+        commands.entity(entity).despawn();
+        shown
+      }
+    }
+  });
+  if !shown && let Some((path, billboard, at)) = placing {
+    let mut entity = commands.spawn((PlacementPreview, at, Visibility::default()));
+    if let Some(path) = path {
+      entity.insert(Model { path });
+    }
+    if let Some(billboard) = billboard {
+      entity.insert(billboard);
+    }
+  }
+}
+
+/// Takes the placement preview away when the world editor isn't showing.
+fn remove_preview(preview: Query<Entity, With<PlacementPreview>>, mut commands: Commands) {
+  preview.iter().for_each(|entity| commands.entity(entity).despawn())
+}
+
+/// The camera's field of view while editing the world, wider than in play to see more
+/// of what's being built.
+const EDIT_FOV: f32 = 70.0_f32.to_radians();
+
+/// Widens the camera's view in the world editor, and puts it back otherwise.
+fn set_fov(
+  mode: Res<State<Mode>>,
+  editor: Res<super::Editor>,
+  mut projection: Single<&mut Projection, With<FreeCamera>>
+) {
+  let wanted = if *mode.get() == Mode::Edit && *editor == super::Editor::World {
+    EDIT_FOV
+  } else {
+    PerspectiveProjection::default().fov
+  };
+  // Only writing when it differs, so the projection isn't marked changed every frame.
+  if let Projection::Perspective(PerspectiveProjection { fov, .. }) = **projection
+    && fov != wanted
+    && let Projection::Perspective(perspective) = &mut **projection
+  {
+    perspective.fov = wanted
+  }
 }
 
 /// Editor-only visuals: a pole with a ball on top at every marker, and a ring on the
@@ -589,10 +680,7 @@ fn use_tool(
 fn draw_markers_and_selection(
   editor: Res<WorldEditor>,
   terrain: Res<Terrain>,
-  placed: Query<
-    (Entity, &Transform, Has<Marker>),
-    Or<(With<Marker>, With<Model>, With<Billboard>)>
-  >,
+  placed: Query<(Entity, &Transform, Has<Marker>), Placed>,
   mut gizmos: Gizmos
 ) {
   placed.iter().for_each(|(entity, &Transform { translation, .. }, is_marker)| {
@@ -617,6 +705,72 @@ fn draw_markers_and_selection(
   });
 }
 
+/// How many changes back undo goes.
+const MAX_UNDO: usize = 100;
+
+/// The world as saved text before each change, for undo, and before each undo, for redo.
+#[derive(Resource, Default)]
+struct History {
+  undo: Vec<String>,
+  redo: Vec<String>,
+  /// The world after the last change seen, to tell when another happens. `None` until
+  /// it's next looked at, as after undoing.
+  current: Option<String>
+}
+
+/// Notes each finished change, and undoes them with Ctrl+Z, redoing with Ctrl+Y or
+/// Ctrl+Shift+Z.
+fn undo_redo(
+  mut history: ResMut<History>,
+  mut editor: ResMut<WorldEditor>,
+  terrain: Res<Terrain>,
+  keys: Res<ButtonInput<KeyCode>>,
+  mouse: Res<ButtonInput<MouseButton>>,
+  egui_wants_input: Res<EguiWantsInput>,
+  markers: Query<(&Marker, &Transform)>,
+  models: Query<(&Model, &Transform), Without<PlacementPreview>>,
+  billboards: Query<(&Billboard, &Transform), Without<PlacementPreview>>,
+  placed: Query<Entity, Placed>,
+  mut commands: Commands
+) {
+  let now = || WorldFile::collect(&terrain, &markers, &models, &billboards).to_text().ok();
+  let History { undo, redo, current } = &mut *history;
+  let busy = editor.stroke.is_some() || mouse.pressed(MouseButton::Left);
+  // A change counts once it's done: the mouse let go, or a key typed.
+  let done = mouse.just_released(MouseButton::Left) || keys.get_just_released().next().is_some();
+  if !busy
+    && (done || current.is_none())
+    && let Some(text) = now()
+    && current.as_ref() != Some(&text)
+    && let Some(before) = current.replace(text)
+  {
+    undo.push(before);
+    undo.drain(..undo.len().saturating_sub(MAX_UNDO));
+    redo.clear()
+  }
+
+  let control = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
+  let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+  let z = keys.just_pressed(KeyCode::KeyZ);
+  let redoing = control && (keys.just_pressed(KeyCode::KeyY) || shift && z);
+  let undoing = control && !shift && z;
+  let (from, to) = if undoing { (undo, redo) } else { (redo, undo) };
+  if (undoing || redoing)
+    && !busy
+    && !egui_wants_input.wants_any_keyboard_input()
+    && let Some(text) = from.pop()
+    && let Some(now) = now()
+    && let Ok(world) = ron::from_str::<WorldFile>(&text)
+  {
+    to.push(now);
+    placed.iter().for_each(|entity| commands.entity(entity).despawn());
+    world.spawn(&mut commands);
+    editor.selected = None;
+    // Looked at again once the restored world is in place.
+    *current = None
+  }
+}
+
 /// How often autosave looks for changes, in seconds.
 const AUTOSAVE_INTERVAL: f32 = 1.0;
 /// Where the world as it was before this session's first autosave is kept, in case an
@@ -629,8 +783,8 @@ fn autosave(
   mut editor: ResMut<WorldEditor>,
   terrain: Res<Terrain>,
   markers: Query<(&Marker, &Transform)>,
-  models: Query<(&Model, &Transform)>,
-  billboards: Query<(&Billboard, &Transform)>,
+  models: Query<(&Model, &Transform), Without<PlacementPreview>>,
+  billboards: Query<(&Billboard, &Transform), Without<PlacementPreview>>,
   time: Res<Time>,
   mut since_check: Local<f32>
 ) {
@@ -672,14 +826,21 @@ fn clock_time() -> String {
 }
 
 pub fn plugin(app: &mut App) {
+  let editing_world = |mode: Res<State<Mode>>, editor: Res<super::Editor>| {
+    *mode.get() == Mode::Edit && *editor == super::Editor::World
+  };
   app
     .init_resource::<WorldEditor>()
+    .init_resource::<History>()
     .add_systems(
       Update,
-      (use_tool, draw_markers_and_selection)
-        .run_if(in_state(Mode::Edit))
-        .run_if(|editor: Res<super::Editor>| *editor == super::Editor::World)
+      (
+        (use_tool, undo_redo).chain(),
+        draw_markers_and_selection
+      )
+        .run_if(editing_world)
     )
+    .add_systems(Update, (set_fov, remove_preview.run_if(not(editing_world))))
     .add_systems(Update, autosave.run_if(in_state(Mode::Edit)))
     // Save straight away when play starts, so nothing waits on the next check.
     .add_systems(OnExit(Mode::Edit), |mut editor: ResMut<WorldEditor>| {

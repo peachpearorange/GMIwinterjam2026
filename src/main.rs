@@ -1,7 +1,8 @@
 #[cfg(feature = "editor")]
 mod editor;
 
-use {bevy::{camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+use {bevy::{camera_controller::free_camera::{run_freecamera_controller, FreeCamera,
+                                             FreeCameraPlugin, FreeCameraState},
             prelude::*},
      winterjam2026::{assets,
                      billboard::WorldCamera,
@@ -14,11 +15,39 @@ const START_MARKER: &str = "start";
 /// Shift to go faster still, and scroll the wheel to speed up or slow down.
 fn free_camera() -> FreeCamera {
   FreeCamera {
+    // Twice Bevy's default, for turning around quickly.
+    sensitivity: 0.4,
     walk_speed: 40.0,
     run_speed: 120.0,
     // Each wheel notch changes the speed by about 20%.
     scroll_factor: 0.18,
     ..default()
+  }
+}
+
+/// Makes forward and back fly level whatever the camera's pitch, by redoing the free
+/// camera's forward movement along the ground.
+#[derive(Component, Default)]
+struct FlyLevel {
+  /// The rotation the free camera moved along this frame, from before it turned.
+  rotation: Quat
+}
+
+fn remember_rotation(camera: Single<(&Transform, &mut FlyLevel)>) {
+  let (&Transform { rotation, .. }, mut fly_level) = camera.into_inner();
+  fly_level.rotation = rotation
+}
+
+fn fly_level(
+  time: Res<Time<Real>>,
+  camera: Single<(&mut Transform, &FreeCameraState, &FlyLevel)>
+) {
+  let (mut transform, &FreeCameraState { enabled, velocity, .. }, &FlyLevel { rotation }) =
+    camera.into_inner();
+  if enabled {
+    let (yaw, ..) = rotation.to_euler(EulerRot::YXZ);
+    let level = Quat::from_rotation_y(yaw) * Vec3::NEG_Z;
+    transform.translation += velocity.z * time.delta_secs() * (level - rotation * Vec3::NEG_Z)
   }
 }
 
@@ -54,6 +83,7 @@ fn spawn_camera(mut commands: Commands, markers: Markers) {
   commands.spawn((
     Camera3d::default(),
     free_camera(),
+    FlyLevel::default(),
     WorldCamera,
     start_transform(&markers)
   ));
@@ -72,7 +102,13 @@ fn main() {
       WorldPlugin
     ))
     .insert_state(Mode::START)
-    .add_systems(PostStartup, spawn_camera);
+    .add_systems(PostStartup, spawn_camera)
+    .add_systems(
+      RunFixedMainLoop,
+      (remember_rotation.before(run_freecamera_controller),
+       fly_level.after(run_freecamera_controller))
+        .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop)
+    );
   #[cfg(feature = "editor")]
   app.add_plugins(editor::plugin);
   app.run();

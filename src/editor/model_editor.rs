@@ -1,13 +1,12 @@
 //! Low poly model editor for `assets/models/*.model.ron`.
 //!
-//! It opens in simple mode, made for building out of shapes like in Blockbench: add a
-//! shape, click it, drag the colored arrows to move it, pick single faces to drag them
-//! out and make shapes longer, and paint. Left drag on empty space turns the view,
-//! right drag slides it, the wheel zooms. Tools have single keys like the pixel
-//! editor: 1 whole pieces, 2 faces, 3 points, V select and move, B paint, Q pick a
-//! color, E pull a face out, S resize, M squeeze to a point, D copy, Shift D mirror
-//! copy, X delete, R T turn, Ctrl Z undo. A handful of tools that combine: a cube with
-//! its top face squeezed is a pyramid, a cylinder with its top face resized a cone.
+//! It opens in simple mode, made for building out of shapes like in Blockbench, with
+//! tools like the pixel editor's: pick one, then click or drag what's under the pointer,
+//! no selecting first. Move drags corners, edges and faces, Pull out block grows a face
+//! into a new block, Join corners and Add corner reshape, the shape tools resize, turn,
+//! copy and delete whole shapes, Paint gives faces a material. Shift click or Shift drag
+//! a lasso picks several things to do together. Left drag on empty space turns the
+//! view, right drag slides it, the wheel zooms, N makes a new material.
 //!
 //! Advanced mode works like a pocket Blender: select vertices, edges or faces, then
 //! move, rotate, scale, extrude and inset them with the keyboard:
@@ -23,19 +22,19 @@
 //!   cancels. Dragging a selected element moves it directly.
 //! - Also: X deletes, F makes a face, M merges, W subdivides, N flips, Shift N faces
 //!   outward, C paints the selection, B paints by clicking faces (Alt picks a face's
-//!   look, Shift fills neighbors that look alike), V goes back to selecting.
-//! - Painting gives faces a color and a material from the shared library (see
-//!   [`ModelMaterials`]): a texture, tiled across faces or fitted to each, with
-//!   roughness, metalness, glow, cutout and two-sided settings. The color tints the
-//!   texture, so white shows it as painted.
+//!   material, Shift fills neighbors made of the same), V goes back to selecting.
+//! - Painting gives faces a material from the shared library (see [`ModelMaterials`]):
+//!   a color, optionally a texture the color tints, tiled across faces or fitted to
+//!   each, with roughness, metalness, glow, cutout and two-sided settings. Double
+//!   clicking a material opens it to change.
 //!
 //! The view is a camera rendering to an image on its own render layer, shown in the
 //! central panel with the vertices, edges and hints drawn over it by egui.
 
 mod ops;
 
-use {super::{Editor,
-             pixel_editor::{Palette, texture_names}},
+use {super::{Editor, name_problem,
+             material_editor::{MaterialEditor, Thumbnails, free_name}},
      crate::Mode,
      bevy::{camera::{RenderTarget, visibility::RenderLayers},
             ecs::system::SystemParam,
@@ -50,12 +49,11 @@ use {super::{Editor,
      ops::{Primitive, SelectMode, Selection},
      std::{f32::consts::{FRAC_PI_2, PI},
            fs,
-           path::Path,
-           time::SystemTime},
-     winterjam2026::{assets::{self, ASSETS_DIR},
-                     material::{Mapping, ModelMaterial, ModelMaterials},
-                     model::{Look, LowPoly, MODEL_EXTENSION, ModelMeshes, Rgb},
-                     world::{MODELS_DIR, TEXTURES_DIR}}};
+           path::Path},
+     winterjam2026::{assets::ASSETS_DIR,
+                     material::{ModelMaterial, ModelMaterials},
+                     model::{Look, LowPoly, MODEL_EXTENSION, ModelMeshes},
+                     world::MODELS_DIR}};
 
 /// Render layer only the model editor's camera sees.
 const LAYER: usize = 1;
@@ -102,15 +100,6 @@ fn model_names(dir: &Path) -> Vec<String> {
     })
     .collect()
 }
-
-fn valid_name(name: &str) -> bool {
-  name.split('/').all(|part| {
-    !part.is_empty()
-      && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-  })
-}
-
-fn color32(Rgb([r, g, b]): Rgb) -> Color32 { Color32::from_rgb(r, g, b) }
 
 fn to_pos(v: Vec2) -> Pos2 { Pos2::new(v.x, v.y) }
 
@@ -303,10 +292,103 @@ enum Hit {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
+  /// Advanced mode's: picks things for the keys to work on.
   Select,
   Paint,
-  /// Clicking a face takes its color and material, then goes back to painting.
-  Picker
+  /// Clicking a face takes its material, then goes back to painting.
+  Picker,
+  // Simple mode's, each working straight on what's under the pointer, pixel editor
+  // style: no selecting first.
+  PullOutBlock,
+  Move,
+  JoinCorners,
+  AddCorner,
+  ResizeShape,
+  ResizeFace,
+  TurnShape,
+  CopyShape,
+  DeleteShape
+}
+
+impl Tool {
+  const SIMPLE: [Self; 11] = [
+    Self::PullOutBlock,
+    Self::Move,
+    Self::JoinCorners,
+    Self::AddCorner,
+    Self::ResizeShape,
+    Self::ResizeFace,
+    Self::TurnShape,
+    Self::CopyShape,
+    Self::DeleteShape,
+    Self::Paint,
+    Self::Picker
+  ];
+
+  const fn name(self) -> &'static str {
+    match self {
+      Self::Select => "Select",
+      Self::Paint => "Paint",
+      Self::Picker => "Pick material",
+      Self::PullOutBlock => "Pull out block",
+      Self::Move => "Move",
+      Self::JoinCorners => "Join corners",
+      Self::AddCorner => "Add corner",
+      Self::ResizeShape => "Resize shape",
+      Self::ResizeFace => "Resize face",
+      Self::TurnShape => "Turn shape",
+      Self::CopyShape => "Copy shape",
+      Self::DeleteShape => "Delete shape"
+    }
+  }
+
+  const fn key(self) -> Key {
+    match self {
+      Self::Select => Key::V,
+      Self::Paint => Key::B,
+      Self::Picker => Key::Q,
+      Self::PullOutBlock => Key::E,
+      Self::Move => Key::M,
+      Self::JoinCorners => Key::Z,
+      Self::AddCorner => Key::A,
+      Self::ResizeShape => Key::R,
+      Self::ResizeFace => Key::K,
+      Self::TurnShape => Key::T,
+      Self::CopyShape => Key::C,
+      Self::DeleteShape => Key::X
+    }
+  }
+
+  const fn hint(self) -> &'static str {
+    match self {
+      Self::Select => "Click selects · Shift adds · drag a selection to move it · drag empty space to box select (Shift adds, Ctrl removes)",
+      Self::Paint => "Click or drag paints faces with the material · Shift fills joined faces made of the same · Alt picks a face's material",
+      Self::Picker => "Click a face to paint with its material",
+      Self::PullOutBlock => "Drag a face to pull a new block out of it: arms, chimneys, branches",
+      Self::Move => "Drag a corner, edge or face to reshape: bend shapes into rocks and slopes, or pull a face to make a shape longer",
+      Self::JoinCorners => "Click an edge to join its two corners, or a face to squeeze it to a point: a cube's top becomes a pyramid",
+      Self::AddCorner => "Click an edge or a face to put a new corner in its middle, then drag it out with Move: tree tips, roof peaks",
+      Self::ResizeShape => "Drag a shape away from its middle to grow it, toward it to shrink it",
+      Self::ResizeFace => "Drag a face away from its middle to grow it, toward it to shrink it, tapering the shape",
+      Self::TurnShape => "Click a shape to turn it",
+      Self::CopyShape => "Drag a shape to pull out a copy of it",
+      Self::DeleteShape => "Click a shape to remove it"
+    }
+  }
+
+  /// What a simple mode tool works on.
+  const fn target(self) -> SelectMode {
+    match self {
+      // Corners, then edges, then faces.
+      Self::Move => SelectMode::Vertex,
+      // Edges, and faces away from edges.
+      Self::JoinCorners | Self::AddCorner => SelectMode::Edge,
+      Self::ResizeShape | Self::TurnShape | Self::CopyShape | Self::DeleteShape => SelectMode::Piece,
+      Self::Select | Self::Paint | Self::Picker | Self::PullOutBlock | Self::ResizeFace => {
+        SelectMode::Face
+      }
+    }
+  }
 }
 
 /// A handle of the move arrows drawn on the selection.
@@ -420,14 +502,10 @@ pub struct ModelEditor {
   redo: Vec<(LowPoly, Selection)>,
   mode: SelectMode,
   tool: Tool,
-  /// What painting and new faces use: the color and the material's name.
-  color: Rgb,
+  /// The material painting and new faces use.
   material: String,
-  hex: String,
-  /// The material name field, applied by the rename button.
-  rename: String,
-  /// Small pictures of textures, as of when their files were last changed.
-  thumbnails: HashMap<String, (Option<SystemTime>, Option<egui::TextureHandle>)>,
+  /// A material to open in the material editor, asked for here.
+  open_material: Option<String>,
   view: View,
   snap: bool,
   grid_step: f32,
@@ -444,6 +522,8 @@ pub struct ModelEditor {
   modal: Option<Modal>,
   press: Option<Press>,
   box_select: Option<(Vec2, Vec2, BoxMode)>,
+  /// The outline being drawn around things to pick, in simple mode.
+  lasso: Option<Vec<Vec2>>,
   /// The mouse button orbiting or panning the view.
   orbit: Option<PointerButton>,
   /// Whether that button slides the view rather than turning it.
@@ -452,8 +532,9 @@ pub struct ModelEditor {
   simple: bool,
   /// The move arrow under the pointer.
   arrow_hover: Option<Arrow>,
-  /// How far the simple mode's turn keys turn.
+  /// How far and around which axis the Turn tool turns.
   turn_degrees: f32,
+  turn_axis: Axis,
   /// The model before the paint stroke in progress.
   stroke: Option<(LowPoly, Selection)>,
   hover: Option<Hit>,
@@ -462,12 +543,11 @@ pub struct ModelEditor {
   texture: Option<egui::TextureId>,
   /// Which vertices and edges the camera sees, for the model and camera they were found for.
   visibility: Option<(LowPoly, Mat4, Vec<bool>, Vec<(usize, usize, bool)>)>,
-  status: String
+  pub(super) status: String
 }
 
 impl Default for ModelEditor {
   fn default() -> Self {
-    let color = Rgb([0xa7, 0x7b, 0x5b]);
     let mut editor = Self {
       model: default(),
       selection: default(),
@@ -476,12 +556,9 @@ impl Default for ModelEditor {
       undo: default(),
       redo: default(),
       mode: SelectMode::Piece,
-      tool: Tool::Select,
-      color,
+      tool: Tool::Move,
       material: default(),
-      hex: color.hex(),
-      rename: default(),
-      thumbnails: default(),
+      open_material: None,
       view: View::DEFAULT,
       snap: true,
       grid_step: 0.125,
@@ -495,11 +572,13 @@ impl Default for ModelEditor {
       modal: None,
       press: None,
       box_select: None,
+      lasso: None,
       orbit: None,
       orbit_pans: false,
       simple: true,
       arrow_hover: None,
       turn_degrees: 90.0,
+      turn_axis: Axis::Y,
       stroke: None,
       hover: None,
       viewport_pixels: UVec2::ONE,
@@ -510,7 +589,7 @@ impl Default for ModelEditor {
     ops::append(
       &mut editor.model,
       &mut editor.selection,
-      Primitive::Cube.build(1.0, 0, 0, &Look::plain(color))
+      Primitive::Cube.build(1.0, 0, 0, &Look::default())
     );
     editor.selection.clear();
     editor
@@ -524,7 +603,6 @@ impl ModelEditor {
   const SNAP_INSET: f32 = 0.05;
   const TOOLS_PANEL_WIDTH: f32 = 190.0;
   const SIDE_PANEL_WIDTH: f32 = 224.0;
-  const PALETTE_COLUMNS: usize = 8;
   const FILE_LIST_HEIGHT: f32 = 200.0;
   const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
   const UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
@@ -583,13 +661,37 @@ impl ModelEditor {
   }
 
   /// What painting and new faces use.
-  fn look(&self) -> Look { Look { color: self.color, material: self.material.clone() } }
+  fn look(&self) -> Look { Look { material: self.material.clone() } }
+
+  /// Adds a material to the library, paints with it and opens it in the material
+  /// editor, to pick its color and texture.
+  fn new_material(&mut self, library: &mut Library) {
+    let mut list = library.model_materials.list().to_vec();
+    let name = free_name(&list);
+    list.push(ModelMaterial { name: name.clone(), ..default() });
+    let Library { model_materials, materials, images, .. } = library;
+    model_materials.set(list, materials, images);
+    if let Err(error) = model_materials.save() {
+      self.status = format!("Can't save the materials: {error}")
+    }
+    self.material.clone_from(&name);
+    if self.simple {
+      self.tool = Tool::Paint
+    }
+    self.open_material = Some(name)
+  }
+
+  /// Whether opening something else would lose work: changes since saving, or for a
+  /// model never saved, any change at all.
+  fn has_unsaved_work(&self) -> bool {
+    self.saved.as_ref().map_or(!self.undo.is_empty(), |saved| *saved != self.model)
+  }
 
   fn save(&mut self, library: &mut Library) {
     self.finish_modal(true);
     let name = self.name.trim().to_string();
-    self.status = if !valid_name(&name) {
-      "Name it with letters, digits, _ or -, and / for folders".into()
+    self.status = if let Some(problem) = name_problem(&name) {
+      problem
     } else {
       let path = model_path(&name);
       match self.model.save(&path) {
@@ -651,69 +753,6 @@ impl ModelEditor {
       ops::selected_faces(&self.model, &piece)
     } else {
       vec![f]
-    }
-  }
-
-  /// Turns the selection by [`Self::turn_degrees`] around `axis` through its center.
-  fn turn(&mut self, axis: Vec3) {
-    let Some(pivot) = ops::selection_center(&self.model, &self.selection) else {
-      self.status = "Select something to turn".into();
-      return;
-    };
-    let rotation = Quat::from_axis_angle(axis, self.turn_degrees.to_radians());
-    self.edit(|editor| {
-      editor.selection.iter().for_each(|&v| {
-        let p = &mut editor.model.vertices[v];
-        *p = pivot + rotation * (*p - pivot);
-        // Keep the corners on the grid rather than a hair off it.
-        *p = (*p * 1e4).round() / 1e4
-      })
-    })
-  }
-
-  /// Pulls the selection together into one point, then picks that point to drag.
-  fn squeeze(&mut self) {
-    if self.selection.len() < 2 {
-      self.status = "Select a face or points to squeeze".into();
-      return;
-    }
-    self.edit(|editor| ops::merge(&mut editor.model, &mut editor.selection));
-    self.mode = SelectMode::Vertex
-  }
-
-  /// Copies the selected faces flipped to the other side of the middle (x = 0), for
-  /// building one half of something and getting the other half free.
-  fn mirror_copy(&mut self) {
-    let mut copied = false;
-    self.edit(|editor| {
-      copied = ops::duplicate(&mut editor.model, &mut editor.selection);
-      if copied {
-        ops::mirror(&mut editor.model, &editor.selection, 0, Vec3::ZERO)
-      }
-    });
-    self.status = if !copied {
-      "Select a piece or faces to mirror".into()
-    } else if self.selection.iter().all(|&v| self.model.vertices[v].x.abs() < 0.01) {
-      "Mirrored onto itself: move it off the middle line first".into()
-    } else {
-      "Mirrored to the other side of the blue line".into()
-    }
-  }
-
-  /// Copies the selected faces and puts the copy right beside them along x.
-  fn copy_beside(&mut self) {
-    let mut copied = false;
-    self.edit(|editor| {
-      copied = ops::duplicate(&mut editor.model, &mut editor.selection);
-      let xs = editor.selection.iter().map(|&v| editor.model.vertices[v].x);
-      let width = xs.clone().reduce(f32::max).unwrap_or(0.0)
-        - xs.reduce(f32::min).unwrap_or(0.0);
-      let step = editor.grid_step.max(0.01);
-      let offset = ((width / step).ceil() * step).max(step) + step;
-      editor.selection.iter().for_each(|&v| editor.model.vertices[v].x += offset)
-    });
-    if !copied {
-      self.status = "Select a piece or faces to copy".into()
     }
   }
 
@@ -839,6 +878,71 @@ impl ModelEditor {
       } else {
         (self.model, self.selection) = modal.undo
       }
+      // Simple mode only selects while a tool is working.
+      if self.simple {
+        self.selection.clear()
+      }
+    }
+  }
+
+  /// Uses a simple mode tool on what was pressed, along with whatever was Shift clicked
+  /// with it: the click tools change it at once, the drag tools follow the pointer until
+  /// the button comes up.
+  fn use_tool(&mut self, hit: Hit, at: Vec2) {
+    let undo = self.snapshot();
+    let pressed = self.hit_vertices(hit);
+    if !pressed.iter().all(|v| self.selection.contains(v)) {
+      self.selection = pressed.into_iter().collect()
+    }
+    let drag = match self.tool {
+      Tool::Move => Some((ModalKind::Grab, None)),
+      Tool::PullOutBlock => Some((
+        ModalKind::Grab,
+        ops::extrude(&mut self.model, &mut self.selection).ok().flatten()
+      )),
+      Tool::CopyShape => {
+        ops::duplicate(&mut self.model, &mut self.selection);
+        Some((ModalKind::Grab, None))
+      }
+      Tool::ResizeShape | Tool::ResizeFace => Some((ModalKind::Scale, None)),
+      Tool::TurnShape => {
+        let axis = match self.turn_axis {
+          Axis::X => Vec3::X,
+          Axis::Z => Vec3::Z,
+          Axis::Y | Axis::Normal => Vec3::Y
+        };
+        let rotation = Quat::from_axis_angle(axis, self.turn_degrees.to_radians());
+        let pivot = ops::selection_center(&self.model, &self.selection).unwrap_or_default();
+        self.selection.iter().for_each(|&v| {
+          let p = &mut self.model.vertices[v];
+          // Keep the corners on the grid rather than a hair off it.
+          *p = ((pivot + rotation * (*p - pivot)) * 1e4).round() / 1e4
+        });
+        None
+      }
+      Tool::JoinCorners => {
+        ops::merge(&mut self.model, &mut self.selection);
+        None
+      }
+      Tool::AddCorner => {
+        if let Hit::Edge(a, b) = hit {
+          ops::split_edge(&mut self.model, (a, b))
+        } else {
+          ops::poke(&mut self.model, &mut self.selection)
+        }
+        None
+      }
+      Tool::DeleteShape => {
+        ops::delete(&mut self.model, &mut self.selection, SelectMode::Piece);
+        None
+      }
+      Tool::Select | Tool::Paint | Tool::Picker => None
+    };
+    if let Some((kind, normal)) = drag {
+      self.start_modal_after(kind, at, true, undo, normal, self.tool.name())
+    } else {
+      self.push_undo(undo);
+      self.selection.clear()
     }
   }
 
@@ -1026,69 +1130,62 @@ impl ModelEditor {
             }
           }
         }
-        return;
-      }
-      if self.simple {
-        let handled = match key {
-          Key::Num1 => Some(self.mode = SelectMode::Piece),
-          Key::Num2 => Some(self.mode = SelectMode::Face),
-          Key::Num3 => Some(self.mode = SelectMode::Vertex),
-          Key::M => Some(self.squeeze()),
-          Key::D if modifiers.shift => Some(self.mirror_copy()),
-          Key::R if modifiers.shift => Some(self.turn(Vec3::X)),
-          Key::R => Some(self.turn(Vec3::Y)),
-          Key::T => Some(self.turn(Vec3::Z)),
-          Key::D => Some(self.copy_beside()),
-          _ => None
-        };
-        if handled.is_some() {
-          return;
+      } else if self.simple {
+        if let Some(tool) = Tool::SIMPLE.into_iter().find(|tool| tool.key() == key) {
+          self.tool = tool
+        } else if key == Key::Home {
+          self.frame(false)
+        } else if key == Key::Escape {
+          self.selection.clear()
+        } else if key == Key::N {
+          self.new_material(library)
         }
-      }
-      match key {
-        Key::Num1 => self.mode = SelectMode::Vertex,
-        Key::Num2 => self.mode = SelectMode::Edge,
-        Key::Num3 => self.mode = SelectMode::Face,
-        Key::Num4 => self.mode = SelectMode::Piece,
-        Key::V => self.tool = Tool::Select,
-        Key::B => self.tool = Tool::Paint,
-        Key::Q => self.tool = Tool::Picker,
-        Key::G => self.start_modal(ModalKind::Grab, at, false),
-        Key::R => self.start_modal(ModalKind::Rotate, at, false),
-        Key::S => self.start_modal(ModalKind::Scale, at, false),
-        Key::I => self.start_modal(ModalKind::Inset, at, false),
-        Key::E => self.extrude(at),
-        Key::D if modifiers.shift => self.duplicate(at),
-        Key::X | Key::Delete => {
-          let mode = self.mode;
-          self.edit(|editor| ops::delete(&mut editor.model, &mut editor.selection, mode))
+      } else {
+        match key {
+          Key::Num1 => self.mode = SelectMode::Vertex,
+          Key::Num2 => self.mode = SelectMode::Edge,
+          Key::Num3 => self.mode = SelectMode::Face,
+          Key::Num4 => self.mode = SelectMode::Piece,
+          Key::V => self.tool = Tool::Select,
+          Key::B => self.tool = Tool::Paint,
+          Key::Q => self.tool = Tool::Picker,
+          Key::G => self.start_modal(ModalKind::Grab, at, false),
+          Key::R => self.start_modal(ModalKind::Rotate, at, false),
+          Key::S => self.start_modal(ModalKind::Scale, at, false),
+          Key::I => self.start_modal(ModalKind::Inset, at, false),
+          Key::E => self.extrude(at),
+          Key::D if modifiers.shift => self.duplicate(at),
+          Key::X | Key::Delete => {
+            let mode = self.mode;
+            self.edit(|editor| ops::delete(&mut editor.model, &mut editor.selection, mode))
+          }
+          Key::F => self.make_face(),
+          Key::M => {
+            self.edit(|editor| ops::merge(&mut editor.model, &mut editor.selection))
+          }
+          Key::W => {
+            self.edit(|editor| ops::subdivide(&mut editor.model, &mut editor.selection))
+          }
+          Key::N if modifiers.shift => {
+            self.edit(|editor| ops::face_outward(&mut editor.model, &editor.selection))
+          }
+          Key::N => self.edit(|editor| ops::flip(&mut editor.model, &editor.selection)),
+          Key::C => self.paint_selection(),
+          Key::A if modifiers.alt => self.selection.clear(),
+          Key::A => self.select_all_toggle(),
+          Key::L => ops::select_linked(&self.model, &mut self.selection),
+          Key::Z => self.xray = !self.xray,
+          Key::O => {
+            self.view.ortho = !self.view.ortho;
+            self.view.auto_ortho = false
+          }
+          Key::Home => self.frame(false),
+          Key::Period => self.frame(true),
+          Key::U => self.undo(),
+          Key::Y => self.redo(),
+          Key::Escape => self.selection.clear(),
+          _ => ()
         }
-        Key::F => self.make_face(),
-        Key::M => {
-          self.edit(|editor| ops::merge(&mut editor.model, &mut editor.selection))
-        }
-        Key::W => {
-          self.edit(|editor| ops::subdivide(&mut editor.model, &mut editor.selection))
-        }
-        Key::N if modifiers.shift => {
-          self.edit(|editor| ops::face_outward(&mut editor.model, &editor.selection))
-        }
-        Key::N => self.edit(|editor| ops::flip(&mut editor.model, &editor.selection)),
-        Key::C => self.paint_selection(),
-        Key::A if modifiers.alt => self.selection.clear(),
-        Key::A => self.select_all_toggle(),
-        Key::L => ops::select_linked(&self.model, &mut self.selection),
-        Key::Z => self.xray = !self.xray,
-        Key::O => {
-          self.view.ortho = !self.view.ortho;
-          self.view.auto_ortho = false
-        }
-        Key::Home => self.frame(false),
-        Key::Period => self.frame(true),
-        Key::U => self.undo(),
-        Key::Y => self.redo(),
-        Key::Escape => self.selection.clear(),
-        _ => ()
       }
     })
   }
@@ -1149,7 +1246,7 @@ impl ModelEditor {
       ui.separator();
       ui.selectable_value(&mut self.tool, Tool::Select, "Select  V");
       ui.selectable_value(&mut self.tool, Tool::Paint, "Paint  B");
-      ui.selectable_value(&mut self.tool, Tool::Picker, "Pick color  Q");
+      ui.selectable_value(&mut self.tool, Tool::Picker, "Pick material  Q");
       ui.separator();
       ui.toggle_value(&mut self.snap, "Snap")
         .on_hover_text("Hold Ctrl to flip while transforming");
@@ -1170,9 +1267,13 @@ impl ModelEditor {
   }
 
   fn set_simple(&mut self, simple: bool) {
+    self.finish_modal(true);
     self.simple = simple;
-    if simple && self.mode == SelectMode::Edge {
-      self.mode = SelectMode::Face
+    self.selection.clear();
+    self.tool = match (simple, Tool::SIMPLE.contains(&self.tool)) {
+      (true, false) => Tool::Move,
+      (false, true) if !matches!(self.tool, Tool::Paint | Tool::Picker) => Tool::Select,
+      _ => self.tool
     }
   }
 
@@ -1235,76 +1336,40 @@ impl ModelEditor {
           .enumerate()
           .for_each(|(i, primitive)| {
             let ui = &mut columns[i % 2];
-            if Self::big_button(ui, primitive.name(), "", "Adds it in the middle, selected, ready to move") {
+            if Self::big_button(ui, primitive.name(), "", "Adds it in the middle") {
               let part = primitive.build(self.primitive_size, 8, 4, &self.look());
               self.edit(|editor| ops::append(&mut editor.model, &mut editor.selection, part));
-              self.mode = SelectMode::Piece;
-              self.tool = Tool::Select
+              self.selection.clear()
             }
           })
       });
 
       ui.separator();
-      ui.strong("CLICKING PICKS");
-      Self::big_choice(ui, &mut self.mode, SelectMode::Piece, "Whole piece", "1", "Clicking a shape picks all of it");
-      Self::big_choice(ui, &mut self.mode, SelectMode::Face, "One face", "2", "Clicking picks one side, to drag it out and make the shape longer");
-      Self::big_choice(ui, &mut self.mode, SelectMode::Vertex, "One point", "3", "Clicking picks a corner, to bend shapes into rocks and slopes");
-
-      ui.separator();
-      ui.strong("TOOL");
-      Self::big_choice(ui, &mut self.tool, Tool::Select, "Select and move", "V", "Click to pick, drag the arrows to move");
-      Self::big_choice(ui, &mut self.tool, Tool::Paint, "Paint", "B", "Click or drag over faces to paint them with the color");
-      Self::big_choice(ui, &mut self.tool, Tool::Picker, "Pick color", "Q", "Click a face to paint with its color and material");
-
-      ui.separator();
-      ui.strong("CHANGE THE SELECTION");
-      ui.add_space(2.0);
-      let at = ui.ctx().pointer_latest_pos().map_or(Vec2::ZERO, to_vec);
-      ui.weak("Shape it");
-      if Self::big_button(ui, "Pull out", "E", "Pulls the selected face out into a new block: arms, chimneys, branches. Move the mouse, click to finish") {
-        self.extrude(at)
-      }
-      if Self::big_button(ui, "Resize", "S", "Grows or shrinks with the mouse, click to finish. On one face it tapers the shape") {
-        self.start_modal(ModalKind::Scale, at, false)
-      }
-      if Self::big_button(ui, "Squeeze to a point", "M", "Pulls a face or points into one point: a cube's top becomes a pyramid") {
-        self.squeeze()
-      }
-      ui.weak("Turn");
-      ui.columns(3, |columns| {
-        let [a, b, c] = columns else { return };
-        if Self::big_button(a, "Turn", "R", "Around the up axis") {
-          self.turn(Vec3::Y)
-        }
-        if Self::big_button(b, "Tip", "Shift R", "Forward, around the red axis") {
-          self.turn(Vec3::X)
-        }
-        if Self::big_button(c, "Roll", "T", "Sideways, around the blue axis") {
-          self.turn(Vec3::Z)
-        }
+      ui.strong("TOOLS");
+      Tool::SIMPLE.into_iter().for_each(|tool| {
+        Self::big_choice(ui, &mut self.tool, tool, tool.name(), tool.key().name(), tool.hint())
       });
-      ui.horizontal(|ui| {
-        ui.label("by");
-        [90.0, 45.0, 15.0].into_iter().for_each(|degrees| {
-          ui.selectable_value(&mut self.turn_degrees, degrees, format!("{degrees}°"));
-        })
-      });
-      ui.weak("Copy and remove");
-      ui.columns(2, |columns| {
-        let [a, b] = columns else { return };
-        if Self::big_button(a, "Copy", "D", "Makes a copy right beside the selection") {
-          self.copy_beside()
-        }
-        if Self::big_button(b, "Mirror copy", "Shift D", "Copies it to the other side of the blue line, flipped: build one half, get the other free") {
-          self.mirror_copy()
-        }
-      });
-      if Self::big_button(ui, "Delete", "X", "Removes the selection") {
-        let mode = self.mode;
-        self.edit(|editor| ops::delete(&mut editor.model, &mut editor.selection, mode))
+      // In simple mode the tool decides what clicking picks. What was gathered for
+      // another kind of tool doesn't carry over.
+      if self.mode != self.tool.target() {
+        self.selection.clear()
       }
-      if Self::big_button(ui, "Paint selection", "C", "Gives the selected faces the color and material") {
-        self.paint_selection()
+      self.mode = self.tool.target();
+      if self.tool == Tool::TurnShape {
+        ui.horizontal(|ui| {
+          ui.label("around");
+          [(Axis::Y, "up"), (Axis::X, "red"), (Axis::Z, "blue")].into_iter().for_each(
+            |(axis, name)| {
+              ui.selectable_value(&mut self.turn_axis, axis, name);
+            }
+          )
+        });
+        ui.horizontal(|ui| {
+          ui.label("by");
+          [90.0, 45.0, 15.0].into_iter().for_each(|degrees| {
+            ui.selectable_value(&mut self.turn_degrees, degrees, format!("{degrees}°"));
+          })
+        });
       }
 
       ui.separator();
@@ -1322,7 +1387,7 @@ impl ModelEditor {
       if Self::big_button(ui, "Show whole model", "Home", "Brings the model back into view") {
         self.frame(false)
       }
-      ui.weak("Mouse: left drag on empty space turns the view, right drag slides it, the wheel zooms. Shift drag picks with a box.");
+      ui.weak("Mouse: left drag on empty space turns the view, right drag slides it, the wheel zooms.");
     });
   }
 
@@ -1497,102 +1562,10 @@ impl ModelEditor {
     });
   }
 
-  fn side_panel(
-    &mut self,
-    ui: &mut egui::Ui,
-    palette: &mut Palette,
-    library: &mut Library
-  ) {
+  fn side_panel(&mut self, ui: &mut egui::Ui, library: &mut Library, thumbnails: &mut Thumbnails) {
     egui::ScrollArea::vertical().show(ui, |ui| {
       let width = ui.available_width();
-      ui.vertical_centered(|ui| ui.strong("COLOR"));
-      ui.horizontal(|ui| {
-        let mut rgb = self.color.0;
-        if ui.color_edit_button_srgb(&mut rgb).changed() {
-          self.color = Rgb(rgb)
-        }
-        let hex_id = egui::Id::new("model_editor_hex");
-        if !ui.memory(|memory| memory.has_focus(hex_id)) {
-          self.hex = self.color.hex()
-        }
-        if ui
-          .add(egui::TextEdit::singleline(&mut self.hex).id(hex_id).desired_width(80.0))
-          .lost_focus()
-          && let Some(color) = Rgb::parse(&self.hex)
-        {
-          self.color = color
-        }
-      });
-      let swatches = |ui: &mut egui::Ui,
-                      colors: &[Rgb],
-                      current: Rgb,
-                      key: &str|
-       -> (Option<Rgb>, Option<Rgb>) {
-        let side = width / Self::PALETTE_COLUMNS as f32;
-        let mut clicked = (None, None);
-        colors.chunks(Self::PALETTE_COLUMNS).for_each(|row| {
-          ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-            row.iter().for_each(|&color| {
-              let (rect, response) =
-                ui.allocate_exact_size(egui::Vec2::splat(side), Sense::click());
-              ui.painter().rect_filled(rect, 0.0, color32(color));
-              let stroke = if color == current {
-                Stroke::new(2.0, Color32::WHITE)
-              } else {
-                Stroke::new(1.0, Color32::from_gray(30))
-              };
-              ui.painter().rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
-              let response = response.on_hover_text(format!("{} {key}", color.hex()));
-              if response.clicked() {
-                clicked.0 = Some(color)
-              }
-              if response.secondary_clicked() {
-                clicked.1 = Some(color)
-              }
-            })
-          });
-        });
-        clicked
-      };
-      let colors =
-        palette.0.iter().map(|&[r, g, b, _]| Rgb([r, g, b])).collect::<Vec<_>>();
-      let (picked, removed) = swatches(ui, &colors, self.color, "· right click removes");
-      if let Some(color) = picked {
-        self.color = color
-      }
-      if let Some(Rgb([r, g, b])) = removed {
-        palette.0.retain(|&color| color != [r, g, b, u8::MAX])
-      }
-      ui.weak("Shared with the texture palette");
-
-      let mut used = Vec::new();
-      self.model.faces.iter().for_each(|face| {
-        if !used.contains(&face.color) {
-          used.push(face.color)
-        }
-      });
-      if !used.is_empty() {
-        ui.add_space(4.0);
-        ui.label("In this model");
-        let (picked, select) =
-          swatches(ui, &used, self.color, "· right click selects its faces");
-        if let Some(color) = picked {
-          self.color = color
-        }
-        if let Some(color) = select {
-          self.selection = self
-            .model
-            .faces
-            .iter()
-            .filter(|face| face.color == color)
-            .flat_map(|face| face.vertices.iter().copied())
-            .collect()
-        }
-      }
-
-      ui.separator();
-      self.material_panel(ui, library);
+      self.material_panel(ui, library, thumbnails);
 
       ui.separator();
       ui.vertical_centered(|ui| ui.strong("FILE"));
@@ -1611,6 +1584,7 @@ impl ModelEditor {
       });
       let mut names = model_names(Path::new(MODELS_DIR));
       names.sort();
+      let unsaved = self.has_unsaved_work();
       let opened = egui::ScrollArea::vertical()
         .id_salt("models")
         .max_height(Self::FILE_LIST_HEIGHT)
@@ -1618,7 +1592,8 @@ impl ModelEditor {
           names
             .iter()
             .filter(|&name| {
-              ui.selectable_label(*name == self.name, name).double_clicked()
+              let response = ui.selectable_label(*name == self.name, name);
+              response.double_clicked() || response.clicked() && !unsaved
             })
             .last()
             .cloned()
@@ -1626,8 +1601,8 @@ impl ModelEditor {
         .inner;
       if names.is_empty() {
         ui.weak(format!("No models in {MODELS_DIR} yet"));
-      } else {
-        ui.weak("Double click to open");
+      } else if unsaved {
+        ui.weak("Unsaved changes: double click to open another anyway");
       }
       if let Some(name) = opened {
         match LowPoly::load(&model_path(&name)) {
@@ -1656,74 +1631,39 @@ impl ModelEditor {
     });
   }
 
-  /// A small picture of the texture at `path` in [`ASSETS_DIR`], loaded again when its
-  /// file changes.
-  fn thumbnail(&mut self, ctx: &egui::Context, path: &str) -> Option<egui::TextureId> {
-    let modified = fs::metadata(Path::new(ASSETS_DIR).join(path))
-      .and_then(|file| file.modified())
-      .ok();
-    let (loaded, texture) =
-      self.thumbnails.entry(path.to_string()).or_insert((None, None));
-    if texture.is_none() || *loaded != modified {
-      *loaded = modified;
-      *texture = assets::read(path)
-        .and_then(|bytes| image::load_from_memory(&bytes).ok())
-        .map(|image| image.into_rgba8())
-        .map(|image| {
-          ctx.load_texture(
-            path,
-            egui::ColorImage::from_rgba_unmultiplied(
-              [image.width() as usize, image.height() as usize],
-              image.as_raw()
-            ),
-            egui::TextureOptions::NEAREST
-          )
-        })
+  /// The materials to paint with. Changing them happens in the material editor.
+  fn material_panel(&mut self, ui: &mut egui::Ui, library: &mut Library, thumbnails: &mut Thumbnails) {
+    ui.vertical_centered(|ui| ui.strong("MATERIALS"));
+    if ui
+      .add_sized([ui.available_width(), 30.0], egui::Button::new("New material   N"))
+      .on_hover_text("Makes a material and opens it in the material editor")
+      .clicked()
+    {
+      self.new_material(library)
     }
-    texture.as_ref().map(egui::TextureHandle::id)
-  }
-
-  /// A row picking what material painting uses, with the picked one's settings below.
-  fn material_panel(&mut self, ui: &mut egui::Ui, library: &mut Library) {
-    const SWATCH: f32 = 18.0;
-    ui.vertical_centered(|ui| ui.strong("MATERIAL"));
-    let mut list = library.model_materials.list().to_vec();
-    let names = [String::new()]
-      .into_iter()
-      .chain(list.iter().map(|m| m.name.clone()))
-      .collect::<Vec<_>>();
-    egui::ScrollArea::vertical().id_salt("materials").max_height(170.0).show(ui, |ui| {
-      names.iter().for_each(|name| {
+    let list = library.model_materials.list();
+    let plain = ModelMaterial::default();
+    egui::ScrollArea::vertical().id_salt("materials").max_height(280.0).show(ui, |ui| {
+      [&plain].into_iter().chain(list).for_each(|material| {
+        let name = &material.name;
         ui.horizontal(|ui| {
-          let texture = list
-            .iter()
-            .find(|m| m.name == *name)
-            .and_then(|m| m.texture.clone())
-            .and_then(|path| self.thumbnail(ui.ctx(), &path));
-          let (rect, _) =
-            ui.allocate_exact_size(egui::Vec2::splat(SWATCH), Sense::hover());
-          match texture {
-            Some(texture) => {
-              let uv = egui::Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0));
-              ui.painter().image(texture, rect, uv, Color32::WHITE);
-            }
-            None => {
-              ui.painter().rect_filled(rect, 2.0, Color32::from_gray(90));
-            }
-          }
-          let used =
-            self.model.faces.iter().filter(|face| face.material == *name).count();
+          thumbnails.swatch(ui, material, 22.0);
+          let used = self.model.faces.iter().filter(|face| face.material == *name).count();
           let label = if name.is_empty() { "Plain" } else { name };
-          let text =
-            if used > 0 { format!("{label}  ({used})") } else { label.to_string() };
+          let text = if used > 0 { format!("{label}  ({used})") } else { label.to_string() };
           let response = ui
             .selectable_label(self.material == *name, text)
-            .on_hover_text("Click to paint with it · right click selects its faces");
+            .on_hover_text("Click to paint with it · double click to change it");
           if response.clicked() {
             self.material.clone_from(name);
-            self.rename.clone_from(name)
+            if self.simple {
+              self.tool = Tool::Paint
+            }
           }
-          if response.secondary_clicked() {
+          if response.double_clicked() && !name.is_empty() {
+            self.open_material = Some(name.clone())
+          }
+          if !self.simple && response.secondary_clicked() {
             self.selection = self
               .model
               .faces
@@ -1735,148 +1675,33 @@ impl ModelEditor {
         });
       })
     });
-    ui.columns(2, |columns| {
-      let [new, paint] = columns else { return };
-      if new.add_sized([new.available_width(), 0.0], egui::Button::new("New")).clicked() {
-        let name = (1..)
-          .map(|i| if i == 1 { "material".to_string() } else { format!("material {i}") })
-          .find(|name| !list.iter().any(|m| m.name == *name))
-          .unwrap_or_default();
-        list.push(ModelMaterial { name: name.clone(), ..default() });
-        self.rename.clone_from(&name);
-        self.material = name
-      }
-      if paint
-        .add_sized([paint.available_width(), 0.0], egui::Button::new("Paint sel.  C"))
-        .on_hover_text("Gives the selected faces this material and the color")
+    if !self.simple
+      && ui
+        .add_sized([ui.available_width(), 0.0], egui::Button::new("Paint selection  C"))
+        .on_hover_text("Gives the selected faces this material")
         .clicked()
-      {
-        self.paint_selection()
-      }
-    });
-
-    let mut renamed = None;
-    let mut deleted = None;
-    if let Some(material) = list.iter_mut().find(|m| m.name == self.material) {
-      ui.horizontal(|ui| {
-        ui.add(
-          egui::TextEdit::singleline(&mut self.rename)
-            .desired_width(ui.available_width() - 70.0)
-        );
-        let new_name = self.rename.trim().to_string();
-        let free =
-          !new_name.is_empty() && new_name != material.name && !names.contains(&new_name);
-        if ui.add_enabled(free, egui::Button::new("Rename")).clicked() {
-          renamed = Some((material.name.clone(), new_name))
-        }
-      });
-      let textures = {
-        let mut names = texture_names(Path::new(TEXTURES_DIR));
-        names.sort();
-        names
-      };
-      let shown = material
-        .texture
-        .as_deref()
-        .and_then(|path| path.strip_prefix("textures/"))
-        .and_then(|path| path.strip_suffix(".png"))
-        .unwrap_or("none")
-        .to_string();
-      egui::ComboBox::from_label("texture").selected_text(shown).show_ui(ui, |ui| {
-        ui.selectable_value(&mut material.texture, None, "none");
-        textures.into_iter().for_each(|name| {
-          let path = format!("textures/{name}.png");
-          ui.selectable_value(&mut material.texture, Some(path), name);
-        })
-      });
-      if material.texture.is_some() {
-        ui.horizontal(|ui| {
-          ui.selectable_value(&mut material.mapping, Mapping::Tile, "Tile")
-            .on_hover_text("Repeats across faces, lined up, like bricks or planks");
-          ui.selectable_value(&mut material.mapping, Mapping::Fit, "Fit")
-            .on_hover_text("Stretches once over each face, like a door or a sign");
-          if material.mapping == Mapping::Tile {
-            ui.add(
-              egui::DragValue::new(&mut material.tile)
-                .range(0.05..=64.0)
-                .speed(0.01)
-                .suffix(" m")
-            )
-            .on_hover_text("World units one repeat covers");
-          }
-        });
-        ui.weak("Faces' colors tint the texture; white shows it as painted");
-      }
-      ui.add(egui::Slider::new(&mut material.roughness, 0.0..=1.0).text("rough"));
-      ui.add(egui::Slider::new(&mut material.metallic, 0.0..=1.0).text("metal"));
-      ui.horizontal(|ui| {
-        let mut glow = material.glow.0;
-        if ui.color_edit_button_srgb(&mut glow).changed() {
-          material.glow = Rgb(glow)
-        }
-        ui.label("glow");
-        ui.add(
-          egui::DragValue::new(&mut material.glow_strength).range(0.0..=50.0).speed(0.05)
-        );
-      })
-      .response
-      .on_hover_text("Light it gives off, black for none, times the texture if any");
-      ui.checkbox(&mut material.cutout, "Cutout")
-        .on_hover_text("Holes where the texture is transparent, for leaves or fences");
-      ui.checkbox(&mut material.double_sided, "Two-sided")
-        .on_hover_text("Shows the back of faces, for single sheets like leaves or flags");
-      if ui
-        .button("Delete material")
-        .on_hover_text("Its faces in this model turn plain")
-        .clicked()
-      {
-        deleted = Some(material.name.clone())
-      }
-    } else if !self.material.is_empty() {
-      ui.weak(format!("{} isn't in the library", self.material));
-    }
-
-    if let Some(name) = deleted {
-      list.retain(|m| m.name != name);
-      self.edit(|editor| {
-        editor
-          .model
-          .faces
-          .iter_mut()
-          .filter(|face| face.material == name)
-          .for_each(|face| face.material.clear())
-      });
-      self.material.clear();
-      self.rename.clear()
-    }
-    if let Some((old, new)) = &renamed
-      && let Some(material) = list.iter_mut().find(|m| m.name == *old)
     {
-      material.name.clone_from(new)
+      self.paint_selection()
     }
+  }
 
-    let old = library.model_materials.list();
-    if list != old {
-      let mapping = |list: &[ModelMaterial]| {
-        list.iter().map(|m| (m.name.clone(), m.mapping, m.tile)).collect::<Vec<_>>()
-      };
-      let remap = mapping(&list) != mapping(old);
-      let Library { model_meshes, model_materials, meshes, materials, images } = library;
-      model_materials.set(list, materials, images);
-      if let Err(error) = model_materials.save() {
-        self.status = format!("Can't save the materials: {error}")
-      }
-      if let Some((old, new)) = renamed {
-        self.rename_material(&old, &new, model_meshes, model_materials, meshes)
-      }
-      if remap {
-        model_meshes.reload_all(model_materials, meshes)
-      }
+  /// Turns faces of material `name` plain, as when it's deleted.
+  pub(super) fn forget_material(&mut self, name: &str) {
+    self.edit(|editor| {
+      editor
+        .model
+        .faces
+        .iter_mut()
+        .filter(|face| face.material == name)
+        .for_each(|face| face.material.clear())
+    });
+    if self.material == name {
+      self.material.clear()
     }
   }
 
   /// Renames material `old` to `new` in the open model and every saved one.
-  fn rename_material(
+  pub(super) fn rename_material(
     &mut self,
     old: &str,
     new: &str,
@@ -2003,17 +1828,8 @@ impl ModelEditor {
 
   fn pick(&self, projector: &Projector, at: Vec2) -> Option<Hit> {
     let on_screen = |v: usize| projector.project(self.model.vertices[v]);
-    match (self.tool, self.mode) {
-      (Tool::Paint | Tool::Picker, _) | (_, SelectMode::Face | SelectMode::Piece) => {
-        self.pick_face(projector, at).map(Hit::Face)
-      }
-      (_, SelectMode::Vertex) => (0..self.model.vertices.len())
-        .filter(|&v| self.vertex_visible(v))
-        .filter_map(|v| on_screen(v).map(|p| (v, p.distance(at))))
-        .filter(|&(_, distance)| distance < PICK_VERTEX)
-        .min_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(v, _)| Hit::Vertex(v)),
-      (_, SelectMode::Edge) => self
+    let edge = || {
+      self
         .visibility
         .iter()
         .flat_map(|(_, _, _, edges)| edges)
@@ -2024,7 +1840,44 @@ impl ModelEditor {
         .filter(|&(_, _, distance)| distance < PICK_EDGE)
         .min_by(|(_, _, a), (_, _, b)| a.total_cmp(b))
         .map(|(a, b, _)| Hit::Edge(a, b))
+    };
+    let face = || self.pick_face(projector, at).map(Hit::Face);
+    let vertex = || {
+      (0..self.model.vertices.len())
+        .filter(|&v| self.vertex_visible(v))
+        .filter_map(|v| on_screen(v).map(|p| (v, p.distance(at))))
+        .filter(|&(_, distance)| distance < PICK_VERTEX)
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(v, _)| Hit::Vertex(v))
+    };
+    match (self.tool, self.mode) {
+      (Tool::Paint | Tool::Picker, _) | (_, SelectMode::Face | SelectMode::Piece) => face(),
+      (Tool::JoinCorners | Tool::AddCorner, _) => edge().or_else(face),
+      (Tool::Move, _) => vertex().or_else(edge).or_else(face),
+      (_, SelectMode::Vertex) => vertex(),
+      (_, SelectMode::Edge) => edge()
     }
+  }
+
+  /// Adds the corners inside `lasso` to the selection, hidden ones too, so drawing
+  /// around a shape picks all of it.
+  fn lasso_select(&mut self, projector: &Projector, lasso: &[Vec2]) {
+    let inside = |p: Vec2| {
+      // Even-odd rule: a ray to the right crosses the outline an odd number of times.
+      lasso
+        .iter()
+        .zip(lasso.iter().cycle().skip(1))
+        .filter(|&(a, b)| {
+          (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x)
+        })
+        .count()
+        % 2
+        == 1
+    };
+    self.selection.extend(
+      (0..self.model.vertices.len())
+        .filter(|&v| projector.project(self.model.vertices[v]).is_some_and(inside))
+    )
   }
 
   fn box_select(&mut self, projector: &Projector, from: Vec2, to: Vec2, mode: BoxMode) {
@@ -2056,7 +1909,7 @@ impl ModelEditor {
     }
   }
 
-  /// Paints the face `face`, or with `region` the faces of its color joined to it.
+  /// Paints the face `face`, or with `region` the faces of its material joined to it.
   fn paint_face(&mut self, face: usize, region: bool) {
     let faces =
       if region { ops::same_look_region(&self.model, face) } else { vec![face] };
@@ -2064,7 +1917,7 @@ impl ModelEditor {
     faces.into_iter().for_each(|f| self.model.faces[f].set_look(&look))
   }
 
-  fn viewport(&mut self, ui: &mut egui::Ui, palette: &mut Palette) {
+  fn viewport(&mut self, ui: &mut egui::Ui) {
     let (response, painter) =
       ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
     let rect = response.rect;
@@ -2146,7 +1999,10 @@ impl ModelEditor {
       if drag && (released.contains(&PointerButton::Primary) || up)
         || !drag && pressed.contains(&PointerButton::Primary) && response.hovered()
       {
-        self.finish_modal(true)
+        // A drag let go without moving undoes what started it, like a pulled out block
+        // with no length.
+        let moved = self.modal.as_ref().is_some_and(|modal| !drag || modal.base != self.model);
+        self.finish_modal(moved)
       } else if pressed.contains(&PointerButton::Secondary) {
         self.finish_modal(false)
       } else {
@@ -2173,24 +2029,26 @@ impl ModelEditor {
         self.press = None
       } else if pressed_here && self.tool == Tool::Picker {
         if let Some(Hit::Face(f)) = self.hover {
-          let Look { color, material } = self.model.faces[f].look();
-          (self.color, self.material) = (color, material);
+          self.material.clone_from(&self.model.faces[f].material);
           self.tool = Tool::Paint
         }
+      } else if pressed_here
+        && !modifiers.shift
+        && !matches!(self.tool, Tool::Select | Tool::Paint | Tool::Picker)
+        && let Some(hit) = self.hover
+      {
+        self.use_tool(hit, at);
+        // What it pointed at may be gone.
+        self.hover = None
       } else if pressed_here {
         self.press = Some(Press { at, hit: self.hover });
         if self.tool == Tool::Paint {
           if let Some(Hit::Face(f)) = self.hover {
             if modifiers.alt {
-              let Look { color, material } = self.model.faces[f].look();
-              (self.color, self.material) = (color, material)
+              self.material.clone_from(&self.model.faces[f].material)
             } else {
               self.stroke = Some(self.snapshot());
-              self.paint_face(f, modifiers.shift);
-              let [r, g, b] = self.color.0;
-              if !palette.0.contains(&[r, g, b, u8::MAX]) {
-                palette.0.push([r, g, b, u8::MAX])
-              }
+              self.paint_face(f, modifiers.shift)
             }
           }
         }
@@ -2212,6 +2070,37 @@ impl ModelEditor {
       }
       match self.tool {
         Tool::Picker => self.press = None,
+        // Simple mode tools only get here pressing on nothing, which clicked lets go of
+        // what was picked and dragged turns the view, or with Shift: clicking picks more,
+        // dragging draws a lasso around more.
+        Tool::PullOutBlock
+        | Tool::Move
+        | Tool::JoinCorners
+        | Tool::AddCorner
+        | Tool::ResizeShape
+        | Tool::ResizeFace
+        | Tool::TurnShape
+        | Tool::CopyShape
+        | Tool::DeleteShape => match (self.lasso.take(), down) {
+          (Some(mut lasso), true) => {
+            if lasso.last().is_none_or(|last| last.distance(at) > 2.0) {
+              lasso.push(at)
+            }
+            self.lasso = Some(lasso)
+          }
+          (Some(lasso), false) => self.lasso_select(&projector, &lasso),
+          (None, _) => {
+            if let Some(&Press { at: from, hit }) = self.press.as_ref() {
+              if !down {
+                self.press = None;
+                self.click_select(hit, modifiers.shift)
+              } else if modifiers.shift && from.distance(at) > DRAG_START {
+                self.press = None;
+                self.lasso = Some(vec![from, at])
+              }
+            }
+          }
+        },
         Tool::Paint => {
           if down
             && self.stroke.is_some()
@@ -2263,6 +2152,9 @@ impl ModelEditor {
       }
     }
 
+    // The tools may have changed the model since.
+    self.update_visibility(&projector);
+
     // The rendered model, then the overlays.
     painter.rect_filled(rect, 0.0, {
       let [r, g, b, _] = BACKGROUND.to_srgba().to_u8_array();
@@ -2279,6 +2171,11 @@ impl ModelEditor {
     self.draw_mesh_overlay(&painter, &projector);
     self.draw_arrows(&painter, &projector);
     self.draw_axes_gizmo(&painter, rect);
+    if let Some(lasso) = &self.lasso {
+      let points = lasso.iter().copied().map(to_pos).collect::<Vec<_>>();
+      let stroke = Stroke::new(1.0, Color32::from_rgb(80, 140, 255));
+      painter.add(egui::Shape::closed_line(points, stroke));
+    }
     if let Some((from, to, _)) = self.box_select {
       let selection = egui::Rect::from_two_pos(to_pos(from), to_pos(to));
       painter.rect_filled(
@@ -2323,18 +2220,10 @@ impl ModelEditor {
       )
     } else if !self.status.is_empty() {
       self.status.clone()
+    } else if self.simple && !matches!(self.tool, Tool::Paint | Tool::Picker) {
+      format!("{} · Shift click, or Shift drag around things, picks several to do together · Esc lets go", self.tool.hint())
     } else {
-      match self.tool {
-        Tool::Select if self.simple => match self.mode {
-          SelectMode::Face => "Click a face to pick it · drag the arrows to pull it, making the shape longer or shorter · Shift click picks more",
-          SelectMode::Vertex => "Click a corner to pick it · drag the arrows to bend the shape · Shift click or Shift drag picks more",
-          _ => "Click a shape to pick it · drag the arrows to move it · Shift click picks more · drag empty space to turn the view"
-        },
-        Tool::Picker => "Click a face to take its color and material",
-        Tool::Select => "Click selects · Shift adds · drag a selection to move it · drag empty space to box select (Shift adds, Ctrl removes)",
-        Tool::Paint => "Click or drag paints faces with the color and material · Shift fills joined faces that look alike · Alt picks a face's color and material"
-      }
-      .into()
+      self.tool.hint().into()
     };
     let galley = painter.layout(
       hint,
@@ -2375,7 +2264,7 @@ impl ModelEditor {
         }
       })
     }
-    if self.mode == SelectMode::Vertex && self.tool == Tool::Select {
+    if self.mode == SelectMode::Vertex && matches!(self.tool, Tool::Select | Tool::Move) {
       (0..self.model.vertices.len()).for_each(|v| {
         if (vertices_seen[v] || self.xray)
           && let Some(p) = on_screen(v)
@@ -2401,7 +2290,11 @@ impl ModelEditor {
         }
       }
       Some(Hit::Face(f)) => {
-        let faces = if self.tool == Tool::Select { self.hover_faces(f) } else { vec![f] };
+        let faces = if matches!(self.tool, Tool::Paint | Tool::Picker) {
+          vec![f]
+        } else {
+          self.hover_faces(f)
+        };
         faces.into_iter().for_each(|f| {
           let corners = self.model.corners(f).collect::<Vec<_>>();
           corners.iter().zip(corners.iter().cycle().skip(1)).for_each(|(&a, &b)| {
@@ -2532,27 +2425,27 @@ impl ModelEditor {
 #[derive(SystemParam)]
 pub struct ModelEditorUi<'w> {
   editor: ResMut<'w, ModelEditor>,
-  palette: ResMut<'w, Palette>,
+  material_editor: ResMut<'w, MaterialEditor>,
+  thumbnails: ResMut<'w, Thumbnails>,
   library: Library<'w>
 }
 
 /// The models and materials the editor saves to, and the asset stores they live in.
 #[derive(SystemParam)]
 pub struct Library<'w> {
-  model_meshes: ResMut<'w, ModelMeshes>,
-  model_materials: ResMut<'w, ModelMaterials>,
-  meshes: ResMut<'w, Assets<Mesh>>,
-  materials: ResMut<'w, Assets<StandardMaterial>>,
-  images: ResMut<'w, Assets<Image>>
+  pub(super) model_meshes: ResMut<'w, ModelMeshes>,
+  pub(super) model_materials: ResMut<'w, ModelMaterials>,
+  pub(super) meshes: ResMut<'w, Assets<Mesh>>,
+  pub(super) materials: ResMut<'w, Assets<StandardMaterial>>,
+  pub(super) images: ResMut<'w, Assets<Image>>
 }
 
 impl ModelEditorUi<'_> {
   /// Draws the model editor over the whole window.
   pub fn ui(&mut self, root: &mut egui::Ui) {
-    let Self { editor, palette, library } = self;
+    let Self { editor, material_editor, thumbnails, library } = self;
     let editor = &mut **editor;
     let ctx = root.ctx().clone();
-    let palette_before = palette.clone();
     let pointer = ctx.pointer_latest_pos().map(to_vec);
     editor.shortcuts(&ctx, pointer, library);
 
@@ -2572,15 +2465,12 @@ impl ModelEditorUi<'_> {
           ))
           .on_hover_text(if unsaved { "Unsaved changes" } else { "Saved" });
         });
-        editor.side_panel(ui, palette, library)
+        editor.side_panel(ui, library, thumbnails)
       }
     );
-    egui::CentralPanel::default().show(root, |ui| editor.viewport(ui, palette));
-
-    if **palette != palette_before
-      && let Err(error) = palette.save()
-    {
-      editor.status = format!("Can't save the palette: {error}")
+    egui::CentralPanel::default().show(root, |ui| editor.viewport(ui));
+    if let Some(name) = editor.open_material.take() {
+      material_editor.open(&name)
     }
   }
 }
@@ -2674,8 +2564,11 @@ fn sync_preview(
     _ => None
   };
   // Painting shows the colors as they are, without the selection's tint.
-  let tinted =
-    if editor.tool == Tool::Select { editor.selection.clone() } else { Selection::new() };
+  let tinted = if matches!(editor.tool, Tool::Paint | Tool::Picker) {
+    Selection::new()
+  } else {
+    editor.selection.clone()
+  };
   let state = (editor.model.clone(), tinted, hovered_face, model_materials.revision);
   if preview.built.as_ref() == Some(&state) {
     return;
@@ -2717,6 +2610,8 @@ fn sync_preview(
         let two_sided = editor.backfaces || material.double_sided;
         materials.add(StandardMaterial {
           unlit: true,
+          // The vertex colors bring the material's color, shaded.
+          base_color: Color::WHITE,
           emissive: LinearRgba::BLACK,
           emissive_texture: None,
           double_sided: two_sided,
