@@ -8,16 +8,27 @@ use {crate::{assets::{self, ASSETS_DIR},
              model::Rgb,
              sky::Sky,
              world::tiling_pixel_image},
-     bevy::{anti_alias::{fxaa::Fxaa, smaa::Smaa, taa::TemporalAntiAliasing},
+     bevy::{anti_alias::{fxaa::{Fxaa, fxaa},
+                         smaa::{Smaa, smaa},
+                         taa::TemporalAntiAliasing},
             camera::{Exposure, Hdr},
             camera_controller::free_camera::FreeCamera,
+            core_pipeline::{Core3dSystems,
+                            fullscreen_material::{FullscreenMaterial,
+                                                  FullscreenMaterialPlugin},
+                            tonemapping::tonemapping},
+            ecs::{schedule::ScheduleConfigs, system::BoxedSystem},
             light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap,
                     GlobalAmbientLight, ShadowFilteringMethod, Skybox},
             pbr::{DistanceFog, FogFalloff, ScreenSpaceAmbientOcclusion},
             post_process::bloom::{Bloom, BloomCompositeMode, BloomPrefilter},
             prelude::*,
-            render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection,
-                           DebandDither, Msaa, Tonemapping}},
+            render::{RenderApp,
+                     extract_component::ExtractComponent,
+                     render_resource::ShaderType,
+                     view::{ColorGrading, ColorGradingGlobal, ColorGradingSection,
+                            DebandDither, Msaa, Tonemapping}},
+            shader::ShaderRef},
      serde::{Deserialize, Serialize},
      std::{fs, io, path::Path}};
 
@@ -306,6 +317,90 @@ impl Glow {
   }
 }
 
+/// How big the dot pattern between two steps of [`Dither`] brightness is: an ordered
+/// (Bayer) pattern this many big pixels along each side.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum DitherPattern {
+  Bayer2,
+  #[default]
+  Bayer4,
+  Bayer8
+}
+
+impl DitherPattern {
+  pub const ALL: [Self; 3] = [Self::Bayer2, Self::Bayer4, Self::Bayer8];
+
+  pub const fn name(self) -> &'static str {
+    match self {
+      Self::Bayer2 => "2x2",
+      Self::Bayer4 => "4x4",
+      Self::Bayer8 => "8x8"
+    }
+  }
+
+  /// The pattern is 2 to this power along each side.
+  const fn bits(self) -> u32 {
+    match self {
+      Self::Bayer2 => 1,
+      Self::Bayer4 => 2,
+      Self::Bayer8 => 3
+    }
+  }
+}
+
+/// [`Dither`] on a camera, as its shader reads it.
+#[derive(Component, ExtractComponent, Clone, Copy, ShaderType, Default)]
+#[extract_app(RenderApp)]
+pub struct DitheredLighting {
+  rows: f32,
+  levels: f32,
+  pattern_bits: u32,
+  strength: f32
+}
+
+impl FullscreenMaterial for DitheredLighting {
+  fn fragment_shader() -> ShaderRef { "shaders/dithered_lighting.wesl".into() }
+
+  /// Over the finished picture: after tone mapping, so it steps the colors shown, and
+  /// after the smoothing of edges, so its big pixels stay sharp.
+  fn schedule_configs(system: ScheduleConfigs<BoxedSystem>) -> ScheduleConfigs<BoxedSystem> {
+    system.in_set(Core3dSystems::PostProcess).after(tonemapping).after(fxaa).after(smaa)
+  }
+}
+
+/// Dithered lighting, when on: the picture in big square pixels, each one's brightness
+/// snapped to a few steps, with a pattern of dots between one step and the next. Hues
+/// stay as they are.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Dither {
+  pub on: bool,
+  /// How many big pixels tall the screen is.
+  pub rows: u32,
+  /// How many steps of brightness there are, black and white included.
+  pub levels: u32,
+  pub pattern: DitherPattern,
+  /// 0 for hard steps without dots, 1 for dots all the way between steps.
+  pub strength: f32
+}
+
+impl Default for Dither {
+  fn default() -> Self {
+    Self { on: false, rows: 270, levels: 5, pattern: default(), strength: 1.0 }
+  }
+}
+
+impl Dither {
+  fn lighting(&self) -> DitheredLighting {
+    DitheredLighting {
+      rows: self.rows as f32,
+      levels: self.levels as f32,
+      pattern_bits: self.pattern.bits(),
+      strength: self.strength
+    }
+  }
+}
+
 /// One of the shadows, midtones and highlights of Bevy's [`ColorGrading`].
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -446,6 +541,7 @@ pub struct CameraSettings {
   pub background: Rgb,
   pub fog: Fog,
   pub glow: Glow,
+  pub dither: Dither,
   pub grading: Grading,
   pub fly: Fly
 }
@@ -467,6 +563,7 @@ impl Default for CameraSettings {
       background: Rgb([red, green, blue].map(|channel| (channel * 255.0).round() as u8)),
       fog: default(),
       glow: default(),
+      dither: default(),
       grading: default(),
       fly: default()
     }
@@ -592,13 +689,32 @@ impl Default for SkySettings {
   fn default() -> Self { Self { brightness: 1000.0 } }
 }
 
+/// How loud each kind of sound plays, 1 being as loud as its file.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoundSettings {
+  /// Scales all the others.
+  pub master: f32,
+  pub music: f32,
+  pub wind: f32,
+  pub steps: f32,
+  pub digging: f32
+}
+
+impl Default for SoundSettings {
+  fn default() -> Self {
+    Self { master: 1.0, music: 1.0, wind: 1.0, steps: 1.0, digging: 1.0 }
+  }
+}
+
 #[derive(Resource, Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SceneSettings {
   pub camera: CameraSettings,
   pub sun: Sun,
   pub ambient: Ambient,
-  pub sky: SkySettings
+  pub sky: SkySettings,
+  pub sound: SoundSettings
 }
 
 impl SceneSettings {
@@ -661,7 +777,8 @@ pub fn apply_scene(
           TemporalAntiAliasing,
           Bloom,
           DistanceFog,
-          ScreenSpaceAmbientOcclusion
+          ScreenSpaceAmbientOcclusion,
+          DitheredLighting
         )>()
         .insert((
           Exposure { ev100: camera.ev100 },
@@ -700,6 +817,9 @@ pub fn apply_scene(
       }
       if camera.fog.on {
         entity.insert(camera.fog.bevy());
+      }
+      if camera.dither.on {
+        entity.insert(camera.dither.lighting());
       }
       if camera.ambient_occlusion {
         entity.insert(ScreenSpaceAmbientOcclusion::default());
@@ -942,8 +1062,12 @@ fn update_sun_image(
 }
 
 pub fn plugin(app: &mut App) {
-  app.insert_resource(SceneSettings::load()).init_resource::<Sky>().add_systems(
-    Update,
-    (apply_scene, show_sky, (update_sky_fog, update_sun_image).after(apply_scene))
-  );
+  app
+    .add_plugins(FullscreenMaterialPlugin::<DitheredLighting>::default())
+    .insert_resource(SceneSettings::load())
+    .init_resource::<Sky>()
+    .add_systems(
+      Update,
+      (apply_scene, show_sky, (update_sky_fog, update_sun_image).after(apply_scene))
+    );
 }

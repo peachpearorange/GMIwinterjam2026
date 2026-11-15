@@ -8,7 +8,7 @@ use std::{env, fs,
 
 const ASSETS_DIR: &str = "assets";
 /// Extensions of asset files that RON files may name, by their path in `assets/`.
-const NAMEABLE: [&str; 4] = ["png", "glb", "gltf", "ron"];
+const NAMEABLE: [&str; 6] = ["png", "glb", "gltf", "ron", "ttf", "otf"];
 
 /// Every file in `dir` and its subfolders, leaving out hidden ones like `.gitkeep`.
 fn files(dir: &Path) -> Vec<PathBuf> {

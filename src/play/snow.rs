@@ -2,7 +2,8 @@
 //! through the partial snow textures and then the snow material, and once a spot is
 //! fully white the snow there starts rising, burying the world. The player clears it
 //! away wherever he walks, the snow around slumps into what he cleared, and cleared
-//! ground slowly snows over again.
+//! ground slowly snows over again. The snow only gets [`MAX_DEPTH`] deep, and slows the
+//! player heading into it.
 //!
 //! Every point of a grid finer than the terrain's remembers when snow started settling
 //! there. Its look and depth follow from how long ago that was, so the settled snow's
@@ -38,9 +39,11 @@ const FULL_STAGE: u8 = PARTIAL_STAGES + 1;
 /// has been white for a stage.
 const RISE_DELAY: f32 = (FULL_STAGE as f32 + 1.0) * STAGE_SECONDS;
 /// How fast the snow rises, in world units per second.
-const RISE_PER_SECOND: f32 = 0.03;
+const RISE_PER_SECOND: f32 = 0.01;
 /// How deep the snow gets at most, in world units.
-const MAX_DEPTH: f32 = 8.0;
+const MAX_DEPTH: f32 = 0.9;
+/// How many chunks a frame have their snow held to [`MAX_DEPTH`], each in turn.
+const CHUNKS_CAPPED_PER_FRAME: u32 = 4;
 /// How far settled snow lies above the ground, so it doesn't flicker into it.
 const COVER_LIFT: f32 = 0.03;
 /// How far under the ground the rising snow's surface starts, out of sight.
@@ -60,7 +63,7 @@ const SNOW_MATERIAL: &str = "snow";
 const COVER_SHADER: &str = "shaders/snow_cover.wesl";
 
 /// A pseudo random number in 0..1 for each integer point.
-fn hash(x: i32, z: i32) -> f32 {
+pub fn hash(x: i32, z: i32) -> f32 {
   let mut h = (x as u32).wrapping_mul(0x8da6_b343) ^ (z as u32).wrapping_mul(0xd816_3841);
   h ^= h >> 13;
   h = h.wrapping_mul(0x5bd1_e995);
@@ -102,6 +105,11 @@ pub struct Snow {
   start: Vec<f32>,
   /// Seconds since play started.
   clock: f32,
+  /// How deep the deepest snow the player cleared this frame was, when any was.
+  /// Zero for snow that had only settled.
+  pub dug: Option<f32>,
+  /// How many chunks have had their turn at being held to [`MAX_DEPTH`].
+  capped: u32,
   /// Chunks whose meshes need building again, as the snow there changed.
   dirty: HashSet<UVec2>,
   chunks: HashMap<UVec2, ChunkMeshes>
@@ -136,6 +144,8 @@ impl Snow {
       ground_normals: vec![],
       start,
       clock: 0.0,
+      dug: None,
+      capped: 0,
       dirty: default(),
       chunks: default()
     };
@@ -161,10 +171,14 @@ impl Snow {
     Vec3::new(-slope.x, 1.0, -slope.y).normalize()
   }
 
-  /// How high all the rising snow has come, which its chunks are moved up by.
-  fn level(&self) -> f32 {
-    let deepest = MAX_DEPTH / RISE_PER_SECOND + RISE_DELAY + SPREAD_SECONDS / 2.0;
-    self.clock.min(deepest) * RISE_PER_SECOND
+  /// How high all the rising snow has come, which its chunks are moved up by. It never
+  /// stops, so cleared ground always snows over again, and [`Self::cap_next_chunk`]
+  /// holds back what has got deep enough.
+  fn level(&self) -> f32 { self.clock * RISE_PER_SECOND }
+
+  /// How far the world is toward as buried as it gets, 0..1.
+  pub fn buried(&self) -> f32 {
+    (self.clock / (MAX_DEPTH / RISE_PER_SECOND + RISE_DELAY + SPREAD_SECONDS / 2.0)).min(1.0)
   }
 
   /// The rising snow's height at point `i` before being moved up by [`Self::level`]: so
@@ -172,6 +186,19 @@ impl Snow {
   /// settling there.
   fn body_height(&self, i: usize) -> f32 {
     self.ground[i] - RISE_PER_SECOND * (self.start[i] + RISE_DELAY) - SINK
+  }
+
+  /// How deep the snow at point `i` is, negative while it's still to come up.
+  fn depth(&self, i: usize) -> f32 { self.body_height(i) + self.level() - self.ground[i] }
+
+  /// How deep the snow the player is about to wade into is, heading along `direction`
+  /// from `xz`, as a share of the deepest it gets. Looks past what he clears around
+  /// himself and the slope the snow slumps to there.
+  pub fn ahead(&self, xz: Vec2, direction: Vec2) -> f32 {
+    let there = xz + direction * (DIG_RADIUS + MAX_DEPTH / STEEPEST_SLOPE);
+    let last = (self.size - UVec2::ONE).as_vec2();
+    let p = ((there - self.origin) / self.step).round().clamp(Vec2::ZERO, last).as_uvec2();
+    (self.depth(self.index(p)) / MAX_DEPTH).clamp(0.0, 1.0)
   }
 
   fn chunk_count(&self) -> UVec2 {
@@ -252,6 +279,27 @@ impl Snow {
       .with_inserted_attribute(Mesh::ATTRIBUTE_UV_1, starts)
   }
 
+  /// Holds the snow of the next chunk in turn to [`MAX_DEPTH`], by making snow deeper
+  /// than that start as late as leaves it that deep. Chunks take turns so only a few
+  /// get built again each frame, and snow rises so slowly that it's never noticeably
+  /// too deep by a chunk's next turn.
+  fn cap_next_chunk(&mut self) {
+    let count = self.chunk_count();
+    let chunk = UVec2::new(self.capped % count.x, self.capped / count.x % count.y);
+    self.capped = (self.capped + 1) % (count.x * count.y);
+    let earliest = self.clock - RISE_DELAY - (MAX_DEPTH + SINK) / RISE_PER_SECOND;
+    let too_deep = self
+      .chunk_points(chunk)
+      .into_iter()
+      .map(|p| self.index(p))
+      .filter(|&i| self.start[i] < earliest)
+      .collect::<Vec<_>>();
+    if !too_deep.is_empty() {
+      too_deep.into_iter().for_each(|i| self.start[i] = earliest);
+      self.dirty.insert(chunk);
+    }
+  }
+
   /// Marks the chunks showing points from `min` to `max` for building again. The
   /// surface's direction at a point leans on its neighbors, so the points next to those
   /// changed too, and a point on a chunk's first row or column is also the last of the
@@ -290,6 +338,12 @@ impl Snow {
           && clock - self.start[self.index(p)] > STAGE_SECONDS / 2.0
       })
       .collect::<Vec<_>>();
+    self.dug = cleared
+      .iter()
+      .map(|&p| self.index(p))
+      .filter(|&i| clock - self.start[i] >= STAGE_SECONDS)
+      .map(|i| self.depth(i).max(0.0))
+      .reduce(f32::max);
     if !cleared.is_empty() {
       cleared.iter().for_each(|&p| {
         let i = self.index(p);
@@ -554,8 +608,8 @@ fn setup(
   }
 }
 
-/// Lets time pass for the snow, clears it around the player, lets it slump, and rebuilds
-/// what changed.
+/// Lets time pass for the snow, clears it around the player, lets it slump, holds it to
+/// its deepest, and rebuilds what changed.
 fn advance(
   snow: Option<ResMut<Snow>>,
   looks: Option<Res<SnowLooks>>,
@@ -572,6 +626,7 @@ fn advance(
       snow.dig(player.translation.xz());
       snow.slump(player.translation.xz(), time.delta_secs())
     }
+    (0..CHUNKS_CAPPED_PER_FRAME).for_each(|_| snow.cap_next_chunk());
     std::mem::take(&mut snow.dirty).into_iter().for_each(|chunk| {
       if let Some(ChunkMeshes { body, cover }) = snow.chunks.get(&chunk) {
         meshes.insert(body, snow.body_mesh(chunk)).ok();
@@ -617,10 +672,10 @@ mod tests {
       .clamp(0.0, FULL_STAGE as f32) as u8
   }
 
-  fn depth(snow: &Snow, p: UVec2) -> f32 {
-    let i = snow.index(p);
-    snow.body_height(i) + snow.level() - snow.ground[i]
-  }
+  fn depth(snow: &Snow, p: UVec2) -> f32 { snow.depth(snow.index(p)) }
+
+  /// Seconds the snow takes to rise `depth`.
+  fn rising(depth: f32) -> f32 { depth / RISE_PER_SECOND }
 
   #[test]
   fn snow_settles_then_rises_and_digging_clears_it() {
@@ -635,21 +690,41 @@ mod tests {
 
     snow.clock = SPREAD_SECONDS + FULL_STAGE as f32 * STAGE_SECONDS;
     assert!(look(&snow, middle) == FULL_STAGE && look(&snow, corner) == FULL_STAGE);
-    snow.clock = SPREAD_SECONDS + RISE_DELAY + 20.0;
+    snow.clock = SPREAD_SECONDS + RISE_DELAY + rising(0.6);
     assert!(depth(&snow, middle) > 0.5, "{}", depth(&snow, middle));
 
     snow.dig(snow.xz(middle));
     assert!(depth(&snow, middle) < 0.0 && !snow.dirty.is_empty());
     assert!(look(&snow, middle) == 0 && look(&snow, corner) == FULL_STAGE);
     // Cleared ground snows over again.
-    snow.clock += RISE_DELAY + 20.0;
+    snow.clock += RISE_DELAY + rising(0.6);
     assert!(depth(&snow, middle) > 0.5);
+  }
+
+  #[test]
+  fn snow_stops_at_its_deepest_and_cleared_ground_still_snows_over() {
+    let mut snow = Snow::new(&Terrain::flat(8, 8, 2.0, "snow"));
+    let middle = snow.size / 2;
+    let chunks = snow.chunk_count().element_product();
+    let cap = |snow: &mut Snow| (0..chunks).for_each(|_| snow.cap_next_chunk());
+    snow.clock = SPREAD_SECONDS + RISE_DELAY + rising(MAX_DEPTH * 3.0);
+    assert!(depth(&snow, middle) > MAX_DEPTH * 2.0);
+    cap(&mut snow);
+    let deepest = (0..snow.start.len()).map(|i| snow.depth(i)).fold(0.0, f32::max);
+    assert!((deepest - MAX_DEPTH).abs() < 1e-3, "{deepest}");
+    assert!(snow.ahead(snow.xz(middle), Vec2::X) > 0.99 && !snow.dirty.is_empty());
+
+    snow.dig(snow.xz(middle));
+    assert!(depth(&snow, middle) < 0.0);
+    snow.clock += RISE_DELAY + rising(MAX_DEPTH * 2.0);
+    cap(&mut snow);
+    assert!((depth(&snow, middle) - MAX_DEPTH).abs() < 1e-3);
   }
 
   #[test]
   fn dug_walls_slump_to_a_resting_slope_keeping_the_snow() {
     let mut snow = Snow::new(&Terrain::flat(16, 16, 2.0, "snow"));
-    snow.clock = SPREAD_SECONDS + RISE_DELAY + 60.0;
+    snow.clock = SPREAD_SECONDS + RISE_DELAY + rising(1.8);
     let middle = snow.size / 2;
     let xz = snow.xz(middle);
     snow.dig(xz);

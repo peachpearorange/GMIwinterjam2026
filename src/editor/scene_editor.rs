@@ -7,8 +7,8 @@ use {super::pixel_editor::texture_names,
      bevy_egui::egui,
      std::path::Path,
      winterjam2026::{model::Rgb,
-                     scene::{AntiAliasing, CameraSettings, Fly, Fog, FogKind, Glow,
-                             Grading, GradingSection, SceneSettings, ShadowFiltering,
+                     scene::{AntiAliasing, CameraSettings, Dither, DitherPattern, Fly, Fog,
+                             FogKind, Glow, Grading, GradingSection, SceneSettings, ShadowFiltering, SoundSettings,
                              Sun, ToneMapping},
                      world::TEXTURES_DIR}};
 
@@ -62,6 +62,7 @@ fn camera_ui(ui: &mut egui::Ui, camera: &mut CameraSettings) {
     background,
     fog,
     glow,
+    dither,
     grading,
     fly
   } = camera;
@@ -161,6 +162,17 @@ fn camera_ui(ui: &mut egui::Ui, camera: &mut CameraSettings) {
       slider(ui, threshold_softness, 0.0..=1.0, "threshold softness");
       ui.checkbox(additive, "Additive")
         .on_hover_text("Adds the glow on top, brightening");
+    });
+  });
+
+  ui.collapsing("Dither", |ui| {
+    let Dither { on, rows, levels, pattern, strength } = dither;
+    ui.checkbox(on, "On");
+    ui.add_enabled_ui(*on, |ui| {
+      ui.add(egui::Slider::new(rows, 60..=1080).text("rows"));
+      ui.add(egui::Slider::new(levels, 2..=16).text("levels"));
+      choice(ui, "pattern", pattern, &DitherPattern::ALL, DitherPattern::name);
+      slider(ui, strength, 0.0..=1.0, "strength");
     });
   });
 
@@ -335,6 +347,14 @@ impl SceneEditorUi<'_> {
         )
         .on_hover_text("Times the camera's exposure");
         ui.weak("Paint the sky with Paint sky in the World tab");
+        ui.separator();
+        ui.heading("Sound");
+        let SoundSettings { master, music, wind, steps, digging } = &mut edited.sound;
+        slider(ui, master, 0.0..=2.0, "master");
+        slider(ui, music, 0.0..=2.0, "music");
+        slider(ui, wind, 0.0..=2.0, "wind");
+        slider(ui, steps, 0.0..=2.0, "footsteps");
+        slider(ui, digging, 0.0..=2.0, "digging");
       });
     });
     // Only written when something changed, so the settings aren't reapplied every frame.

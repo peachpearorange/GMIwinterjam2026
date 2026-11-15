@@ -865,6 +865,97 @@ pub fn append(model: &mut LowPoly, selection: &mut Selection, part: LowPoly) {
   *selection = (offset..model.vertices.len()).collect()
 }
 
+/// The smallest convex shape around `points`, its faces facing out, or for points all on
+/// one plane the polygon around them, facing `toward`. Points inside it or partway along
+/// its edges and faces are left out. None for under three points not in a line.
+pub fn convex_hull(points: &[Vec3], toward: Vec3, look: &Look) -> Option<LowPoly> {
+  let points = points.iter().fold(Vec::<Vec3>::new(), |mut unique, &p| {
+    if !unique.iter().any(|q| q.distance_squared(p) < EPSILON.squared()) {
+      unique.push(p)
+    }
+    unique
+  });
+  let n = points.len();
+  // Planes through three of the points with none on their outer side.
+  let planes = (0..n)
+    .flat_map(|i| (i + 1..n).flat_map(move |j| (j + 1..n).map(move |k| [i, j, k])))
+    .filter_map(|[i, j, k]| {
+      let normal = (points[j] - points[i]).cross(points[k] - points[i]).normalize_or_zero();
+      let side = |p: &Vec3| (*p - points[i]).dot(normal);
+      let below = points.iter().any(|p| side(p) < -EPSILON);
+      let above = points.iter().any(|p| side(p) > EPSILON);
+      let outward = match (below, above) {
+        (true, true) => None,
+        (false, true) => Some(-normal),
+        (true, false) => Some(normal),
+        // Every point is on this plane.
+        (false, false) if normal.dot(toward) < 0.0 => Some(-normal),
+        (false, false) => Some(normal)
+      };
+      outward.filter(|&normal| normal != Vec3::ZERO).map(|normal| (normal, normal.dot(points[i])))
+    })
+    .fold(Vec::<(Vec3, f32)>::new(), |mut planes, (normal, d)| {
+      if !planes.iter().any(|&(m, e)| m.dot(normal) > 1.0 - 1e-5 && (e - d).abs() < EPSILON) {
+        planes.push((normal, d))
+      }
+      planes
+    });
+  // Each plane's face: the points on it, around their outline counterclockwise seen
+  // from outside.
+  let faces = planes
+    .into_iter()
+    .map(|(normal, d)| {
+      let u = normal.any_orthonormal_vector();
+      let w = normal.cross(u);
+      let mut on = (0..n)
+        .filter(|&p| (points[p].dot(normal) - d).abs() < EPSILON)
+        .map(|p| (p, Vec2::new(points[p].dot(u), points[p].dot(w))))
+        .collect::<Vec<_>>();
+      // Rounded, so points in a line across the axis sort along it despite rounding.
+      on.sort_by_key(|(_, p)| ((p.x / EPSILON).round() as i64, (p.y / EPSILON).round() as i64));
+      // Andrew's monotone chain, dropping points partway along a side.
+      let chain = |points: &mut dyn Iterator<Item = &(usize, Vec2)>| {
+        points.fold(Vec::<(usize, Vec2)>::new(), |mut chain, &point| {
+          while let [.., (_, a), (_, b)] = chain[..]
+            && (b - a).perp_dot(point.1 - a) <= 1e-6
+          {
+            chain.pop();
+          }
+          chain.push(point);
+          chain
+        })
+      };
+      let mut lower = chain(&mut on.iter());
+      let mut upper = chain(&mut on.iter().rev());
+      lower.pop();
+      upper.pop();
+      lower.into_iter().chain(upper).map(|(p, _)| p).collect::<Vec<_>>()
+    })
+    .filter(|outline| outline.len() >= 3)
+    .collect::<Vec<_>>();
+  (!faces.is_empty()).then(|| {
+    let mut index = vec![usize::MAX; n];
+    let mut model = LowPoly::default();
+    model.faces = faces
+      .into_iter()
+      .map(|outline| {
+        let vertices = outline
+          .into_iter()
+          .map(|p| {
+            if index[p] == usize::MAX {
+              index[p] = model.vertices.len();
+              model.vertices.push(points[p])
+            }
+            index[p]
+          })
+          .collect();
+        Face::new(vertices, look)
+      })
+      .collect();
+    model
+  })
+}
+
 /// For each selected vertex off the mirror plane of `axis`, the unselected vertex at its
 /// mirror image, if any.
 pub fn mirror_partners(
@@ -1097,6 +1188,33 @@ mod tests {
         model.vertices[w].distance(model.vertices[v] * Vec3::new(-1.0, 1.0, 1.0)) < 1e-6
       )
     })
+  }
+
+  #[test]
+  fn convex_hulls_are_closed_and_leave_out_inner_points() {
+    let mut corners = cube().vertices;
+    // Inside, partway along an edge, and in the middle of a face.
+    corners.extend([Vec3::Y * 0.5, Vec3::new(0.0, 0.0, -0.5), Vec3::new(0.0, 1.0, 0.0)]);
+    let model = convex_hull(&corners, Vec3::Z, &look()).unwrap();
+    assert_eq!((model.vertices.len(), model.faces.len()), (8, 6));
+    assert!(model.faces.iter().all(|face| face.vertices.len() == 4));
+    assert_closed(&model);
+    assert!((volume(&model) - 1.0).abs() < 1e-5);
+
+    let corners = [Vec3::ZERO, Vec3::X, Vec3::Z, Vec3::new(0.3, 1.0, 0.2), Vec3::X];
+    let model = convex_hull(&corners, Vec3::Z, &look()).unwrap();
+    assert_eq!((model.vertices.len(), model.faces.len()), (4, 4));
+    assert_closed(&model);
+    assert!(volume(&model) > 0.0);
+
+    let square = [Vec3::ZERO, Vec3::X, Vec3::new(1.0, 0.0, 1.0), Vec3::Z, Vec3::X * 0.5];
+    let model = convex_hull(&square, Vec3::Y, &look()).unwrap();
+    assert_eq!((model.vertices.len(), model.faces.len()), (4, 1));
+    assert!(model.face_normal(0).y > 0.99);
+    assert!(convex_hull(&square, Vec3::NEG_Y, &look()).unwrap().face_normal(0).y < -0.99);
+
+    assert!(convex_hull(&[Vec3::ZERO, Vec3::X, Vec3::X * 2.0], Vec3::Y, &look()).is_none());
+    assert!(convex_hull(&[Vec3::ZERO, Vec3::X], Vec3::Y, &look()).is_none())
   }
 
   #[test]

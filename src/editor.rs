@@ -10,6 +10,7 @@ mod material_editor;
 mod model_editor;
 mod pixel_editor;
 mod scene_editor;
+mod ui_editor;
 mod world_editor;
 
 use {crate::{Mode, start_transform},
@@ -22,6 +23,7 @@ use {crate::{Mode, start_transform},
      model_editor::ModelEditorUi,
      pixel_editor::PixelEditorUi,
      scene_editor::SceneEditorUi,
+     ui_editor::UiEditorUi,
      winterjam2026::world::Markers,
      world_editor::WorldEditorUi};
 
@@ -79,7 +81,9 @@ pub enum Editor {
   Models,
   Materials,
   /// The in-game camera and the light, over the live world.
-  Scene
+  Scene,
+  /// The in-game screens: HUD, title, messages.
+  Ui
 }
 
 /// Where the camera was when play started, to return to after.
@@ -185,7 +189,8 @@ fn edit_ui(
     ModelEditorUi,
     MaterialEditorUi,
     ResMut<MaterialEditor>,
-    SceneEditorUi
+    SceneEditorUi,
+    UiEditorUi
   )>
 ) -> Result {
   let ctx = contexts.ctx_mut()?;
@@ -197,6 +202,7 @@ fn edit_ui(
       ui.selectable_value(&mut *editor, Editor::Models, "Models");
       ui.selectable_value(&mut *editor, Editor::Materials, "Materials");
       ui.selectable_value(&mut *editor, Editor::Scene, "Scene");
+      ui.selectable_value(&mut *editor, Editor::Ui, "UI");
       ui.separator();
       if ui.button("▶ Play (F1)").clicked() {
         next.set(Mode::Play);
@@ -208,7 +214,8 @@ fn edit_ui(
     Editor::Textures => editors.p1().ui(&mut root),
     Editor::Models => editors.p2().ui(&mut root),
     Editor::Materials => editors.p3().ui(&mut root),
-    Editor::Scene => editors.p5().ui(&mut root)
+    Editor::Scene => editors.p5().ui(&mut root),
+    Editor::Ui => editors.p6().ui(&mut root)
   }
   // The model editor making a material opens it here.
   if std::mem::take(&mut editors.p4().show) {
@@ -236,7 +243,8 @@ pub fn plugin(app: &mut App) {
       world_editor::plugin,
       pixel_editor::plugin,
       model_editor::plugin,
-      material_editor::plugin
+      material_editor::plugin,
+      ui_editor::plugin
     ))
     .init_resource::<Editor>()
     .init_resource::<EditCamera>()

@@ -244,6 +244,18 @@ impl Terrain {
   /// World units between paint grid points.
   pub fn paint_step(&self) -> f32 { self.cell_size / PAINT_PER_CELL as f32 }
 
+  /// The name of the material painted at world `xz`.
+  pub fn material(&self, xz: Vec2) -> Option<&str> {
+    let UVec2 { x, y } =
+      ((xz + self.size() / 2.0) / self.paint_step()).round().max(Vec2::ZERO).as_uvec2();
+    self
+      .paint
+      .get(y as usize)
+      .and_then(|row| row.get(x as usize))
+      .and_then(|&index| self.materials.get(index as usize))
+      .map(String::as_str)
+  }
+
   /// The paint grid points within `radius` of any of `path`'s world xz points that
   /// aren't `material` yet.
   pub fn unpainted(

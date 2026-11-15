@@ -1,4 +1,5 @@
-//! World design: sculpting the terrain, painting ground, placing models and markers.
+//! World design: sculpting the terrain, painting ground, placing models, markers,
+//! billboards and lights.
 
 use {super::{material_editor::Thumbnails,
              pixel_editor::{Palette, texture_names}},
@@ -13,11 +14,12 @@ use {super::{material_editor::Thumbnails,
      winterjam2026::{assets::ASSETS_DIR,
                      billboard::{Billboard, BillboardMode, PlacedBillboard},
                      material::ModelMaterials,
-                     model::MODEL_EXTENSION,
+                     model::{MODEL_EXTENSION, Rgb},
                      scene::{SceneSettings, apply_scene},
                      sky::{Brush, Sky, SkyPixels, SkyStroke},
                      terrain::{Terrain, TerrainShading},
-                     world::{MODELS_DIR, Marker, Model, TEXTURES_DIR, WorldFile}}};
+                     world::{Light, MODELS_DIR, Marker, Model, PlacedLight, TEXTURES_DIR,
+                             WorldFile}}};
 
 /// How a height brush moves the terrain vertices under it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -37,12 +39,13 @@ enum Tool {
   PlaceModel,
   PlaceMarker,
   PlaceBillboard,
+  PlaceLight,
   Select,
   PaintSky
 }
 
 impl Tool {
-  const ALL: [Self; 10] = [
+  const ALL: [Self; 11] = [
     Self::Sculpt(Sculpt::Raise),
     Self::Sculpt(Sculpt::Lower),
     Self::Sculpt(Sculpt::Smooth),
@@ -51,6 +54,7 @@ impl Tool {
     Self::PlaceModel,
     Self::PlaceMarker,
     Self::PlaceBillboard,
+    Self::PlaceLight,
     Self::Select,
     Self::PaintSky
   ];
@@ -65,6 +69,7 @@ impl Tool {
       Self::PlaceModel => "Place model",
       Self::PlaceMarker => "Place marker",
       Self::PlaceBillboard => "Place billboard",
+      Self::PlaceLight => "Place light",
       Self::Select => "Select",
       Self::PaintSky => "Paint sky"
     }
@@ -72,7 +77,7 @@ impl Tool {
 }
 
 /// The keys that pick each tool in [`Tool::ALL`], in order, and what the buttons show.
-const TOOL_KEYS: [(KeyCode, &str); 10] = [
+const TOOL_KEYS: [(KeyCode, &str); 11] = [
   (KeyCode::Digit1, "1"),
   (KeyCode::Digit2, "2"),
   (KeyCode::Digit3, "3"),
@@ -81,6 +86,7 @@ const TOOL_KEYS: [(KeyCode, &str); 10] = [
   (KeyCode::Digit6, "6"),
   (KeyCode::Digit7, "7"),
   (KeyCode::Digit8, "8"),
+  (KeyCode::KeyL, "L"),
   (KeyCode::Digit9, "9"),
   (KeyCode::Digit0, "0")
 ];
@@ -134,7 +140,7 @@ impl NewWorld {
 }
 
 /// Every file in `dir` and its subfolders.
-fn files(dir: &Path) -> Vec<PathBuf> {
+pub(super) fn files(dir: &Path) -> Vec<PathBuf> {
   fs::read_dir(dir)
     .into_iter()
     .flatten()
@@ -166,7 +172,7 @@ fn model_paths() -> Vec<String> {
 
 /// Asset paths of the textures in [`TEXTURES_DIR`] and its subfolders, like
 /// `textures/tree.png`.
-fn texture_paths() -> Vec<String> {
+pub(super) fn texture_paths() -> Vec<String> {
   let mut names = texture_names(Path::new(TEXTURES_DIR));
   names.sort();
   names.into_iter().map(|name| format!("textures/{name}.png")).collect()
@@ -177,7 +183,7 @@ const PICKER_HEIGHT: f32 = 320.0;
 
 /// A list to pick a model or texture from, one click each, with a picture beside each
 /// entry when `picture` gives one.
-fn picker(
+pub(super) fn picker(
   ui: &mut egui::Ui,
   id: &str,
   paths: &[String],
@@ -233,13 +239,35 @@ fn billboard_settings(
   });
 }
 
+/// The color, brightness, reach and shadows of a light.
+fn light_settings(ui: &mut egui::Ui, light: &mut Light) {
+  let Light { color: Rgb(rgb), intensity, range, shadows } = light;
+  ui.horizontal(|ui| {
+    ui.color_edit_button_srgb(rgb);
+    ui.label("color");
+  });
+  ui.add(
+    egui::Slider::new(intensity, 100.0..=10_000_000.0)
+      .logarithmic(true)
+      .suffix(" lm")
+      .text("intensity")
+  );
+  ui.add(
+    egui::Slider::new(range, 1.0..=200.0).logarithmic(true).suffix(" m").text("range")
+  )
+  .on_hover_text("How far its light reaches");
+  ui.checkbox(shadows, "shadows").on_hover_text("Costly with many lights");
+}
+
 /// What a click would place, shown where it would go. Not part of the world.
 #[derive(Component)]
 struct PlacementPreview;
 
-/// The markers, models and billboards placed in the world.
-type Placed =
-  (Or<(With<Marker>, With<Model>, With<Billboard>)>, Without<PlacementPreview>);
+/// The markers, models, billboards and lights placed in the world.
+type Placed = (
+  Or<(With<Marker>, With<Model>, With<Billboard>, With<Light>)>,
+  Without<PlacementPreview>
+);
 
 /// A drag over the terrain with the left mouse button.
 #[derive(Clone, Copy)]
@@ -269,6 +297,10 @@ struct WorldEditor {
   marker_name: String,
   /// What placing a billboard places.
   billboard: Billboard,
+  /// What placing a light places.
+  light: Light,
+  /// How far above the clicked ground a light gets placed, in world units.
+  light_height: f32,
   selected: Vec<Entity>,
   /// The outline being dragged with the select tool, in window coordinates.
   lasso: Option<Vec<Vec2>>,
@@ -313,6 +345,13 @@ impl Default for WorldEditor {
         size: 3.0,
         mode: BillboardMode::FacePositionUpright
       },
+      light: Light {
+        color: Rgb::WHITE,
+        intensity: 100_000.0,
+        range: 20.0,
+        shadows: false
+      },
+      light_height: 3.0,
       selected: default(),
       lasso: None,
       new_world: NewWorld::DEFAULT,
@@ -346,6 +385,9 @@ const LASSO_MIN: f32 = 6.0;
 /// Height of the editor-only pole drawn at every marker.
 const MARKER_POLE: f32 = 3.0;
 const MARKER_COLOR: Color = Color::srgb(1.0, 0.3, 0.9);
+/// Radius of the editor-only ball drawn at every light.
+const LIGHT_BALL: f32 = 0.3;
+const LIGHT_COLOR: Color = Color::srgb(1.0, 0.5, 0.1);
 const SELECTION_COLOR: Color = Color::srgb(1.0, 0.85, 0.1);
 const BRUSH_COLOR: Color = Color::srgb(0.1, 0.9, 1.0);
 
@@ -363,7 +405,8 @@ pub struct WorldEditorUi<'w, 's> {
       Option<&'static mut Marker>,
       Option<&'static Model>,
       &'static mut Transform,
-      Option<&'static mut Billboard>
+      Option<&'static mut Billboard>,
+      Option<&'static mut Light>
     ),
     Placed
   >,
@@ -550,11 +593,27 @@ impl WorldEditorUi<'_, '_> {
             }
             billboard_settings(ui, &mut editor.billboard, &editor.textures, thumbnails)
           }
+          Tool::PlaceLight => {
+            light_settings(ui, &mut editor.light);
+            ui.add(
+              egui::Slider::new(&mut editor.light_height, 0.0..=30.0)
+                .suffix(" m")
+                .text("height")
+            )
+            .on_hover_text("Above the ground clicked");
+          }
           Tool::Select => {
             if let [entity] = editor.selected[..]
-              && let Ok((_, marker, model, mut transform, billboard)) =
+              && let Ok((_, marker, model, mut transform, billboard, light)) =
                 placed.get_mut(entity)
             {
+              if let Some(mut light) = light {
+                let mut edited = *light;
+                light_settings(ui, &mut edited);
+                if edited != *light {
+                  *light = edited
+                }
+              }
               if let Some(mut billboard) = billboard {
                 let mut edited = billboard.clone();
                 billboard_settings(ui, &mut edited, &editor.textures, thumbnails);
@@ -591,7 +650,7 @@ impl WorldEditorUi<'_, '_> {
                 transform.translation.y = height;
               }
             } else if editor.selected.is_empty() {
-              ui.label("Click or drag around markers, models and billboards.");
+              ui.label("Click or drag around markers, models, billboards and lights.");
             } else {
               ui.label(format!("{} selected", editor.selected.len()));
             }
@@ -612,7 +671,7 @@ impl WorldEditorUi<'_, '_> {
 
         ui.separator();
         ui.heading("Markers");
-        placed.iter().for_each(|(_, marker, _, &Transform { translation, .. }, _)| {
+        placed.iter().for_each(|(_, marker, _, &Transform { translation, .. }, ..)| {
           marker.map(|Marker { name }| ui.label(format!("{name}  {translation:.1}")));
         });
       });
@@ -638,7 +697,7 @@ impl WorldEditorUi<'_, '_> {
         egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 140, 255))
       ));
     });
-    placed.iter().for_each(|(_, marker, _, &Transform { translation, .. }, _)| {
+    placed.iter().for_each(|(_, marker, _, &Transform { translation, .. }, ..)| {
       if let Some(Marker { name }) = marker
         && let Ok(Vec2 { x, y }) =
           camera.world_to_viewport(camera_transform, translation + Vec3::Y * MARKER_POLE)
@@ -838,7 +897,13 @@ fn use_tool(
   time: Res<Time>,
   placed: Query<(Entity, &Transform), Placed>,
   mut preview: Query<
-    (Entity, Option<&Model>, Option<&mut Billboard>, &mut Transform),
+    (
+      Entity,
+      Option<&Model>,
+      Option<&mut Billboard>,
+      Option<&mut Light>,
+      &mut Transform
+    ),
     With<PlacementPreview>
   >,
   mut gizmos: Gizmos,
@@ -942,6 +1007,16 @@ fn use_tool(
         if clicked {
           let Billboard { texture, size, mode } = editor.billboard.clone();
           commands.spawn(PlacedBillboard { texture, position: hit, size, mode }.spawn());
+        }
+      }
+      Tool::PlaceLight => {
+        let at = hit + Vec3::Y * editor.light_height;
+        gizmos.line(hit, at, LIGHT_COLOR);
+        gizmos.sphere(at, LIGHT_BALL, LIGHT_COLOR);
+        if clicked {
+          let Light { color, intensity, range, shadows } = editor.light;
+          commands
+            .spawn(PlacedLight { position: at, color, intensity, range, shadows }.spawn());
         }
       }
       Tool::PlaceMarker => {
@@ -1054,30 +1129,45 @@ fn use_tool(
     }
   }
 
-  // The model or billboard a click would place, where it would go.
+  // The model, billboard or light a click would place, where it would go.
   let yaw = Quat::from_rotation_y(editor.model_yaw_degrees.to_radians());
   let model_at = editor.placing.map(|Placing { position, .. }| position).or(hit);
   let placing = match editor.tool {
     Tool::PlaceModel => model_at.zip(editor.model.clone()).map(|(at, path)| {
-      (Some(path), None, Transform::from_translation(at).with_rotation(yaw))
+      (Some(path), None, None, Transform::from_translation(at).with_rotation(yaw))
     }),
     Tool::PlaceBillboard => hit.map(|hit| {
-      (None, Some(editor.billboard.clone()), Transform::from_translation(hit))
+      (None, Some(editor.billboard.clone()), None, Transform::from_translation(hit))
     }),
+    // Not where a light was just placed, as the two together would shine twice as bright
+    // as what got placed.
+    Tool::PlaceLight => hit
+      .map(|hit| hit + Vec3::Y * editor.light_height)
+      .filter(|&at| {
+        !placed.iter().any(|(_, &Transform { translation, .. })| translation == at)
+      })
+      .map(|at| (None, None, Some(editor.light), Transform::from_translation(at))),
     _ => None
   };
-  let shown =
-    preview.iter_mut().fold(false, |shown, (entity, model, billboard, mut transform)| {
+  let shown = preview.iter_mut().fold(
+    false,
+    |shown, (entity, model, billboard, light, mut transform)| {
       match &placing {
-        Some((path, wanted, at))
+        Some((path, wanted, wanted_light, at))
           if !shown
             && model.map(|Model { path }| path) == path.as_ref()
-            && billboard.is_some() == wanted.is_some() =>
+            && billboard.is_some() == wanted.is_some()
+            && light.is_some() == wanted_light.is_some() =>
         {
           if let (Some(mut billboard), Some(wanted)) = (billboard, wanted)
             && *billboard != *wanted
           {
             *billboard = wanted.clone()
+          }
+          if let (Some(mut light), &Some(wanted)) = (light, wanted_light)
+            && *light != wanted
+          {
+            *light = wanted
           }
           transform.translation = at.translation;
           // Billboards turn themselves toward the camera.
@@ -1091,14 +1181,18 @@ fn use_tool(
           shown
         }
       }
-    });
-  if !shown && let Some((path, billboard, at)) = placing {
+    }
+  );
+  if !shown && let Some((path, billboard, light, at)) = placing {
     let mut entity = commands.spawn((PlacementPreview, at, Visibility::default()));
     if let Some(path) = path {
       entity.insert(Model { path });
     }
     if let Some(billboard) = billboard {
       entity.insert(billboard);
+    }
+    if let Some(light) = light {
+      entity.insert(light);
     }
   }
 }
@@ -1154,17 +1248,24 @@ fn set_fov(
   }
 }
 
-/// Editor-only visuals: a pole with a ball on top at every marker, and a ring on the
-/// ground around the selection.
+/// Editor-only visuals: a pole with a ball on top at every marker, a ball in every
+/// light's color on a pole up from the ground, and a ring on the ground around the
+/// selection.
 fn draw_markers_and_selection(
   editor: Res<WorldEditor>,
   terrain: Res<Terrain>,
-  placed: Query<(Entity, &Transform, Has<Marker>), Placed>,
+  placed: Query<(Entity, &Transform, Has<Marker>, Option<&Light>), Placed>,
   mut gizmos: Gizmos
 ) {
-  placed.iter().for_each(|(entity, &Transform { translation, .. }, is_marker)| {
+  placed.iter().for_each(|(entity, &Transform { translation, .. }, is_marker, light)| {
     let selected = editor.selected.contains(&entity);
     let color = if selected { SELECTION_COLOR } else { MARKER_COLOR };
+    if let Some(&Light { color: light_color, .. }) = light {
+      let pole = if selected { SELECTION_COLOR } else { LIGHT_COLOR };
+      gizmos.line(translation.with_y(terrain.height(translation.xz())), translation, pole);
+      gizmos.sphere(translation, LIGHT_BALL, light_color.color());
+      gizmos.sphere(translation, LIGHT_BALL * 1.5, pole);
+    }
     if is_marker {
       let top = translation + Vec3::Y * MARKER_POLE;
       gizmos.line(translation, top, color);
@@ -1216,13 +1317,14 @@ fn undo_redo(
   markers: Query<(&Marker, &Transform)>,
   models: Query<(&Model, &Transform), Without<PlacementPreview>>,
   billboards: Query<(&Billboard, &Transform), Without<PlacementPreview>>,
+  lights: Query<(&Light, &Transform), Without<PlacementPreview>>,
   placed: Query<Entity, Placed>,
   mut sky: ResMut<Sky>,
   mut images: ResMut<Assets<Image>>,
   mut commands: Commands
 ) {
   let now = |sky: &Sky| {
-    WorldFile::collect(&terrain, &markers, &models, &billboards)
+    WorldFile::collect(&terrain, &markers, &models, &billboards, &lights)
       .to_text()
       .ok()
       .map(|world| Snapshot { world, sky: sky.pixels.clone() })
@@ -1286,6 +1388,7 @@ fn autosave(
   markers: Query<(&Marker, &Transform)>,
   models: Query<(&Model, &Transform), Without<PlacementPreview>>,
   billboards: Query<(&Billboard, &Transform), Without<PlacementPreview>>,
+  lights: Query<(&Light, &Transform), Without<PlacementPreview>>,
   time: Res<Time>,
   mut since_check: Local<f32>
 ) {
@@ -1296,7 +1399,7 @@ fn autosave(
   }
   *since_check = 0.0;
   editor.save_now = false;
-  let world = WorldFile::collect(&terrain, &markers, &models, &billboards);
+  let world = WorldFile::collect(&terrain, &markers, &models, &billboards, &lights);
   let Ok(text) = world.to_text() else { return };
   let file = Path::new(ASSETS_DIR).join(WorldFile::NAME);
   let saved =
@@ -1320,7 +1423,7 @@ fn autosave(
 }
 
 /// The time of day as hours, minutes and seconds in UTC, for the save status.
-fn clock_time() -> String {
+pub(super) fn clock_time() -> String {
   let seconds = std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
     .map_or(0, |since| since.as_secs());

@@ -8,6 +8,7 @@ use {bevy::{camera_controller::free_camera::{run_freecamera_controller,
      winterjam2026::{assets,
                      billboard::WorldCamera,
                      scene::SceneSettings,
+                     ui,
                      world::{Markers, WorldPlugin}}};
 
 /// Marker the camera starts at, when the world has one.
@@ -90,6 +91,7 @@ fn main() {
       }),
       FreeCameraPlugin,
       WorldPlugin,
+      ui::plugin,
       play::plugin
     ))
     .insert_state(Mode::START)

@@ -23,6 +23,15 @@ pub fn read(path: &str) -> Option<Cow<'static, [u8]>> {
   }
 }
 
+/// Whether there's an asset at `path`, relative to [`ASSETS_DIR`].
+pub fn exists(path: &str) -> bool {
+  if cfg!(feature = "editor") {
+    Path::new(ASSETS_DIR).join(path).is_file()
+  } else {
+    EMBEDDED.iter().any(|&(embedded, _)| embedded == path)
+  }
+}
+
 /// Makes Bevy load assets from the baked in files when there's no editor. Add it before
 /// `DefaultPlugins`.
 pub fn plugin(app: &mut App) {

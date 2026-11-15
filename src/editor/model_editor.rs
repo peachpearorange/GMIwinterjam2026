@@ -2,7 +2,9 @@
 //!
 //! It opens in simple mode, made for building out of shapes like in Blockbench, with
 //! tools like the pixel editor's: pick one, then click or drag what's under the pointer,
-//! no selecting first. Move drags corners, edges and faces, Pull out block grows a face
+//! no selecting first. Build from corners makes a convex shape around corners pushed into
+//! the view along the pointer by dragging up and down, a side view showing how far. Move
+//! drags corners, edges and faces, Pull out block grows a face
 //! into a new block, Join corners and Add corner reshape, the shape tools resize, turn,
 //! copy and delete whole shapes, Paint gives faces a material. Shift click or Shift drag
 //! a lasso picks several things to do together. Left drag on empty space turns the
@@ -18,7 +20,7 @@
 //!   L whole pieces, Z sees through faces.
 //! - Editing: G moves, R rotates, S scales, E extrudes, I insets, Shift D duplicates.
 //!   While one runs, X, Y or Z lock an axis (N the extrusion's normal), typing sets the
-//!   amount, Ctrl flips snapping, Enter or a click confirms, Esc or a right click
+//!   amount, Enter or a click confirms, Esc or a right click
 //!   cancels. Dragging a selected element moves it directly.
 //! - Also: X deletes, F makes a face, M merges, W subdivides, N flips, Shift N faces
 //!   outward, C paints the selection, B paints by clicking faces (Alt picks a face's
@@ -271,6 +273,15 @@ impl Projector {
     ray.get_point(t)
   }
 
+  /// How far along the line through `origin` along unit `axis` is the point of it nearest
+  /// the ray through `at`.
+  fn along(&self, at: Vec2, origin: Vec3, axis: Vec3) -> f32 {
+    let ray = self.ray(at);
+    let (r, w) = (*ray.direction, origin - ray.origin);
+    let (b, denominator) = (axis.dot(r), 1.0 - axis.dot(r).powi(2));
+    if denominator.abs() < 1e-5 { 0.0 } else { (b * r.dot(w) - axis.dot(w)) / denominator }
+  }
+
   /// The direction from `point` toward the camera, and how far the camera is.
   fn toward_eye(&self, point: Vec3) -> (Vec3, f32) {
     if self.ortho {
@@ -299,6 +310,8 @@ enum Tool {
   Picker,
   // Simple mode's, each working straight on what's under the pointer, pixel editor
   // style: no selecting first.
+  /// Clicking puts down corners, which make a new convex shape around them.
+  BuildFromCorners,
   PullOutBlock,
   Move,
   JoinCorners,
@@ -311,7 +324,8 @@ enum Tool {
 }
 
 impl Tool {
-  const SIMPLE: [Self; 11] = [
+  const SIMPLE: [Self; 12] = [
+    Self::BuildFromCorners,
     Self::PullOutBlock,
     Self::Move,
     Self::JoinCorners,
@@ -330,6 +344,7 @@ impl Tool {
       Self::Select => "Select",
       Self::Paint => "Paint",
       Self::Picker => "Pick material",
+      Self::BuildFromCorners => "Build from corners",
       Self::PullOutBlock => "Pull out block",
       Self::Move => "Move",
       Self::JoinCorners => "Join corners",
@@ -347,6 +362,7 @@ impl Tool {
       Self::Select => Key::V,
       Self::Paint => Key::B,
       Self::Picker => Key::Q,
+      Self::BuildFromCorners => Key::S,
       Self::PullOutBlock => Key::E,
       Self::Move => Key::M,
       Self::JoinCorners => Key::Z,
@@ -364,6 +380,7 @@ impl Tool {
       Self::Select => "Click selects · Shift adds · drag a selection to move it · drag empty space to box select (Shift adds, Ctrl removes)",
       Self::Paint => "Click or drag paints faces with the material · Shift fills joined faces made of the same · Alt picks a face's material",
       Self::Picker => "Click a face to paint with its material",
+      Self::BuildFromCorners => "Press under the pointer for a corner and drag up to push it away, down to pull it near: the side view shows how far · drag a corner to push it again, click it to take it away · middle drag turns the view · Enter builds the shape · Backspace takes back the last corner, Esc all",
       Self::PullOutBlock => "Drag a face to pull a new block out of it: arms, chimneys, branches",
       Self::Move => "Drag a corner, edge or face to reshape: bend shapes into rocks and slopes, or pull a face to make a shape longer",
       Self::JoinCorners => "Click an edge to join its two corners, or a face to squeeze it to a point: a cube's top becomes a pyramid",
@@ -381,6 +398,8 @@ impl Tool {
     match self {
       // Corners, then edges, then faces.
       Self::Move => SelectMode::Vertex,
+      // Snaps to corners.
+      Self::BuildFromCorners => SelectMode::Vertex,
       // Edges, and faces away from edges.
       Self::JoinCorners | Self::AddCorner => SelectMode::Edge,
       Self::ResizeShape | Self::TurnShape | Self::CopyShape | Self::DeleteShape => SelectMode::Piece,
@@ -470,6 +489,28 @@ struct Press {
   hit: Option<Hit>
 }
 
+/// A corner being pushed along the line from the camera through it, by dragging up and
+/// down: which, that line, how far along it the corner was, where on screen the drag
+/// started, and whether pressing put it down.
+#[derive(Clone, Copy)]
+struct Pushing {
+  corner: usize,
+  ray: Ray3d,
+  start: f32,
+  from: Vec2,
+  new: bool
+}
+
+/// The shape the Build from corners tool is making.
+#[derive(Default)]
+struct NewShape {
+  /// The corners put down so far.
+  corners: Vec<Vec3>,
+  pushing: Option<Pushing>,
+  /// Where the next corner would go.
+  cursor: Option<Vec3>
+}
+
 /// How box selection combines with the selection.
 #[derive(Clone, Copy)]
 enum BoxMode {
@@ -490,7 +531,12 @@ struct Preview {
   materials: HashMap<String, Handle<StandardMaterial>>,
   materials_for: (u64, bool),
   /// What the model was last built from.
-  built: Option<(LowPoly, Selection, Option<usize>, u64)>
+  built: Option<(LowPoly, Selection, Option<usize>, u64)>,
+  /// The see-through shape the Build from corners tool is making, and what it was last
+  /// built from.
+  ghost: Entity,
+  ghost_materials: HashMap<String, Handle<StandardMaterial>>,
+  ghost_built: Option<(Option<LowPoly>, u64)>
 }
 
 #[derive(Resource)]
@@ -509,8 +555,6 @@ pub struct ModelEditor {
   /// A material to open in the material editor, asked for here.
   open_material: Option<String>,
   view: View,
-  snap: bool,
-  grid_step: f32,
   /// Moves vertices mirrored across x = 0 along with the selected ones.
   mirror_x: bool,
   /// Lets the pointer pick and box select what's hidden behind faces.
@@ -537,6 +581,7 @@ pub struct ModelEditor {
   /// How far and around which axis the Turn tool turns.
   turn_degrees: f32,
   turn_axis: Axis,
+  new_shape: NewShape,
   /// The model before the paint stroke in progress.
   stroke: Option<(LowPoly, Selection)>,
   hover: Option<Hit>,
@@ -562,8 +607,6 @@ impl Default for ModelEditor {
       material: default(),
       open_material: None,
       view: View::DEFAULT,
-      snap: true,
-      grid_step: 0.125,
       mirror_x: false,
       xray: false,
       wireframe: true,
@@ -581,6 +624,7 @@ impl Default for ModelEditor {
       arrow_hover: None,
       turn_degrees: 90.0,
       turn_axis: Axis::Y,
+      new_shape: default(),
       stroke: None,
       hover: None,
       viewport_pixels: UVec2::ONE,
@@ -600,9 +644,8 @@ impl Default for ModelEditor {
 
 impl ModelEditor {
   const MAX_UNDO: usize = 200;
-  const SNAP_DEGREES: f32 = 15.0;
-  const SNAP_SCALE: f32 = 0.1;
-  const SNAP_INSET: f32 = 0.05;
+  /// How far a wheel notch pushes what's moving freely toward or away from the camera.
+  const WHEEL_STEP: f32 = 0.125;
   const TOOLS_PANEL_WIDTH: f32 = 190.0;
   const SIDE_PANEL_WIDTH: f32 = 224.0;
   const FILE_LIST_HEIGHT: f32 = 200.0;
@@ -658,6 +701,7 @@ impl ModelEditor {
     self.undo.clear();
     self.redo.clear();
     self.name = name;
+    self.new_shape.corners.clear();
     self.frame(false);
     self.status = default()
   }
@@ -677,7 +721,7 @@ impl ModelEditor {
       self.status = format!("Can't save the materials: {error}")
     }
     self.material.clone_from(&name);
-    if self.simple {
+    if self.simple && self.tool != Tool::BuildFromCorners {
       self.tool = Tool::Paint
     }
     self.open_material = Some(name)
@@ -918,7 +962,7 @@ impl ModelEditor {
         let pivot = ops::selection_center(&self.model, &self.selection).unwrap_or_default();
         self.selection.iter().for_each(|&v| {
           let p = &mut self.model.vertices[v];
-          // Keep the corners on the grid rather than a hair off it.
+          // Keep tidy numbers tidy rather than a hair off.
           *p = ((pivot + rotation * (*p - pivot)) * 1e4).round() / 1e4
         });
         None
@@ -939,7 +983,7 @@ impl ModelEditor {
         ops::delete(&mut self.model, &mut self.selection, SelectMode::Piece);
         None
       }
-      Tool::Select | Tool::Paint | Tool::Picker => None
+      Tool::Select | Tool::Paint | Tool::Picker | Tool::BuildFromCorners => None
     };
     if let Some((kind, normal)) = drag {
       self.start_modal_after(kind, at, true, undo, normal, self.tool.name())
@@ -950,9 +994,7 @@ impl ModelEditor {
   }
 
   /// Redoes the modal operation for the pointer at `at`.
-  fn update_modal(&mut self, projector: &Projector, at: Vec2, invert_snap: bool) {
-    let snap = self.snap != invert_snap;
-    let grid = self.grid_step;
+  fn update_modal(&mut self, projector: &Projector, at: Vec2) {
     let Some(modal) = &mut self.modal else { return };
     let typed = modal.typed.parse::<f32>().ok();
     let pivot = modal.pivot;
@@ -964,8 +1006,6 @@ impl ModelEditor {
       Axis::Z => Vec3::Z,
       Axis::Normal => modal.normal.unwrap_or(Vec3::Y)
     });
-    let round =
-      |value: f32, step: f32| if snap { (value / step).round() * step } else { value };
     let mut model = modal.base.clone();
     let mut selection = modal.base_selection.clone();
     let selected = modal.base_selection.iter().copied().collect::<Vec<_>>();
@@ -975,31 +1015,17 @@ impl ModelEditor {
     match modal.kind {
       ModalKind::Grab => {
         let offset = if let Some(axis) = axis {
-          // The point on the axis line nearest the pointer's ray.
-          let along = |at: Vec2| {
-            let ray = projector.ray(at);
-            let (d, r, w) = (axis, *ray.direction, pivot - ray.origin);
-            let (b, denominator) = (d.dot(r), 1.0 - d.dot(r).powi(2));
-            if denominator.abs() < 1e-5 {
-              0.0
-            } else {
-              (b * r.dot(w) - d.dot(w)) / denominator
-            }
-          };
-          let distance =
-            typed.unwrap_or_else(|| round(along(at) - along(modal.start), grid));
+          let along = |at: Vec2| projector.along(at, pivot, axis);
+          let distance = typed.unwrap_or_else(|| along(at) - along(modal.start));
           modal.amount = format!("{distance:.3}");
           axis * distance
         } else if let Some(typed) = typed {
           modal.amount = format!("{typed:.3}");
           Vec3::X * typed
         } else {
-          let offset = (projector.on_plane(at, pivot)
-            - projector.on_plane(modal.start, pivot))
-          .to_array()
-          .map(|component| round(component, grid));
-          // The wheel pushes it straight along the view, a grid step a notch.
-          let offset = Vec3::from_array(offset) + projector.forward * grid * modal.depth;
+          // The wheel pushes it straight along the view.
+          let offset = projector.on_plane(at, pivot) - projector.on_plane(modal.start, pivot)
+            + projector.forward * Self::WHEEL_STEP * modal.depth;
           modal.amount = format!("{:.3}, {:.3}, {:.3}", offset.x, offset.y, offset.z);
           offset
         };
@@ -1011,9 +1037,7 @@ impl ModelEditor {
         let axis = axis.unwrap_or(projector.forward);
         let degrees = typed.unwrap_or_else(|| {
           let degrees = (screen_angle + 540.0) % 360.0 - 180.0;
-          let degrees =
-            if axis.dot(projector.forward) < 0.0 { -degrees } else { degrees };
-          round(degrees, Self::SNAP_DEGREES)
+          if axis.dot(projector.forward) < 0.0 { -degrees } else { degrees }
         });
         modal.amount = format!("{degrees:.1}°");
         let rotation = Quat::from_axis_angle(axis, degrees.to_radians());
@@ -1021,9 +1045,7 @@ impl ModelEditor {
       }
       ModalKind::Scale => {
         let start = (modal.start - pivot_screen).length().max(1.0);
-        let factor = typed.unwrap_or_else(|| {
-          round((at - pivot_screen).length() / start, Self::SNAP_SCALE)
-        });
+        let factor = typed.unwrap_or_else(|| (at - pivot_screen).length() / start);
         modal.amount = format!("×{factor:.3}");
         transform(&|p| match axis {
           Some(axis) => p + (factor - 1.0) * (p - pivot).dot(axis) * axis,
@@ -1033,9 +1055,7 @@ impl ModelEditor {
       ModalKind::Inset => {
         let start = (modal.start - pivot_screen).length().max(20.0);
         let amount = typed
-          .unwrap_or_else(|| {
-            round(1.0 - (at - pivot_screen).length() / start, Self::SNAP_INSET)
-          })
+          .unwrap_or_else(|| 1.0 - (at - pivot_screen).length() / start)
           .clamp(0.0, 0.99);
         modal.amount = format!("{amount:.2}");
         ops::inset(&mut model, &mut selection, amount)
@@ -1052,6 +1072,55 @@ impl ModelEditor {
     }
     self.model = model;
     self.selection = selection
+  }
+
+  // Building from corners.
+
+  /// The shape the corners make with the one the pointer would put down, while building.
+  fn new_shape_hull(&self) -> Option<LowPoly> {
+    let NewShape { corners, cursor, .. } = &self.new_shape;
+    (self.tool == Tool::BuildFromCorners)
+      .then(|| {
+        let points = [corners.as_slice(), cursor.as_slice()].concat();
+        ops::convex_hull(&points, -self.view.forward(), &self.look())
+      })
+      .flatten()
+  }
+
+  /// Adds the shape around the corners to the model, ready for the next.
+  fn build_shape(&mut self) {
+    match ops::convex_hull(&self.new_shape.corners, -self.view.forward(), &self.look()) {
+      Some(part) => {
+        self.edit(|editor| ops::append(&mut editor.model, &mut editor.selection, part));
+        self.selection.clear();
+        self.new_shape.corners.clear()
+      }
+      None => self.status = "Put down at least three corners, not all in a line".into()
+    }
+  }
+
+  /// Where pressing at `at` puts a corner: on a corner or a model vertex near the
+  /// pointer, or on the model under it, or else as deep in the view as the middle of the
+  /// corners so far, or the middle of the view.
+  fn corner_at(&self, projector: &Projector, at: Vec2) -> Option<Vec3> {
+    let NewShape { corners, .. } = &self.new_shape;
+    let vertices = (0..self.model.vertices.len())
+      .filter(|&v| self.vertex_visible(v))
+      .map(|v| self.model.vertices[v]);
+    let ray = projector.ray(at);
+    let middle = (!corners.is_empty())
+      .then(|| corners.iter().sum::<Vec3>() / corners.len() as f32)
+      .unwrap_or(self.view.target);
+    corners
+      .iter()
+      .copied()
+      .chain(vertices)
+      .filter_map(|p| projector.project(p).map(|on_screen| (p, on_screen.distance(at))))
+      .filter(|&(_, distance)| distance < PICK_VERTEX)
+      .min_by(|(_, a), (_, b)| a.total_cmp(b))
+      .map(|(p, _)| p)
+      .or_else(|| self.face_hit(projector, at).map(|(_, t)| ray.get_point(t)))
+      .or_else(|| Some(projector.on_plane(at, middle)))
   }
 
   // Shortcuts.
@@ -1087,7 +1156,8 @@ impl ModelEditor {
     if save {
       self.save(library)
     }
-    if undo {
+    // Undoing while building takes back the last corner first.
+    if undo && !(self.tool == Tool::BuildFromCorners && self.new_shape.corners.pop().is_some()) {
       self.undo()
     }
     if redo {
@@ -1135,12 +1205,18 @@ impl ModelEditor {
           }
         }
       } else if self.simple {
+        let building = self.tool == Tool::BuildFromCorners;
         if let Some(tool) = Tool::SIMPLE.into_iter().find(|tool| tool.key() == key) {
           self.tool = tool
         } else if key == Key::Home {
           self.frame(false)
+        } else if building && key == Key::Enter {
+          self.build_shape()
+        } else if building && key == Key::Backspace {
+          self.new_shape.corners.pop();
         } else if key == Key::Escape {
-          self.selection.clear()
+          self.selection.clear();
+          self.new_shape.corners.clear()
         } else if key == Key::N {
           self.new_material(library)
         }
@@ -1252,15 +1328,6 @@ impl ModelEditor {
       ui.selectable_value(&mut self.tool, Tool::Paint, "Paint  B");
       ui.selectable_value(&mut self.tool, Tool::Picker, "Pick material  Q");
       ui.separator();
-      ui.toggle_value(&mut self.snap, "Snap")
-        .on_hover_text("Hold Ctrl to flip while transforming");
-      ui.add(
-        egui::DragValue::new(&mut self.grid_step)
-          .range(0.01..=4.0)
-          .speed(0.01)
-          .max_decimals(3)
-      )
-      .on_hover_text("Grid step snapping moves by");
       ui.toggle_value(&mut self.mirror_x, "Mirror X")
         .on_hover_text("Moving a vertex moves its mirror image across x = 0 too");
       ui.toggle_value(&mut self.xray, "X-ray  Z").on_hover_text("Select through faces");
@@ -1293,8 +1360,6 @@ impl ModelEditor {
         self.redo()
       }
       ui.separator();
-      ui.toggle_value(&mut self.snap, "Snap to grid")
-        .on_hover_text("Moves in steps. Hold Ctrl while dragging to move freely");
       ui.toggle_value(&mut self.mirror_x, "Mirror left/right")
         .on_hover_text("Changing one side of the model changes the other side the same way");
       ui.separator();
@@ -1374,6 +1439,15 @@ impl ModelEditor {
             ui.selectable_value(&mut self.turn_degrees, degrees, format!("{degrees}°"));
           })
         });
+      }
+      if self.tool == Tool::BuildFromCorners {
+        ui.label(format!(
+          "made of {}",
+          if self.material.is_empty() { "Plain" } else { &self.material }
+        ));
+        if Self::big_button(ui, "Build shape", "Enter", "Makes the shape around the corners") {
+          self.build_shape()
+        }
       }
 
       ui.separator();
@@ -1660,7 +1734,8 @@ impl ModelEditor {
             .on_hover_text("Click to paint with it · double click to change it");
           if response.clicked() {
             self.material.clone_from(name);
-            if self.simple {
+            // Building keeps building, with the new material.
+            if self.simple && self.tool != Tool::BuildFromCorners {
               self.tool = Tool::Paint
             }
           }
@@ -1814,8 +1889,8 @@ impl ModelEditor {
     self.xray || self.visibility.as_ref().is_some_and(|(_, _, vertices, _)| vertices[v])
   }
 
-  /// The face under the pointer, nearest first.
-  fn pick_face(&self, projector: &Projector, at: Vec2) -> Option<usize> {
+  /// The nearest face under the pointer, and how far along the pointer's ray.
+  fn face_hit(&self, projector: &Projector, at: Vec2) -> Option<(usize, f32)> {
     let ray = projector.ray(at);
     self
       .triangles()
@@ -1827,7 +1902,11 @@ impl ModelEditor {
         ray_triangle(ray.origin, *ray.direction, triangle).map(|t| (f, t))
       })
       .min_by(|(_, a), (_, b)| a.total_cmp(b))
-      .map(|(f, _)| f)
+  }
+
+  /// The face under the pointer, nearest first.
+  fn pick_face(&self, projector: &Projector, at: Vec2) -> Option<usize> {
+    self.face_hit(projector, at).map(|(f, _)| f)
   }
 
   fn pick(&self, projector: &Projector, at: Vec2) -> Option<Hit> {
@@ -1988,6 +2067,25 @@ impl ModelEditor {
 
     let projector = self.view.projector(rect);
     self.update_visibility(&projector);
+    // The corner being pushed goes along its line as far as the pointer has gone up,
+    // or comes back as far as it's gone down. Otherwise, where the next would go.
+    let count = self.new_shape.corners.len();
+    self.new_shape.cursor = if let Some(Pushing { corner, ray, start, from, .. }) =
+      self.new_shape.pushing.filter(|pushing| pushing.corner < count)
+    {
+      let along = start + (from.y - at.y) * self.view.units_per_point(rect) * 2.0;
+      self.new_shape.corners[corner] = ray.get_point(along.max(NEAR * 2.0));
+      Some(self.new_shape.corners[corner])
+    } else if self.simple
+      && self.tool == Tool::BuildFromCorners
+      && response.hovered()
+      && self.orbit.is_none()
+      && self.modal.is_none()
+    {
+      self.corner_at(&projector, at)
+    } else {
+      None
+    };
 
     // Using the tools.
     if self.modal.is_some() {
@@ -2005,7 +2103,7 @@ impl ModelEditor {
       } else if pressed.contains(&PointerButton::Secondary) {
         self.finish_modal(false)
       } else {
-        self.update_modal(&projector, at, modifiers.command)
+        self.update_modal(&projector, at)
       }
       self.press = None
     } else if self.orbit == Some(PointerButton::Primary) {
@@ -2013,7 +2111,7 @@ impl ModelEditor {
       self.arrow_hover = None
     } else {
       self.arrow_hover = response.hovered().then(|| self.arrow_at(&projector, at)).flatten();
-      self.hover = if self.arrow_hover.is_some() {
+      self.hover = if self.arrow_hover.is_some() || self.tool == Tool::BuildFromCorners {
         None
       } else {
         response.hovered().then(|| self.pick(&projector, at)).flatten()
@@ -2026,6 +2124,26 @@ impl ModelEditor {
           modal.axis = Some(axis)
         }
         self.press = None
+      } else if pressed_here
+        && self.tool == Tool::BuildFromCorners
+        && let Some(cursor) = self.new_shape.cursor
+      {
+        // The line from the camera through the corner.
+        let ray = projector.ray(projector.project(cursor).unwrap_or(at));
+        let start = (cursor - ray.origin).dot(*ray.direction);
+        let ray = Ray3d::new(cursor - *ray.direction * start, ray.direction);
+        let NewShape { corners, pushing, .. } = &mut self.new_shape;
+        let existing = corners.iter().position(|c| c.distance(cursor) < ops::EPSILON);
+        if existing.is_none() {
+          corners.push(cursor)
+        }
+        *pushing = Some(Pushing {
+          corner: existing.unwrap_or(corners.len() - 1),
+          ray,
+          start,
+          from: at,
+          new: existing.is_none()
+        })
       } else if pressed_here && self.tool == Tool::Picker {
         if let Some(Hit::Face(f)) = self.hover {
           self.material.clone_from(&self.model.faces[f].material);
@@ -2069,6 +2187,18 @@ impl ModelEditor {
       }
       match self.tool {
         Tool::Picker => self.press = None,
+        // Clicking a corner takes it away. Dragging leaves it where it was pushed.
+        Tool::BuildFromCorners => {
+          let NewShape { corners, pushing, .. } = &mut self.new_shape;
+          if !down
+            && let Some(Pushing { corner, from, new, .. }) = pushing.take()
+            && from.distance(at) <= DRAG_START
+            && !new
+            && corner < corners.len()
+          {
+            corners.remove(corner);
+          }
+        }
         // Simple mode tools only get here pressing on nothing, which clicked lets go of
         // what was picked and dragged turns the view, or with Shift: clicking picks more,
         // dragging draws a lasso around more.
@@ -2168,6 +2298,10 @@ impl ModelEditor {
       );
     }
     self.draw_mesh_overlay(&painter, &projector);
+    if self.tool == Tool::BuildFromCorners {
+      self.draw_new_shape(&painter, &projector);
+      self.draw_side_view(&painter, rect)
+    }
     self.draw_arrows(&painter, &projector);
     self.draw_axes_gizmo(&painter, rect);
     if let Some(lasso) = &self.lasso {
@@ -2205,7 +2339,7 @@ impl ModelEditor {
         modal.amount,
         modal.axis.map_or(String::new(), |axis| format!("  along {}", axis.name())),
         if modal.drag {
-          "let go to finish · hold Ctrl to move off the grid"
+          "let go to finish"
         } else {
           "move the mouse, click to finish · type a number for an exact amount"
         },
@@ -2213,7 +2347,7 @@ impl ModelEditor {
       )
     } else if let Some(modal) = &self.modal {
       format!(
-        "{}  {}{}{}   ·   X Y Z{} lock an axis{} · type a number · Ctrl {} snapping · Enter/click done · Esc/right click cancel",
+        "{}  {}{}   ·   X Y Z{} lock an axis{} · type a number · Enter/click done · Esc/right click cancel",
         modal.label,
         if modal.typed.is_empty() {
           modal.amount.clone()
@@ -2221,14 +2355,14 @@ impl ModelEditor {
           format!("[{}]", modal.typed)
         },
         modal.axis.map_or(String::new(), |axis| format!("  along {}", axis.name())),
-        if (self.snap) != modifiers.command { "  snapped" } else { "" },
         if modal.normal.is_some() { " N" } else { "" },
-        wheel(modal),
-        if self.snap { "frees" } else { "turns on" }
+        wheel(modal)
       )
     } else if !self.status.is_empty() {
       self.status.clone()
-    } else if self.simple && !matches!(self.tool, Tool::Paint | Tool::Picker) {
+    } else if self.simple
+      && !matches!(self.tool, Tool::Paint | Tool::Picker | Tool::BuildFromCorners)
+    {
       format!("{} · Shift click, or Shift drag around things, picks several to do together · Esc lets go", self.tool.hint())
     } else {
       self.tool.hint().into()
@@ -2272,7 +2406,9 @@ impl ModelEditor {
         }
       })
     }
-    if self.mode == SelectMode::Vertex && matches!(self.tool, Tool::Select | Tool::Move) {
+    if self.mode == SelectMode::Vertex
+      && matches!(self.tool, Tool::Select | Tool::Move | Tool::BuildFromCorners)
+    {
       (0..self.model.vertices.len()).for_each(|v| {
         if (vertices_seen[v] || self.xray)
           && let Some(p) = on_screen(v)
@@ -2341,6 +2477,170 @@ impl ModelEditor {
       let stroke = Stroke::new(1.0, Color32::WHITE);
       painter.line_segment([p - egui::vec2(5.0, 0.0), p + egui::vec2(5.0, 0.0)], stroke);
       painter.line_segment([p - egui::vec2(0.0, 5.0), p + egui::vec2(0.0, 5.0)], stroke);
+    }
+  }
+
+  /// While building from corners: the corners, the edges of the shape they make, and a
+  /// line from each corner down to the ground ending in a ring on it.
+  fn draw_new_shape(&self, painter: &egui::Painter, projector: &Projector) {
+    let NewShape { corners, cursor, .. } = &self.new_shape;
+    let line = |a: Vec3, b: Vec3, stroke: Stroke| {
+      if let Some(points) = projector.segment(a, b) {
+        painter.line_segment(points, stroke);
+      }
+    };
+
+    // Its shadow on the ground, straight below it.
+    let flat = corners.iter().chain(cursor).map(|p| p.with_y(0.0)).collect::<Vec<_>>();
+    if let Some(shadow) = ops::convex_hull(&flat, Vec3::Y, &default())
+      && let Some(outline) =
+        shadow.vertices.iter().map(|&p| projector.project(p).map(to_pos)).collect()
+    {
+      painter.add(egui::Shape::convex_polygon(
+        outline,
+        Color32::from_black_alpha(70),
+        Stroke::new(1.0, Color32::from_black_alpha(120))
+      ));
+    }
+
+    // The shape's edges.
+    if let Some(hull) = self.new_shape_hull() {
+      ops::edges(&hull).into_iter().for_each(|(a, b)| {
+        line(hull.vertices[a], hull.vertices[b], Stroke::new(1.5, Color32::from_white_alpha(170)))
+      })
+    }
+
+    let ring_radius = self.view.units_per_point(projector.rect) * 5.0;
+    let drop = |p: Vec3, color: Color32| {
+      let foot = p.with_y(0.0);
+      if p.y.abs() > ops::EPSILON {
+        line(p, foot, Stroke::new(1.0, color));
+        let ring = (0..16)
+          .filter_map(|i| {
+            let angle = i as f32 / 16.0 * std::f32::consts::TAU;
+            projector
+              .project(foot + Vec3::new(angle.cos(), 0.0, angle.sin()) * ring_radius)
+              .map(to_pos)
+          })
+          .collect::<Vec<_>>();
+        painter.add(egui::Shape::closed_line(ring, Stroke::new(1.0, color)));
+      }
+    };
+    corners.iter().for_each(|&corner| drop(corner, SELECTED.gamma_multiply(0.6)));
+    if let &Some(cursor) = cursor {
+      drop(cursor, HOVERED.gamma_multiply(0.8))
+    }
+    // Where the corner being placed is: short lines along the axes through it, shrinking
+    // with distance, and dimmed where the model hides it.
+    if let &Some(cursor) = cursor {
+      let length = ring_radius * 4.0;
+      let hidden = !self.sees(projector, &self.triangles(), cursor, |_| false);
+      let alpha = if hidden { 0.35 } else { 1.0 };
+      (0..3).for_each(|axis| {
+        let along = Vec3::AXES[axis] * length;
+        line(cursor - along, cursor + along, Stroke::new(2.0, AXIS_COLORS[axis].gamma_multiply(alpha)))
+      })
+    }
+    corners.iter().filter_map(|&corner| projector.project(corner)).for_each(|p| {
+      painter.circle(to_pos(p), 4.5, SELECTED, Stroke::new(1.0, Color32::from_black_alpha(180)));
+    });
+    if let &Some(cursor) = cursor
+      && let Some(p) = projector.project(cursor).map(to_pos)
+    {
+      painter.circle_stroke(p, 7.0, Stroke::new(2.0, HOVERED));
+      painter.circle_filled(p, 2.5, HOVERED);
+      let text = format!("{:.3}  {:.3}  {:.3}", cursor.x, cursor.y, cursor.z);
+      let galley =
+        painter.layout_no_wrap(text, egui::FontId::monospace(11.0), Color32::WHITE);
+      let corner = p + egui::vec2(12.0, -galley.size().y - 6.0);
+      painter.rect_filled(
+        egui::Rect::from_min_size(corner, galley.size()).expand(2.0),
+        2.0,
+        Color32::from_black_alpha(150)
+      );
+      painter.galley(corner, galley, Color32::WHITE);
+    }
+  }
+
+  /// A small view from the side, while building: the line from the camera through the
+  /// next corner seen side on, the camera off to the left, so how deep the corner is
+  /// shows as how far along the line it is, among the model and the other corners.
+  fn draw_side_view(&self, painter: &egui::Painter, rect: egui::Rect) {
+    let NewShape { corners, cursor, .. } = &self.new_shape;
+    if let &Some(cursor) = cursor {
+      let size = (rect.width().min(rect.height()) * 0.4).max(140.0);
+      let inset = egui::Rect::from_min_size(
+        rect.right_bottom() - egui::vec2(size + 8.0, size + 8.0),
+        egui::vec2(size, size)
+      );
+      let painter = painter.with_clip_rect(inset);
+      painter.rect_filled(inset, 4.0, Color32::from_black_alpha(190));
+      painter.rect_stroke(
+        inset,
+        4.0,
+        Stroke::new(1.0, Color32::from_white_alpha(60)),
+        egui::StrokeKind::Inside
+      );
+
+      // Looking across the view: its forward runs left to right, up stays up.
+      let forward = self.view.forward();
+      let across = forward.with_y(0.0).normalize_or(Vec3::NEG_Z);
+      let points = self.model.vertices.iter().chain(corners).copied().collect::<Vec<_>>();
+      let middle = (points.iter().copied().reduce(Vec3::min).zip(points.iter().copied().reduce(Vec3::max)))
+        .map_or(cursor, |(min, max)| (min + max) / 2.0);
+      let reach = points
+        .iter()
+        .chain([&cursor])
+        .map(|&p| {
+          let offset = p - middle;
+          offset.dot(across).abs().max(offset.y.abs())
+        })
+        .fold(1.0f32, f32::max);
+      let side = View {
+        target: middle,
+        yaw: self.view.yaw + FRAC_PI_2,
+        pitch: 0.0,
+        distance: reach * 2.4 / (2.0 * (FOV / 2.0).tan()),
+        ortho: true,
+        auto_ortho: false
+      };
+      let projector = side.projector(inset);
+      let line = |a: Vec3, b: Vec3, stroke: Stroke| {
+        if let Some(points) = projector.segment(a, b) {
+          painter.line_segment(points, stroke);
+        }
+      };
+
+      let ground = middle.with_y(0.0);
+      line(ground - across * 1000.0, ground + across * 1000.0, Stroke::new(1.0, Color32::from_white_alpha(50)));
+      ops::edges(&self.model).into_iter().for_each(|(a, b)| {
+        line(self.model.vertices[a], self.model.vertices[b], Stroke::new(1.0, Color32::from_white_alpha(80)))
+      });
+      if let Some(hull) = self.new_shape_hull() {
+        ops::edges(&hull).into_iter().for_each(|(a, b)| {
+          line(hull.vertices[a], hull.vertices[b], Stroke::new(1.5, Color32::from_white_alpha(170)))
+        })
+      }
+      // The line the corner is on, from the camera.
+      let direction = if self.view.ortho {
+        forward
+      } else {
+        (cursor - self.view.eye()).normalize_or(forward)
+      };
+      let ray = Color32::from_rgb(0x78, 0xb4, 0xff);
+      line(cursor - direction * 1000.0, cursor + direction * 1000.0, Stroke::new(1.0, ray.gamma_multiply(0.6)));
+      if !self.view.ortho
+        && let Some(eye) = projector.project(self.view.eye())
+      {
+        painter.circle_filled(to_pos(eye), 4.0, ray);
+      }
+      corners.iter().filter_map(|&corner| projector.project(corner)).for_each(|p| {
+        painter.circle(to_pos(p), 3.5, SELECTED, Stroke::new(1.0, Color32::from_black_alpha(180)));
+      });
+      if let Some(p) = projector.project(cursor).map(to_pos) {
+        painter.circle_stroke(p, 6.0, Stroke::new(2.0, HOVERED));
+        painter.circle_filled(p, 2.5, HOVERED);
+      }
     }
   }
 
@@ -2529,14 +2829,20 @@ fn sync_preview(
         layer.clone()
       ))
       .id();
-    let model = commands.spawn((Transform::default(), Visibility::default(), layer)).id();
+    let model =
+      commands.spawn((Transform::default(), Visibility::default(), layer.clone())).id();
+    let ghost =
+      commands.spawn((Transform::default(), Visibility::default(), NotShadowCaster, layer)).id();
     commands.insert_resource(Preview {
       camera,
       model,
       image,
       materials: default(),
       materials_for: (u64::MAX, false),
-      built: None
+      built: None,
+      ghost,
+      ghost_materials: default(),
+      ghost_built: None
     });
     return;
   };
@@ -2564,7 +2870,55 @@ fn sync_preview(
   let materials_for = (model_materials.revision, editor.backfaces);
   if preview.materials_for != materials_for {
     preview.materials.clear();
+    preview.ghost_materials.clear();
+    preview.ghost_built = None;
     preview.materials_for = materials_for
+  }
+
+  let light = Vec3::new(0.35, 1.0, 0.55).normalize();
+  let fill = Vec3::new(-0.6, -0.2, -0.4).normalize();
+  let ghost = (editor.new_shape_hull(), model_materials.revision);
+  if preview.ghost_built.as_ref() != Some(&ghost) {
+    let mesh = ghost.0.as_ref().and_then(|hull| {
+      hull
+        .meshes_with(
+          |name| model_materials.get(name),
+          |_, color, normal| {
+            (color.color().to_linear() * (0.7 + 0.3 * normal.dot(light).max(0.0)))
+              .with_alpha(0.5)
+          }
+        )
+        .into_iter()
+        .next()
+    });
+    let mut entity = commands.entity(preview.ghost);
+    match mesh {
+      Some((name, mesh)) => {
+        let material = preview
+          .ghost_materials
+          .entry(name.clone())
+          .or_insert_with(|| {
+            let material = model_materials.get(&name).cloned().unwrap_or_default();
+            let texture = model_materials.texture_of(&name, images);
+            materials.add(StandardMaterial {
+              unlit: true,
+              // The vertex colors bring the material's color, shaded and see-through.
+              base_color: Color::WHITE,
+              emissive: LinearRgba::BLACK,
+              emissive_texture: None,
+              alpha_mode: AlphaMode::Blend,
+              // Its far side shows through its near side.
+              double_sided: true,
+              cull_mode: None,
+              ..material.standard(texture)
+            })
+          })
+          .clone();
+        entity.insert((Mesh3d(meshes.add(mesh)), MeshMaterial3d(material)))
+      }
+      None => entity.remove::<(Mesh3d, MeshMaterial3d<StandardMaterial>)>()
+    };
+    preview.ghost_built = Some(ghost)
   }
 
   let hovered_face = match editor.hover {
@@ -2582,8 +2936,6 @@ fn sync_preview(
     return;
   }
   let (model, selection, hovered, _) = &state;
-  let light = Vec3::new(0.35, 1.0, 0.55).normalize();
-  let fill = Vec3::new(-0.6, -0.2, -0.4).normalize();
   let glowing = |f: usize| {
     model_materials.get(&model.faces[f].material).is_some_and(ModelMaterial::glows)
   };
@@ -2652,18 +3004,11 @@ fn draw_grid(editor: Res<ModelEditor>, mut gizmos: Gizmos<ModelGizmos>) {
     .fold(4.0f32, f32::max)
     .ceil()
     + 1.0;
-  let mut lines = |step: f32, color: Color, skip: &dyn Fn(f32) -> bool| {
-    let count = (extent / step).round() as i32;
-    (-count..=count).map(|i| i as f32 * step).filter(|&x| !skip(x)).for_each(|x| {
-      gizmos.line(Vec3::new(x, 0.0, -extent), Vec3::new(x, 0.0, extent), color);
-      gizmos.line(Vec3::new(-extent, 0.0, x), Vec3::new(extent, 0.0, x), color)
-    })
-  };
-  let minor = editor.grid_step;
-  if minor < 1.0 && extent / minor <= 64.0 {
-    lines(minor, Color::srgba(1.0, 1.0, 1.0, 0.035), &|x| (x.round() - x).abs() < 1e-4)
-  }
-  lines(1.0, Color::srgba(1.0, 1.0, 1.0, 0.11), &|x| x == 0.0);
+  let color = Color::srgba(1.0, 1.0, 1.0, 0.11);
+  (-extent as i32..=extent as i32).filter(|&x| x != 0).map(|x| x as f32).for_each(|x| {
+    gizmos.line(Vec3::new(x, 0.0, -extent), Vec3::new(x, 0.0, extent), color);
+    gizmos.line(Vec3::new(-extent, 0.0, x), Vec3::new(extent, 0.0, x), color)
+  });
   let [x, y, z] = AXIS_COLORS.map(|color| {
     let [r, g, b, _] = color.to_array();
     Color::srgb_u8(r, g, b)

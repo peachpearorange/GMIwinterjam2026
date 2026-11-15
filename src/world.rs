@@ -1,11 +1,11 @@
-//! The designed world: the painted [`Terrain`], placed 3D models, billboards and named
-//! markers. Authored in the editor, saved to
+//! The designed world: the painted [`Terrain`], placed 3D models, billboards, lights and
+//! named markers. Authored in the editor, saved to
 //! [`WorldFile::NAME`] in [`ASSETS_DIR`], and loaded through [`WorldPlugin`].
 
 use {crate::{assets::{self, ASSETS_DIR},
              billboard::{self, Billboard, PlacedBillboard},
              material::ModelMaterials,
-             model::{MODEL_EXTENSION, ModelMeshes},
+             model::{MODEL_EXTENSION, ModelMeshes, Rgb},
              scene::{self, SunLight},
              terrain::{self, Terrain, add_legacy_materials}},
      bevy::{asset::RenderAssetUsages,
@@ -114,6 +114,57 @@ fn show_low_poly_models(
     });
 }
 
+/// A placed light shining all around from its [`Transform`]. Spawn it with one and its
+/// [`PointLight`] gets attached.
+#[derive(Component, Clone, Copy, PartialEq, Debug)]
+pub struct Light {
+  pub color: Rgb,
+  /// Lumens.
+  pub intensity: f32,
+  /// How far its light reaches, in world units.
+  pub range: f32,
+  /// Whether things in its light cast shadows. Costly with many lights.
+  pub shadows: bool
+}
+
+/// Gives new lights, and ones whose settings changed, their [`PointLight`].
+fn show_lights(lights: Query<(Entity, &Light), Changed<Light>>, mut commands: Commands) {
+  lights.iter().for_each(|(entity, &Light { color, intensity, range, shadows })| {
+    commands.entity(entity).insert(PointLight {
+      color: color.color(),
+      intensity,
+      range,
+      shadow_maps_enabled: shadows,
+      ..default()
+    });
+  })
+}
+
+/// A light as saved in the world file.
+#[derive(Serialize, Deserialize)]
+pub struct PlacedLight {
+  pub position: Vec3,
+  pub color: Rgb,
+  pub intensity: f32,
+  pub range: f32,
+  #[serde(default)]
+  pub shadows: bool
+}
+
+impl PlacedLight {
+  pub fn spawn(self) -> (Light, Transform) {
+    let Self { position, color, intensity, range, shadows } = self;
+    (Light { color, intensity, range, shadows }, Transform::from_translation(position))
+  }
+
+  pub fn collect(
+    &Light { color, intensity, range, shadows }: &Light,
+    &Transform { translation: position, .. }: &Transform
+  ) -> Self {
+    Self { position, color, intensity, range, shadows }
+  }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct PlacedMarker {
   pub name: String,
@@ -142,6 +193,8 @@ pub struct WorldFile {
   pub models: Vec<PlacedModel>,
   #[serde(default)]
   pub billboards: Vec<PlacedBillboard>,
+  #[serde(default)]
+  pub lights: Vec<PlacedLight>,
   pub terrain: Terrain
 }
 
@@ -151,6 +204,7 @@ impl Default for WorldFile {
       markers: default(),
       models: default(),
       billboards: default(),
+      lights: default(),
       terrain: Terrain::flat(64, 64, 2.0, "snow")
     }
   }
@@ -190,7 +244,8 @@ impl WorldFile {
     terrain: &Terrain,
     markers: impl IntoIterator<Item = (&'a Marker, &'a Transform)>,
     models: impl IntoIterator<Item = (&'a Model, &'a Transform)>,
-    billboards: impl IntoIterator<Item = (&'a Billboard, &'a Transform)>
+    billboards: impl IntoIterator<Item = (&'a Billboard, &'a Transform)>,
+    lights: impl IntoIterator<Item = (&'a Light, &'a Transform)>
   ) -> Self {
     Self {
       markers: markers
@@ -212,15 +267,20 @@ impl WorldFile {
         .into_iter()
         .map(|(billboard, transform)| PlacedBillboard::collect(billboard, transform))
         .collect(),
+      lights: lights
+        .into_iter()
+        .map(|(light, transform)| PlacedLight::collect(light, transform))
+        .collect(),
       terrain: terrain.clone()
     }
   }
 
-  /// Makes this the live world: the [`Terrain`] resource plus [`Marker`], [`Model`] and
-  /// [`Billboard`] entities. Doesn't remove what is already there.
+  /// Makes this the live world: the [`Terrain`] resource plus [`Marker`], [`Model`],
+  /// [`Billboard`] and [`Light`] entities. Doesn't remove what is already there.
   pub fn spawn(self, commands: &mut Commands) {
-    let Self { markers, models, billboards, terrain } = self;
+    let Self { markers, models, billboards, lights, terrain } = self;
     commands.spawn_batch(billboards.into_iter().map(PlacedBillboard::spawn));
+    commands.spawn_batch(lights.into_iter().map(PlacedLight::spawn));
     commands.insert_resource(terrain);
     commands.spawn_batch(markers.into_iter().map(|PlacedMarker { name, position }| {
       (Marker { name }, Transform::from_translation(position))
@@ -254,6 +314,6 @@ impl Plugin for WorldPlugin {
       .init_resource::<ModelMaterials>()
       .add_plugins((billboard::plugin, scene::plugin, terrain::plugin))
       .add_systems(Startup, load_world)
-      .add_systems(Update, (attach_model_scenes, show_low_poly_models));
+      .add_systems(Update, (attach_model_scenes, show_low_poly_models, show_lights));
   }
 }
