@@ -289,7 +289,7 @@ pub(super) struct WorldPointer {
 pub(super) struct ReadPointer;
 
 /// Points with the mouse.
-fn read_mouse(
+pub(super) fn read_mouse(
   editor: Res<WorldEditor>,
   camera: Single<(&Camera, &GlobalTransform), With<FreeCamera>>,
   window: Single<&Window>,
@@ -336,7 +336,7 @@ struct Stroke {
 
 /// The state of the world editor: the active tool and every tool's settings.
 #[derive(Resource)]
-struct WorldEditor {
+pub(super) struct WorldEditor {
   tool: Tool,
   height_brush: HeightBrush,
   /// The library material painting the ground lays down.

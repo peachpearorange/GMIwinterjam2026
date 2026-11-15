@@ -2852,7 +2852,8 @@ fn sync_preview(
       None
     ))
   };
-  let shown = *mode.get() == Mode::Edit && *open == Editor::Models;
+  // Also while a VR headset shows the model.
+  let shown = *mode.get() == Mode::Edit && *open == Editor::Models || editor.vr_toward.is_some();
   let layer = RenderLayers::layer(LAYER);
   let Some(mut preview) = preview else {
     if !shown {
@@ -3075,9 +3076,14 @@ pub fn plugin(app: &mut App) {
       Update,
       (
         sync_preview,
-        draw_grid
-          .run_if(in_state(Mode::Edit))
-          .run_if(|editor: Res<Editor>| *editor == Editor::Models)
+        draw_grid.run_if(|mode: Res<State<Mode>>, open: Res<Editor>, editor: Res<ModelEditor>| {
+          *mode.get() == Mode::Edit && *open == Editor::Models || editor.vr_toward.is_some()
+        })
       )
     );
+  #[cfg(feature = "vr")]
+  app.add_systems(
+    Update,
+    vr::use_vr_tools.after(super::vr::PointerSet).before(sync_preview)
+  );
 }

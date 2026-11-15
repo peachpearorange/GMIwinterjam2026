@@ -11,6 +11,8 @@ mod model_editor;
 mod pixel_editor;
 mod scene_editor;
 mod ui_editor;
+#[cfg(feature = "vr")]
+pub mod vr;
 mod world_editor;
 
 use {crate::{Mode, start_transform},
@@ -245,7 +247,10 @@ pub fn plugin(app: &mut App) {
       model_editor::plugin,
       material_editor::plugin,
       ui_editor::plugin
-    ))
+    ));
+  #[cfg(feature = "vr")]
+  app.add_plugins(vr::plugin);
+  app
     .init_resource::<Editor>()
     .init_resource::<EditCamera>()
     .add_systems(Update, (toggle_mode, enable_camera))

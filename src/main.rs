@@ -82,10 +82,14 @@ fn spawn_camera(mut commands: Commands, markers: Markers, settings: Res<SceneSet
 
 fn main() {
   let mut app = App::new();
+  let plugins = DefaultPlugins.build();
+  // Shows the game in a VR headset when an OpenXR runtime is running.
+  #[cfg(feature = "vr")]
+  let plugins = editor::vr::xr_plugins(plugins);
   app
     .add_plugins(assets::plugin)
     .add_plugins((
-      DefaultPlugins.set(WindowPlugin {
+      plugins.set(WindowPlugin {
         primary_window: Some(Window { title: "Winter Jam 2026".into(), ..default() }),
         ..default()
       }),
