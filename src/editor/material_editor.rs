@@ -320,8 +320,6 @@ impl MaterialEditor {
             );
           }
         });
-        ui.checkbox(&mut material.double_sided, "Two-sided")
-          .on_hover_text("Shows the back of faces, for single sheets like leaves or flags");
 
         ui.separator();
         deleted = ui

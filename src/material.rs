@@ -6,8 +6,7 @@
 use {crate::{assets::{self, ASSETS_DIR},
              model::Rgb,
              world::tiling_pixel_image},
-     bevy::{platform::collections::HashMap, prelude::*,
-            render::render_resource::Face as CullFace},
+     bevy::{platform::collections::HashMap, prelude::*},
      serde::{Deserialize, Serialize},
      std::{fs, io, path::Path}};
 
@@ -66,9 +65,7 @@ pub struct ModelMaterial {
   pub glow: Rgb,
   pub glow_strength: f32,
   /// Leaves holes where the texture is under half opaque, for leaves, fences or grates.
-  pub cutout: bool,
-  /// Shows the back of faces too, for single sheets like leaves or flags.
-  pub double_sided: bool
+  pub cutout: bool
 }
 
 impl Default for ModelMaterial {
@@ -95,8 +92,7 @@ impl Default for ModelMaterial {
       fog: true,
       glow: Rgb([0; 3]),
       glow_strength: 1.0,
-      cutout: false,
-      double_sided: false
+      cutout: false
     }
   }
 }
@@ -124,8 +120,9 @@ impl ModelMaterial {
       unlit: self.unlit,
       fog_enabled: self.fog,
       alpha_mode: if self.cutout { AlphaMode::Mask(0.5) } else { AlphaMode::Opaque },
-      double_sided: self.double_sided,
-      cull_mode: if self.double_sided { None } else { Some(CullFace::Back) },
+      // Faces show from both sides.
+      double_sided: true,
+      cull_mode: None,
       ..default()
     }
   }

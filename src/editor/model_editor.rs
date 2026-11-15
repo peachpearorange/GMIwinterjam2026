@@ -27,7 +27,7 @@
 //!   material, Shift fills neighbors made of the same), V goes back to selecting.
 //! - Painting gives faces a material from the shared library (see [`ModelMaterials`]):
 //!   a color, optionally a texture the color tints, tiled across faces or fitted to
-//!   each, with roughness, metalness, glow, cutout and two-sided settings. Double
+//!   each, with roughness, metalness, glow and cutout settings, and show from both sides. Double
 //!   clicking a material opens it to change.
 //!
 //! The view is a camera rendering to an image on its own render layer, shown in the
@@ -43,7 +43,7 @@ use {super::{Editor, in_lasso, name_problem,
             light::NotShadowCaster,
             platform::collections::HashMap,
             prelude::*,
-            render::{render_resource::{Face as CullFace, TextureFormat},
+            render::{render_resource::TextureFormat,
                      view::{DebandDither, Tonemapping}}},
      bevy_egui::{EguiTextureHandle, EguiUserTextures,
                  egui::{self, Color32, Key, KeyboardShortcut, Modifiers,
@@ -529,7 +529,7 @@ struct Preview {
   /// Unlit copies of the materials in use, for the material library revision and
   /// backface setting they were made for.
   materials: HashMap<String, Handle<StandardMaterial>>,
-  materials_for: (u64, bool),
+  materials_for: u64,
   /// What the model was last built from.
   built: Option<(LowPoly, Selection, Option<usize>, u64)>,
   /// The see-through shape the Build from corners tool is making, and what it was last
@@ -561,7 +561,6 @@ pub struct ModelEditor {
   xray: bool,
   wireframe: bool,
   /// Draws the back of faces too.
-  backfaces: bool,
   primitive_size: f32,
   segments: usize,
   rings: usize,
@@ -610,7 +609,6 @@ impl Default for ModelEditor {
       mirror_x: false,
       xray: false,
       wireframe: true,
-      backfaces: false,
       primitive_size: 1.0,
       segments: 8,
       rings: 4,
@@ -1332,8 +1330,6 @@ impl ModelEditor {
         .on_hover_text("Moving a vertex moves its mirror image across x = 0 too");
       ui.toggle_value(&mut self.xray, "X-ray  Z").on_hover_text("Select through faces");
       ui.toggle_value(&mut self.wireframe, "Wire");
-      ui.toggle_value(&mut self.backfaces, "Backs")
-        .on_hover_text("Draw the backs of faces");
     });
   }
 
@@ -1847,9 +1843,8 @@ impl ModelEditor {
   ) -> bool {
     let (direction, distance) = projector.toward_eye(point);
     let origin = point + direction * 1e-4;
-    !triangles.iter().any(|&(f, triangle @ [a, b, c])| {
+    !triangles.iter().any(|&(f, triangle)| {
       !skip(f)
-        && (self.backfaces || (b - a).cross(c - a).dot(direction) > 0.0)
         && ray_triangle(origin, direction, triangle).is_some_and(|t| t < distance)
     })
   }
@@ -1895,9 +1890,6 @@ impl ModelEditor {
     self
       .triangles()
       .into_iter()
-      .filter(|&(_, [a, b, c])| {
-        self.backfaces || (b - a).cross(c - a).dot(*ray.direction) < 0.0
-      })
       .filter_map(|(f, triangle)| {
         ray_triangle(ray.origin, *ray.direction, triangle).map(|t| (f, t))
       })
@@ -2838,7 +2830,7 @@ fn sync_preview(
       model,
       image,
       materials: default(),
-      materials_for: (u64::MAX, false),
+      materials_for: u64::MAX,
       built: None,
       ghost,
       ghost_materials: default(),
@@ -2867,7 +2859,7 @@ fn sync_preview(
   *transform = editor.view.transform();
   *projection = editor.view.projection();
 
-  let materials_for = (model_materials.revision, editor.backfaces);
+  let materials_for = model_materials.revision;
   if preview.materials_for != materials_for {
     preview.materials.clear();
     preview.ghost_materials.clear();
@@ -2907,9 +2899,6 @@ fn sync_preview(
               emissive: LinearRgba::BLACK,
               emissive_texture: None,
               alpha_mode: AlphaMode::Blend,
-              // Its far side shows through its near side.
-              double_sided: true,
-              cull_mode: None,
               ..material.standard(texture)
             })
           })
@@ -2967,15 +2956,12 @@ fn sync_preview(
       .or_insert_with(|| {
         let material = model_materials.get(&name).cloned().unwrap_or_default();
         let texture = model_materials.texture_of(&name, images);
-        let two_sided = editor.backfaces || material.double_sided;
         materials.add(StandardMaterial {
           unlit: true,
           // The vertex colors bring the material's color, shaded.
           base_color: Color::WHITE,
           emissive: LinearRgba::BLACK,
           emissive_texture: None,
-          double_sided: two_sided,
-          cull_mode: if two_sided { None } else { Some(CullFace::Back) },
           ..material.standard(texture)
         })
       })

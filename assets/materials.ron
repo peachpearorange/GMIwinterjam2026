@@ -21,8 +21,7 @@
         fog: true,
         glow: "#000000",
         glow_strength: 1.0,
-        cutout: false,
-        double_sided: false,
+        cutout: false
     ),
     (
         name: "tree green",
@@ -46,8 +45,7 @@
         fog: true,
         glow: "#000000",
         glow_strength: 1.0,
-        cutout: false,
-        double_sided: false,
+        cutout: false
     ),
     (
         name: "tree brown bark",
@@ -71,8 +69,7 @@
         fog: true,
         glow: "#000000",
         glow_strength: 1.0,
-        cutout: false,
-        double_sided: false,
+        cutout: false
     ),
     (
         name: "material 2",
@@ -96,8 +93,7 @@
         fog: true,
         glow: "#000000",
         glow_strength: 1.0,
-        cutout: false,
-        double_sided: false,
+        cutout: false
     ),
     (
         name: "rock mat",
@@ -121,8 +117,7 @@
         fog: true,
         glow: "#000000",
         glow_strength: 1.0,
-        cutout: false,
-        double_sided: false,
+        cutout: false
     ),
     (
         name: "material 3",
@@ -146,8 +141,7 @@
         fog: true,
         glow: "#000000",
         glow_strength: 1.0,
-        cutout: false,
-        double_sided: false,
+        cutout: false
     ),
     (
         name: "material 4",
@@ -171,8 +165,7 @@
         fog: true,
         glow: "#000000",
         glow_strength: 1.0,
-        cutout: false,
-        double_sided: false,
+        cutout: false
     ),
     (
         name: "snow",
@@ -196,8 +189,7 @@
         fog: true,
         glow: "#000000",
         glow_strength: 26.2,
-        cutout: false,
-        double_sided: false,
+        cutout: false
     ),
     (
         name: "rock",
@@ -221,8 +213,7 @@
         fog: true,
         glow: "#000000",
         glow_strength: 1.0,
-        cutout: false,
-        double_sided: false,
+        cutout: false
     ),
     (
         name: "grass",
@@ -246,8 +237,7 @@
         fog: true,
         glow: "#000000",
         glow_strength: 1.0,
-        cutout: false,
-        double_sided: false,
+        cutout: false
     ),
     (
         name: "cobble",
@@ -271,8 +261,7 @@
         fog: true,
         glow: "#000000",
         glow_strength: 1.0,
-        cutout: false,
-        double_sided: false,
+        cutout: false
     ),
     (
         name: "asphalt",
@@ -296,7 +285,6 @@
         fog: true,
         glow: "#000000",
         glow_strength: 1.0,
-        cutout: false,
-        double_sided: false,
+        cutout: false
     ),
 ]
