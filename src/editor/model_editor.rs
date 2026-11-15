@@ -34,6 +34,8 @@
 //! central panel with the vertices, edges and hints drawn over it by egui.
 
 mod ops;
+#[cfg(feature = "vr")]
+pub(super) mod vr;
 
 use {super::{Editor, in_lasso, name_problem,
              material_editor::{MaterialEditor, Thumbnails, free_name}},
@@ -58,12 +60,12 @@ use {super::{Editor, in_lasso, name_problem,
                      world::MODELS_DIR}};
 
 /// Render layer only the model editor's camera sees.
-const LAYER: usize = 1;
+pub(super) const LAYER: usize = 1;
 const FOV: f32 = 0.8;
 const NEAR: f32 = 0.05;
 /// How far behind the orbit distance the orthographic camera sits, so nothing is clipped.
 const ORTHO_BACK: f32 = 200.0;
-const BACKGROUND: Color = Color::srgb(0.19, 0.2, 0.23);
+pub(super) const BACKGROUND: Color = Color::srgb(0.19, 0.2, 0.23);
 const SELECTED: Color32 = Color32::from_rgb(0xff, 0x9a, 0x1f);
 const HOVERED: Color32 = Color32::WHITE;
 const AXIS_COLORS: [Color32; 3] = [
@@ -214,6 +216,19 @@ impl View {
   fn units_per_point(&self, rect: egui::Rect) -> f32 {
     self.height() / rect.height().max(1.0)
   }
+}
+
+/// Makes the mirror images of what `modal` moves follow it across x = 0, and keeps
+/// what was on that line on it.
+fn mirror_modal(modal: &Modal, model: &mut LowPoly) {
+  modal.partners.iter().for_each(|&(v, w)| {
+    model.vertices[w] = model.vertices[v] * Vec3::new(-1.0, 1.0, 1.0)
+  });
+  modal
+    .base_selection
+    .iter()
+    .filter(|&&v| modal.base.vertices[v].x.abs() < ops::EPSILON)
+    .for_each(|&v| model.vertices[v].x = 0.0)
 }
 
 /// Converts between the world and the viewport on screen.
@@ -589,6 +604,13 @@ pub struct ModelEditor {
   texture: Option<egui::TextureId>,
   /// Which vertices and edges the camera sees, for the model and camera they were found for.
   visibility: Option<(LowPoly, Mat4, Vec<bool>, Vec<(usize, usize, bool)>)>,
+  /// Where a VR headset is looking from, for which way flat new shapes face, while one
+  /// shows the model.
+  vr_toward: Option<Vec3>,
+  /// While a VR controller is using a tool, so the window's mouse leaves it be.
+  vr_busy: bool,
+  #[cfg(feature = "vr")]
+  vr: vr::VrTool,
   pub(super) status: String
 }
 
@@ -628,6 +650,10 @@ impl Default for ModelEditor {
       viewport_pixels: UVec2::ONE,
       texture: None,
       visibility: None,
+      vr_toward: None,
+      vr_busy: false,
+      #[cfg(feature = "vr")]
+      vr: default(),
       status: default()
     };
     ops::append(
@@ -1060,13 +1086,7 @@ impl ModelEditor {
       }
     }
     if modal.kind != ModalKind::Inset && self.mirror_x {
-      modal.partners.iter().for_each(|&(v, w)| {
-        model.vertices[w] = model.vertices[v] * Vec3::new(-1.0, 1.0, 1.0)
-      });
-      selected
-        .iter()
-        .filter(|&&v| modal.base.vertices[v].x.abs() < ops::EPSILON)
-        .for_each(|&v| model.vertices[v].x = 0.0)
+      mirror_modal(modal, &mut model)
     }
     self.model = model;
     self.selection = selection
@@ -1074,20 +1094,30 @@ impl ModelEditor {
 
   // Building from corners.
 
+  /// The direction toward whoever is looking, which flat new shapes face.
+  fn toward(&self) -> Vec3 { self.vr_toward.unwrap_or(-self.view.forward()) }
+
+  /// The corners of the box around the model, if it has any.
+  #[cfg(feature = "vr")]
+  pub(super) fn bounds(&self) -> Option<(Vec3, Vec3)> {
+    let vertices = self.model.vertices.iter().copied();
+    vertices.clone().reduce(Vec3::min).zip(vertices.reduce(Vec3::max))
+  }
+
   /// The shape the corners make with the one the pointer would put down, while building.
   fn new_shape_hull(&self) -> Option<LowPoly> {
     let NewShape { corners, cursor, .. } = &self.new_shape;
     (self.tool == Tool::BuildFromCorners)
       .then(|| {
         let points = [corners.as_slice(), cursor.as_slice()].concat();
-        ops::convex_hull(&points, -self.view.forward(), &self.look())
+        ops::convex_hull(&points, self.toward(), &self.look())
       })
       .flatten()
   }
 
   /// Adds the shape around the corners to the model, ready for the next.
   fn build_shape(&mut self) {
-    match ops::convex_hull(&self.new_shape.corners, -self.view.forward(), &self.look()) {
+    match ops::convex_hull(&self.new_shape.corners, self.toward(), &self.look()) {
       Some(part) => {
         self.edit(|editor| ops::append(&mut editor.model, &mut editor.selection, part));
         self.selection.clear();
@@ -2079,8 +2109,10 @@ impl ModelEditor {
       None
     };
 
-    // Using the tools.
-    if self.modal.is_some() {
+    // Using the tools, unless a VR controller is.
+    if self.vr_busy {
+      self.press = None
+    } else if self.modal.is_some() {
       self.hover = None;
       let drag = self.modal.as_ref().is_some_and(|modal| modal.drag);
       // A quick click can press and let go within one frame, so check the button too.
@@ -2769,6 +2801,30 @@ impl ModelEditorUi<'_> {
       }
     );
     egui::CentralPanel::default().show(root, |ui| editor.viewport(ui));
+    if let Some(name) = editor.open_material.take() {
+      material_editor.open(&name)
+    }
+  }
+}
+
+#[cfg(feature = "vr")]
+impl ModelEditorUi<'_> {
+  /// The model editor's panels on the VR tablet: the tools beside the materials and
+  /// files, as on screen but without the view.
+  pub fn vr_panel(&mut self, ui: &mut egui::Ui) {
+    let Self { editor, material_editor, thumbnails, library } = self;
+    let editor = &mut **editor;
+    if !editor.simple {
+      editor.set_simple(true)
+    }
+    egui::Panel::top("model").show(ui, |ui| editor.top_bar(ui));
+    if !editor.status.is_empty() {
+      egui::Panel::bottom("model_status").show(ui, |ui| ui.label(&editor.status));
+    }
+    ui.columns(2, |columns| {
+      editor.tools_panel(&mut columns[0]);
+      editor.side_panel(&mut columns[1], library, thumbnails)
+    });
     if let Some(name) = editor.open_material.take() {
       material_editor.open(&name)
     }

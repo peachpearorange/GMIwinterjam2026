@@ -9,6 +9,8 @@ bevy_egui = { version = "0.43.1", optional = true }
 image = "0.25.10"
 ron = "0.12.3"
 serde = { version = "1.0.229", features = ["derive"] }
+bevy_mod_openxr = { path = "vendor/bevy_oxr/crates/bevy_openxr", optional = true, features = ["window_support"] }
+bevy_mod_xr = { path = "vendor/bevy_oxr/crates/bevy_xr", optional = true }
 
 [build-dependencies]
 ron = "0.12.3"
@@ -18,6 +20,9 @@ default = ["editor"]
 # The content editor, built into the game. Leave it out of releases with
 # `cargo build --release --no-default-features`.
 editor = ["dep:bevy_egui"]
+# Edit in a VR headset through OpenXR (e.g. WiVRn streaming to a Pico 4).
+# `cargo run --features vr`
+vr = ["editor", "dep:bevy_mod_openxr", "dep:bevy_mod_xr"]
 
 [profile.dev]
 opt-level = 1
