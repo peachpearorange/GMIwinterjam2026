@@ -153,6 +153,7 @@ fn finish(played: Query<Entity, With<PlayOnly>>, mut commands: Commands) {
 
 pub fn plugin(app: &mut App) {
   app
+    .add_plugins(snow::plugin)
     .init_resource::<FollowCamera>()
     .add_systems(OnEnter(Mode::Play), start)
     .add_systems(OnExit(Mode::Play), finish)

@@ -1,23 +1,26 @@
 //! Snowfall during play. Snow first settles on the ground in patches, each spot going
 //! through the partial snow textures and then the snow material, and once a spot is
 //! fully white the snow there starts rising, burying the world. The player clears it
-//! away wherever he walks, and cleared ground slowly snows over again.
+//! away wherever he walks, the snow around slumps into what he cleared, and cleared
+//! ground slowly snows over again.
 //!
 //! Every point of a grid finer than the terrain's remembers when snow started settling
-//! there. Its look and depth follow from how long ago that was, so the rising snow is
-//! one mesh moving up, rebuilt only where the player digs.
+//! there. Its look and depth follow from how long ago that was, so the settled snow's
+//! looks fade into each other in a shader and the rising snow is one mesh moving up, both rebuilt
+//! only where the player digs.
 
-use {super::Player,
+use {super::{PlayOnly, Player},
      bevy::{asset::RenderAssetUsages,
             light::NotShadowCaster,
+            math::Affine2,
             mesh::Indices,
+            pbr::{ExtendedMaterial, MaterialExtension},
             platform::collections::{HashMap, HashSet},
             prelude::*,
-            render::render_resource::PrimitiveTopology},
+            render::render_resource::{AsBindGroup, PrimitiveTopology},
+            shader::ShaderRef},
      winterjam2026::{material::{ModelMaterial, ModelMaterials},
                      terrain::Terrain}};
-
-use super::PlayOnly;
 
 /// Snow grid points per terrain cell along each side.
 const POINTS_PER_CELL: usize = 4;
@@ -44,16 +47,17 @@ const COVER_LIFT: f32 = 0.03;
 const SINK: f32 = 0.05;
 /// How far around the player snow gets cleared, in world units.
 const DIG_RADIUS: f32 = 1.2;
-/// How often the settled snow's look is brought up to date, in seconds.
-const COVER_INTERVAL: f32 = 0.25;
+/// The steepest snow stays, as height per distance. Steeper snow slides down.
+const STEEPEST_SLOPE: f32 = 0.6;
+/// How quickly snow steeper than [`STEEPEST_SLOPE`] slides, as the share of the way to
+/// resting it goes per second.
+const SLUMP_PER_SECOND: f32 = 6.0;
+/// How far past where the player digs snow slides, in world units.
+const SLUMP_REACH: f32 = 4.0;
 /// The library material settled and rising snow is made of.
 const SNOW_MATERIAL: &str = "snow";
-
-/// Which look snow has `age` seconds after it started settling: 0 bare, then each
-/// partial stage, then [`FULL_STAGE`].
-fn stage(age: f32) -> u8 {
-  (age / STAGE_SECONDS).floor().clamp(0.0, FULL_STAGE as f32) as u8
-}
+/// The shader showing each look of settled snow.
+const COVER_SHADER: &str = "shaders/snow_cover.wesl";
 
 /// A pseudo random number in 0..1 for each integer point.
 fn hash(x: i32, z: i32) -> f32 {
@@ -94,24 +98,21 @@ pub struct Snow {
   /// The terrain's direction at each point.
   ground_normals: Vec<Vec3>,
   /// Seconds into play when snow started settling at each point, last time it was
-  /// cleared or at first.
+  /// cleared or at first. Snow sliding onto a point makes it earlier.
   start: Vec<f32>,
   /// Seconds since play started.
   clock: f32,
-  /// Chunks whose rising snow needs building again, as the player dug there.
+  /// Chunks whose meshes need building again, as the snow there changed.
   dirty: HashSet<UVec2>,
-  /// Seconds since the settled snow's look was last brought up to date.
-  since_cover: f32,
-  chunks: HashMap<UVec2, ChunkEntities>
+  chunks: HashMap<UVec2, ChunkMeshes>
 }
 
-/// The entities showing a chunk, and the look its settled snow was built with.
-struct ChunkEntities {
+/// The meshes showing a chunk, replaced in place when it changes.
+struct ChunkMeshes {
   /// The rising snow, moved up as it rises.
-  body: Entity,
-  /// Parent of a mesh per look of settled snow.
-  cover: Entity,
-  stages: Vec<u8>
+  body: Handle<Mesh>,
+  /// The settled snow, shared by every look's entity.
+  cover: Handle<Mesh>
 }
 
 impl Snow {
@@ -136,7 +137,6 @@ impl Snow {
       start,
       clock: 0.0,
       dirty: default(),
-      since_cover: COVER_INTERVAL,
       chunks: default()
     };
     snow.ground_normals =
@@ -167,11 +167,10 @@ impl Snow {
     self.clock.min(deepest) * RISE_PER_SECOND
   }
 
-  /// The rising snow's height at `p` before being moved up by [`Self::level`]: so far
-  /// under the ground that it comes up through it [`RISE_DELAY`] after snow started
+  /// The rising snow's height at point `i` before being moved up by [`Self::level`]: so
+  /// far under the ground that it comes up through it [`RISE_DELAY`] after snow started
   /// settling there.
-  fn body_height(&self, p: UVec2) -> f32 {
-    let i = self.index(p);
+  fn body_height(&self, i: usize) -> f32 {
     self.ground[i] - RISE_PER_SECOND * (self.start[i] + RISE_DELAY) - SINK
   }
 
@@ -187,41 +186,32 @@ impl Snow {
     (range(chunk.x, squares.x), range(chunk.y, squares.y))
   }
 
-  /// How each square of a chunk looks now, by when snow started at its corners.
-  fn cover_stages(&self, chunk: UVec2) -> Vec<u8> {
+  /// The grid points of a chunk, row by row.
+  fn chunk_points(&self, chunk: UVec2) -> Vec<UVec2> {
     let (xs, zs) = self.chunk_squares(chunk);
-    zs.flat_map(|z| xs.clone().map(move |x| UVec2::new(x, z)))
-      .map(|p| {
-        let start = [UVec2::ZERO, UVec2::X, UVec2::Y, UVec2::ONE]
-          .map(|corner| self.start[self.index(p + corner)])
-          .iter()
-          .sum::<f32>()
-          / 4.0;
-        stage(self.clock - start)
-      })
-      .collect()
+    (zs.start..=zs.end).flat_map(|z| (xs.start..=xs.end).map(move |x| UVec2::new(x, z))).collect()
   }
 
-  /// The rising snow over a chunk, textured every `tile` world units. Cut along the same
+  /// A surface over a chunk at `height`, its first UVs world xz. Cut along the same
   /// diagonals as the terrain, so it lies exactly on the ground where it's level with it.
-  fn body_mesh(&self, chunk: UVec2, tile: f32) -> Mesh {
+  fn grid_mesh(
+    &self,
+    chunk: UVec2,
+    height: impl Fn(usize) -> f32,
+    normal: impl Fn(UVec2) -> Vec3
+  ) -> Mesh {
     let (xs, zs) = self.chunk_squares(chunk);
     let width = xs.len() as u32 + 1;
-    let points = (zs.start..=zs.end)
-      .flat_map(|z| (xs.start..=xs.end).map(move |x| UVec2::new(x, z)))
-      .collect::<Vec<_>>();
+    let points = self.chunk_points(chunk);
     let positions = points
       .iter()
       .map(|&p| {
         let xz = self.xz(p);
-        [xz.x, self.body_height(p), xz.y]
+        [xz.x, height(self.index(p)), xz.y]
       })
       .collect::<Vec<_>>();
-    let normals = points
-      .iter()
-      .map(|&p| self.normal(p, |p| self.body_height(p)).to_array())
-      .collect::<Vec<_>>();
-    let uvs = points.iter().map(|&p| (self.xz(p) / tile).to_array()).collect::<Vec<_>>();
+    let normals = points.iter().map(|&p| normal(p).to_array()).collect::<Vec<_>>();
+    let uvs = points.iter().map(|&p| self.xz(p).to_array()).collect::<Vec<_>>();
     let indices = (0..zs.len() as u32)
       .flat_map(|z| (0..xs.len() as u32).map(move |x| (x, z)))
       .flat_map(|(x, z)| {
@@ -230,69 +220,74 @@ impl Snow {
         [a, c, b, b, c, c + 1]
       })
       .collect();
-    mesh(positions, normals, uvs, indices)
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+      .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+      .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+      .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+      .with_inserted_indices(Indices::U32(indices))
   }
 
-  /// A mesh per look of the settled snow over a chunk, for squares that have any, each
-  /// textured every `tile(stage)` world units.
-  fn cover_meshes(
-    &self,
-    chunk: UVec2,
-    stages: &[u8],
-    tile: impl Fn(u8) -> f32
-  ) -> Vec<(u8, Mesh)> {
-    let (xs, zs) = self.chunk_squares(chunk);
-    let mut parts = HashMap::<u8, Vec<UVec2>>::default();
-    zs.flat_map(|z| xs.clone().map(move |x| UVec2::new(x, z)))
-      .zip(stages)
-      .filter(|&(_, &stage)| stage > 0)
-      .for_each(|(p, &stage)| parts.entry(stage).or_default().push(p));
-    parts
-      .into_iter()
-      .map(|(stage, squares)| {
-        let tile = tile(stage).max(1e-3);
-        let corners = squares
-          .iter()
-          .flat_map(|&p| [UVec2::ZERO, UVec2::X, UVec2::Y, UVec2::ONE].map(|c| p + c))
-          .collect::<Vec<_>>();
-        let positions = corners
-          .iter()
-          .map(|&p| {
-            let xz = self.xz(p);
-            [xz.x, self.ground[self.index(p)] + COVER_LIFT, xz.y]
-          })
-          .collect();
-        let normals = corners
-          .iter()
-          .map(|&p| self.ground_normals[self.index(p)].to_array())
-          .collect();
-        let uvs = corners.iter().map(|&p| (self.xz(p) / tile).to_array()).collect();
-        let indices = (0..squares.len() as u32)
-          .flat_map(|i| {
-            let [a, b, c, d] = [0, 1, 2, 3].map(|k| i * 4 + k);
-            [a, c, b, b, c, d]
-          })
-          .collect();
-        (stage, mesh(positions, normals, uvs, indices))
-      })
-      .collect()
+  /// The rising snow over a chunk.
+  fn body_mesh(&self, chunk: UVec2) -> Mesh {
+    self.grid_mesh(
+      chunk,
+      |i| self.body_height(i),
+      |p| self.normal(p, |p| self.body_height(self.index(p)))
+    )
+  }
+
+  /// The settled snow over a chunk, its second UVs when snow started settling there.
+  fn cover_mesh(&self, chunk: UVec2) -> Mesh {
+    let starts = self
+      .chunk_points(chunk)
+      .iter()
+      .map(|&p| [self.start[self.index(p)], 0.0])
+      .collect::<Vec<_>>();
+    self
+      .grid_mesh(
+        chunk,
+        |i| self.ground[i] + COVER_LIFT,
+        |p| self.ground_normals[self.index(p)]
+      )
+      .with_inserted_attribute(Mesh::ATTRIBUTE_UV_1, starts)
+  }
+
+  /// Marks the chunks showing points from `min` to `max` for building again. The
+  /// surface's direction at a point leans on its neighbors, so the points next to those
+  /// changed too, and a point on a chunk's first row or column is also the last of the
+  /// chunk before. Missing one leaves its edge lit differently, a line along the border.
+  fn mark_dirty(&mut self, min: UVec2, max: UVec2) {
+    let chunks = self.chunk_count() - UVec2::ONE;
+    let chunk = |p: UVec2| (p / CHUNK).min(chunks);
+    let (from, to) = (chunk(min.saturating_sub(UVec2::splat(2))), chunk(max + UVec2::ONE));
+    self
+      .dirty
+      .extend((from.y..=to.y).flat_map(|z| (from.x..=to.x).map(move |x| UVec2::new(x, z))))
+  }
+
+  /// The grid points within `radius` world units of `xz` along each axis, as the first
+  /// and last corners.
+  fn around(&self, xz: Vec2, radius: f32) -> (UVec2, UVec2) {
+    let at = (xz - self.origin) / self.step;
+    let reach = radius / self.step;
+    let last = (self.size - UVec2::ONE).as_vec2();
+    (
+      (at - reach).ceil().clamp(Vec2::ZERO, last).as_uvec2(),
+      (at + reach).floor().clamp(Vec2::ZERO, last).as_uvec2()
+    )
   }
 
   /// Clears the snow within [`DIG_RADIUS`] of `xz`, marking the chunks it changes.
   fn dig(&mut self, xz: Vec2) {
-    let at = (xz - self.origin) / self.step;
-    let reach = DIG_RADIUS / self.step;
-    let last = (self.size - UVec2::ONE).as_vec2();
-    let min = (at - reach).ceil().clamp(Vec2::ZERO, last).as_uvec2();
-    let max = (at + reach).floor().clamp(Vec2::ZERO, last).as_uvec2();
+    let (min, max) = self.around(xz, DIG_RADIUS);
     let clock = self.clock;
     // Points cleared a moment ago are left alone, so standing still doesn't rebuild
     // the snow every frame. Half a stage on, they still look bare.
     let cleared = (min.y..=max.y)
       .flat_map(|z| (min.x..=max.x).map(move |x| UVec2::new(x, z)))
       .filter(|&p| {
-        let i = self.index(p);
-        p.as_vec2().distance(at) <= reach && clock - self.start[i] > STAGE_SECONDS / 2.0
+        self.xz(p).distance(xz) <= DIG_RADIUS
+          && clock - self.start[self.index(p)] > STAGE_SECONDS / 2.0
       })
       .collect::<Vec<_>>();
     if !cleared.is_empty() {
@@ -300,38 +295,137 @@ impl Snow {
         let i = self.index(p);
         self.start[i] = clock
       });
-      // A point further out too, as the surface's direction leans on its neighbors.
-      let chunks = self.chunk_count() - UVec2::ONE;
-      let chunk = |p: UVec2| (p / CHUNK).min(chunks);
-      let (from, to) = (
-        chunk(min.saturating_sub(UVec2::ONE)),
-        chunk((max + UVec2::ONE).min(self.size - UVec2::ONE))
-      );
-      (from.y..=to.y).for_each(|z| {
-        (from.x..=to.x).for_each(|x| {
-          self.dirty.insert(UVec2::new(x, z));
-        })
-      })
+      self.mark_dirty(min, max)
     }
+  }
+
+  /// Lets snow steeper than [`STEEPEST_SLOPE`] near `xz` slide downhill for `seconds`,
+  /// so walls left by digging slump into what was cleared. Snow only moves, none is made
+  /// or lost.
+  fn slump(&mut self, xz: Vec2, seconds: f32) {
+    let (min, max) = self.around(xz, DIG_RADIUS + SLUMP_REACH);
+    let width = (max.x - min.x + 1) as usize;
+    let points = (min.y..=max.y)
+      .flat_map(|z| (min.x..=max.x).map(move |x| UVec2::new(x, z)))
+      .collect::<Vec<_>>();
+    let level = self.level();
+    // How deep the snow is at each point, and how high its top or the bare ground is.
+    let depths = points
+      .iter()
+      .map(|&p| {
+        let i = self.index(p);
+        (self.body_height(i) + level - self.ground[i]).max(0.0)
+      })
+      .collect::<Vec<_>>();
+    let tops =
+      points.iter().zip(&depths).map(|(&p, depth)| self.ground[self.index(p)] + depth);
+    let tops = tops.collect::<Vec<_>>();
+    let (rows, step) = ((max.y - min.y + 1) as i32, self.step);
+    let neighbors = move |k: usize| {
+      let (x, z) = ((k % width) as i32, (k / width) as i32);
+      [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]
+        .into_iter()
+        .filter(move |&(dx, dz)| {
+          (0..width as i32).contains(&(x + dx))
+            && (0..rows).contains(&(z + dz))
+        })
+        .map(move |(dx, dz)| {
+          let far = Vec2::new(dx as f32, dz as f32).length() * step;
+          ((z + dz) as usize * width + (x + dx) as usize, far)
+        })
+    };
+    let share = (SLUMP_PER_SECOND * seconds).min(1.0);
+    // Each point with snow sends some to the neighbors it's too steep above, more to
+    // the steeper ones, at most half the way to resting so it never overshoots.
+    let changes = (0..points.len()).filter(|&k| depths[k] > 0.0).fold(
+      vec![0.0; points.len()],
+      |mut changes, k| {
+        let drops = neighbors(k)
+          .map(|(n, far)| (n, tops[k] - tops[n] - STEEPEST_SLOPE * far))
+          .filter(|&(_, drop)| drop > 0.0)
+          .collect::<Vec<_>>();
+        let (steepest, total) =
+          drops.iter().fold((0.0_f32, 0.0), |(steepest, total), &(_, drop)| {
+            (steepest.max(drop), total + drop)
+          });
+        let moved = depths[k].min(steepest / 2.0 * share);
+        if moved > 0.0 {
+          changes[k] -= moved;
+          drops.iter().for_each(|&(n, drop)| changes[n] += moved * drop / total)
+        }
+        changes
+      }
+    );
+    // Points that get snow onto bare ground stop waiting under it, and start rising
+    // from the snow that slid there.
+    let moved = points
+      .iter()
+      .zip(&depths)
+      .zip(changes)
+      .filter(|&(_, change)| change.abs() > 1e-5)
+      .map(|((&p, &depth), change)| {
+        let i = self.index(p);
+        let surface = self.ground[i] + (depth + change).max(0.0);
+        self.start[i] =
+          (self.ground[i] - SINK + level - surface) / RISE_PER_SECOND - RISE_DELAY;
+        p
+      })
+      .fold(None, |bounds: Option<(UVec2, UVec2)>, p| {
+        Some(bounds.map_or((p, p), |(min, max)| (min.min(p), max.max(p))))
+      });
+    moved.into_iter().for_each(|(min, max)| self.mark_dirty(min, max))
   }
 }
 
-fn mesh(
-  positions: Vec<[f32; 3]>,
-  normals: Vec<[f32; 3]>,
-  uvs: Vec<[f32; 2]>,
-  indices: Vec<u32>
-) -> Mesh {
-  Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-    .with_inserted_indices(Indices::U32(indices))
+/// One look of settled snow: a material that draws only where snow has that look now.
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
+struct CoverLook {
+  /// World units one pixel of the look's texture covers, zero without a texture, so
+  /// each pixel comes in as one.
+  #[uniform(100)]
+  texel: Vec2,
+  /// Which look this is, 1 for the first partial one.
+  #[uniform(100)]
+  look: f32,
+  /// Seconds since play started, kept up to date.
+  #[uniform(100)]
+  clock: f32,
+  #[uniform(100)]
+  stage_seconds: f32,
+  #[uniform(100)]
+  full_look: f32,
+  /// 1 when this draws the look fading in over the one before it, 0 when it draws the
+  /// look once it has fully come in.
+  #[uniform(100)]
+  fading_in: f32
 }
 
-/// The materials of each look of snow, and the world units their textures repeat over.
+impl MaterialExtension for CoverLook {
+  fn fragment_shader() -> ShaderRef { COVER_SHADER.into() }
+
+  /// Kept out of the depth prepass, which could pick a slightly different look at the
+  /// edges between looks than the main pass and leave black holes there.
+  fn enable_prepass() -> bool { false }
+}
+
+type CoverMaterial = ExtendedMaterial<StandardMaterial, CoverLook>;
+
+/// The materials of the rising snow and of each look of settled snow.
 #[derive(Resource)]
-struct SnowLooks([(Handle<StandardMaterial>, f32); FULL_STAGE as usize]);
+struct SnowLooks {
+  body: Handle<StandardMaterial>,
+  /// Each look after bare, in order.
+  cover: [CoverLookMaterials; FULL_STAGE as usize]
+}
+
+/// The two ways a look of settled snow shows.
+struct CoverLookMaterials {
+  /// Once it has fully come in.
+  shown: Handle<CoverMaterial>,
+  /// Fading in over the look before it, through that look's time. Blended, so it can
+  /// be partly see through.
+  fading_in: Handle<CoverMaterial>
+}
 
 impl SnowLooks {
   /// Partial looks use a library material named like their texture when there is one,
@@ -339,43 +433,69 @@ impl SnowLooks {
   fn new(
     model_materials: &mut ModelMaterials,
     materials: &mut Assets<StandardMaterial>,
+    cover_materials: &mut Assets<CoverMaterial>,
     images: &mut Assets<Image>
   ) -> Self {
     let snow = model_materials
       .get(SNOW_MATERIAL)
       .cloned()
       .unwrap_or_else(|| ModelMaterial { name: SNOW_MATERIAL.into(), ..default() });
-    Self(std::array::from_fn(|i| {
+    // Meshes are laid out in world units, so each texture repeats every `tile` of them.
+    // Also how many world units one of its pixels covers.
+    let mut standard = |material: &ModelMaterial, model_materials: &mut ModelMaterials| {
+      let tile = material.tile.max(1e-3);
+      let texture =
+        material.texture.as_ref().and_then(|path| model_materials.texture(path, images));
+      let texel = texture
+        .as_ref()
+        .and_then(|texture| images.get(texture))
+        .map_or(Vec2::ZERO, |image| tile / image.size().as_vec2());
+      (
+        StandardMaterial {
+          uv_transform: Affine2::from_scale(Vec2::splat(1.0 / tile)),
+          ..material.standard(texture)
+        },
+        texel
+      )
+    };
+    let body = materials.add(standard(&snow, model_materials).0);
+    let cover = std::array::from_fn(|i| {
       let stage = i as u8 + 1;
       let name = if stage == FULL_STAGE {
         SNOW_MATERIAL.to_string()
       } else {
         format!("partial snow {stage}")
       };
-      match model_materials.get(&name).cloned() {
-        Some(material) => {
-          (model_materials.handle(&name, materials, images), material.tile)
+      let material = model_materials.get(&name).cloned().unwrap_or_else(|| {
+        let texture = (stage != FULL_STAGE).then(|| format!("textures/{name}.png"));
+        ModelMaterial {
+          name,
+          cutout: texture.is_some(),
+          texture: texture.or(snow.texture.clone()),
+          ..snow.clone()
         }
-        None => {
-          let texture = (stage != FULL_STAGE).then(|| format!("textures/{name}.png"));
-          let material = ModelMaterial {
-            name,
-            cutout: texture.is_some(),
-            texture: texture.clone().or(snow.texture.clone()),
-            ..snow.clone()
-          };
-          let image = material
-            .texture
-            .as_ref()
-            .and_then(|path| model_materials.texture(path, images));
-          (materials.add(material.standard(image)), snow.tile)
-        }
+      });
+      let (base, texel) = standard(&material, model_materials);
+      let mut add = |alpha_mode, depth_bias, fading_in: bool| {
+        cover_materials.add(CoverMaterial {
+          base: StandardMaterial { alpha_mode, depth_bias, ..base.clone() },
+          extension: CoverLook {
+            texel,
+            look: stage as f32,
+            clock: 0.0,
+            stage_seconds: STAGE_SECONDS,
+            full_look: FULL_STAGE as f32,
+            fading_in: fading_in as u8 as f32
+          }
+        })
+      };
+      CoverLookMaterials {
+        shown: add(AlphaMode::Mask(0.5), 0.0, false),
+        // Drawn over the look it fades in on, on the same mesh.
+        fading_in: add(AlphaMode::Blend, 1.0, true)
       }
-    }))
-  }
-
-  fn get(&self, stage: u8) -> &(Handle<StandardMaterial>, f32) {
-    &self.0[stage as usize - 1]
+    });
+    Self { body, cover }
   }
 }
 
@@ -389,35 +509,53 @@ fn setup(
   terrain: Option<Res<Terrain>>,
   mut model_materials: ResMut<ModelMaterials>,
   mut materials: ResMut<Assets<StandardMaterial>>,
+  mut cover_materials: ResMut<Assets<CoverMaterial>>,
   mut images: ResMut<Assets<Image>>,
+  mut meshes: ResMut<Assets<Mesh>>,
   mut commands: Commands
 ) {
-  let (None, Some(terrain)) = (snow, terrain) else { return };
-  let mut snow = Snow::new(&terrain);
-  let looks = SnowLooks::new(&mut model_materials, &mut materials, &mut images);
-  let count = snow.chunk_count();
-  (0..count.y).flat_map(|z| (0..count.x).map(move |x| UVec2::new(x, z))).for_each(
-    |chunk| {
-      let body = commands
-        .spawn((
+  if snow.is_none()
+    && let Some(terrain) = terrain
+  {
+    let mut snow = Snow::new(&terrain);
+    let looks = SnowLooks::new(
+      &mut model_materials,
+      &mut materials,
+      &mut cover_materials,
+      &mut images
+    );
+    let count = snow.chunk_count();
+    let chunks = (0..count.y).flat_map(|z| (0..count.x).map(move |x| UVec2::new(x, z)));
+    snow.chunks = chunks
+      .map(|chunk| {
+        let body = meshes.add(snow.body_mesh(chunk));
+        let cover = meshes.add(snow.cover_mesh(chunk));
+        commands.spawn((
           SnowBody,
           PlayOnly,
-          MeshMaterial3d(looks.get(FULL_STAGE).0.clone()),
-          Transform::default(),
-          Visibility::default()
-        ))
-        .id();
-      let cover =
-        commands.spawn((PlayOnly, Transform::default(), Visibility::default())).id();
-      snow.chunks.insert(chunk, ChunkEntities { body, cover, stages: vec![] });
-      snow.dirty.insert(chunk);
-    }
-  );
-  commands.insert_resource(looks);
-  commands.insert_resource(snow);
+          Mesh3d(body.clone()),
+          MeshMaterial3d(looks.body.clone())
+        ));
+        looks.cover.iter().for_each(|CoverLookMaterials { shown, fading_in }| {
+          [shown, fading_in].into_iter().for_each(|material| {
+            commands.spawn((
+              PlayOnly,
+              Mesh3d(cover.clone()),
+              MeshMaterial3d(material.clone()),
+              NotShadowCaster
+            ));
+          })
+        });
+        (chunk, ChunkMeshes { body, cover })
+      })
+      .collect();
+    commands.insert_resource(looks);
+    commands.insert_resource(snow)
+  }
 }
 
-/// Lets time pass for the snow, clears it around the player, and rebuilds what changed.
+/// Lets time pass for the snow, clears it around the player, lets it slump, and rebuilds
+/// what changed.
 fn advance(
   snow: Option<ResMut<Snow>>,
   looks: Option<Res<SnowLooks>>,
@@ -425,57 +563,33 @@ fn advance(
   players: Query<&Transform, With<Player>>,
   mut bodies: Query<&mut Transform, (With<SnowBody>, Without<Player>)>,
   mut meshes: ResMut<Assets<Mesh>>,
-  mut commands: Commands
+  mut cover_materials: ResMut<Assets<CoverMaterial>>
 ) {
-  let (Some(mut snow), Some(looks)) = (snow, looks) else { return };
-  let snow = &mut *snow;
-  snow.clock += time.delta_secs();
-  if let Ok(player) = players.single() {
-    snow.dig(player.translation.xz())
-  }
-
-  let tile = |stage: u8| looks.get(stage).1;
-  std::mem::take(&mut snow.dirty).into_iter().for_each(|chunk| {
-    if let Some(&ChunkEntities { body, .. }) = snow.chunks.get(&chunk) {
-      let mesh = snow.body_mesh(chunk, tile(FULL_STAGE));
-      commands.entity(body).insert(Mesh3d(meshes.add(mesh)));
+  if let (Some(mut snow), Some(looks)) = (snow, looks) {
+    let snow = &mut *snow;
+    snow.clock += time.delta_secs();
+    if let Ok(player) = players.single() {
+      snow.dig(player.translation.xz());
+      snow.slump(player.translation.xz(), time.delta_secs())
     }
-    // Shown cleared straight away rather than at the next look update.
-    snow.chunks.get_mut(&chunk).iter_mut().for_each(|entities| entities.stages.clear())
-  });
-
-  snow.since_cover += time.delta_secs();
-  let due = snow.since_cover >= COVER_INTERVAL;
-  if due {
-    snow.since_cover = 0.0
-  }
-  let chunks = snow.chunks.keys().copied().collect::<Vec<_>>();
-  chunks.into_iter().for_each(|chunk| {
-    let stale =
-      snow.chunks.get(&chunk).is_some_and(|entities| entities.stages.is_empty());
-    if due || stale {
-      let stages = snow.cover_stages(chunk);
-      let meshes_now = (snow.chunks[&chunk].stages != stages)
-        .then(|| snow.cover_meshes(chunk, &stages, tile));
-      if let Some(parts) = meshes_now
-        && let Some(entities) = snow.chunks.get_mut(&chunk)
-      {
-        entities.stages = stages;
-        let mut cover = commands.entity(entities.cover);
-        cover.despawn_related::<Children>();
-        parts.into_iter().for_each(|(stage, mesh)| {
-          cover.with_child((
-            Mesh3d(meshes.add(mesh)),
-            MeshMaterial3d(looks.get(stage).0.clone()),
-            NotShadowCaster
-          ));
-        })
+    std::mem::take(&mut snow.dirty).into_iter().for_each(|chunk| {
+      if let Some(ChunkMeshes { body, cover }) = snow.chunks.get(&chunk) {
+        meshes.insert(body, snow.body_mesh(chunk)).ok();
+        meshes.insert(cover, snow.cover_mesh(chunk)).ok();
       }
-    }
-  });
-
-  let level = snow.level();
-  bodies.iter_mut().for_each(|mut transform| transform.translation.y = level)
+    });
+    looks
+      .cover
+      .iter()
+      .flat_map(|CoverLookMaterials { shown, fading_in }| [shown, fading_in])
+      .for_each(|look| {
+        if let Some(mut material) = cover_materials.get_mut(look) {
+          material.extension.clock = snow.clock
+        }
+      });
+    let level = snow.level();
+    bodies.iter_mut().for_each(|mut transform| transform.translation.y = level)
+  }
 }
 
 /// The snow's systems, in order.
@@ -489,9 +603,24 @@ pub fn finish(commands: &mut Commands) {
   commands.remove_resource::<SnowLooks>()
 }
 
+pub fn plugin(app: &mut App) { app.add_plugins(MaterialPlugin::<CoverMaterial>::default()); }
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Which look snow has at `p`: 0 bare, then each partial one, then [`FULL_STAGE`],
+  /// as the shader works it out.
+  fn look(snow: &Snow, p: UVec2) -> u8 {
+    ((snow.clock - snow.start[snow.index(p)]) / STAGE_SECONDS)
+      .floor()
+      .clamp(0.0, FULL_STAGE as f32) as u8
+  }
+
+  fn depth(snow: &Snow, p: UVec2) -> f32 {
+    let i = snow.index(p);
+    snow.body_height(i) + snow.level() - snow.ground[i]
+  }
 
   #[test]
   fn snow_settles_then_rises_and_digging_clears_it() {
@@ -499,25 +628,47 @@ mod tests {
     terrain.heights[4][4] = 3.0;
     let mut snow = Snow::new(&terrain);
     let middle = snow.size / 2;
-    let depth = |snow: &Snow, p: UVec2| {
-      snow.body_height(p) + snow.level() - snow.ground[snow.index(p)]
-    };
+    let corner = UVec2::ZERO;
     // Nothing settled at first, and the rising snow out of sight under the ground.
-    assert!(snow.cover_stages(UVec2::ZERO).iter().all(|&stage| stage == 0));
+    assert!(look(&snow, middle) == 0 && look(&snow, corner) == 0);
     assert!(depth(&snow, middle) < 0.0);
 
     snow.clock = SPREAD_SECONDS + FULL_STAGE as f32 * STAGE_SECONDS;
-    assert!(snow.cover_stages(UVec2::ZERO).iter().all(|&stage| stage == FULL_STAGE));
+    assert!(look(&snow, middle) == FULL_STAGE && look(&snow, corner) == FULL_STAGE);
     snow.clock = SPREAD_SECONDS + RISE_DELAY + 20.0;
     assert!(depth(&snow, middle) > 0.5, "{}", depth(&snow, middle));
 
     snow.dig(snow.xz(middle));
     assert!(depth(&snow, middle) < 0.0 && !snow.dirty.is_empty());
-    let stages = snow.cover_stages(UVec2::ZERO);
-    assert!(stages.contains(&0) && stages.contains(&FULL_STAGE));
+    assert!(look(&snow, middle) == 0 && look(&snow, corner) == FULL_STAGE);
     // Cleared ground snows over again.
     snow.clock += RISE_DELAY + 20.0;
     assert!(depth(&snow, middle) > 0.5);
+  }
+
+  #[test]
+  fn dug_walls_slump_to_a_resting_slope_keeping_the_snow() {
+    let mut snow = Snow::new(&Terrain::flat(16, 16, 2.0, "snow"));
+    snow.clock = SPREAD_SECONDS + RISE_DELAY + 60.0;
+    let middle = snow.size / 2;
+    let xz = snow.xz(middle);
+    snow.dig(xz);
+    let (min, max) = snow.around(xz, DIG_RADIUS + SLUMP_REACH);
+    let points = (min.y..=max.y)
+      .flat_map(|z| (min.x..=max.x).map(move |x| UVec2::new(x, z)))
+      .collect::<Vec<_>>();
+    let total = |snow: &Snow| points.iter().map(|&p| depth(snow, p).max(0.0)).sum::<f32>();
+    let before = total(&snow);
+    (0..400).for_each(|_| snow.slump(xz, 1.0 / 60.0));
+    assert!((total(&snow) - before).abs() < 1e-2 * before, "{before} {}", total(&snow));
+    // Snow has slid into the hole, and no neighbors are much steeper than resting.
+    assert!(depth(&snow, middle) > 0.0);
+    let steepest = points
+      .iter()
+      .filter(|&&p| p.x < max.x)
+      .map(|&p| (depth(&snow, p).max(0.0) - depth(&snow, p + UVec2::X).max(0.0)).abs())
+      .fold(0.0_f32, f32::max);
+    assert!(steepest < STEEPEST_SLOPE * snow.step * 1.5, "{steepest}");
   }
 
   #[test]
@@ -528,7 +679,7 @@ mod tests {
     let squares = (0..count.y)
       .flat_map(|z| (0..count.x).map(move |x| UVec2::new(x, z)))
       .map(|chunk| {
-        let mesh = snow.body_mesh(chunk, 4.0);
+        let mesh = snow.body_mesh(chunk);
         mesh.indices().map_or(0, |indices| indices.len()) / 6
       })
       .sum::<usize>();
