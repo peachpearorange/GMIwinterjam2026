@@ -3,10 +3,17 @@
 //! optionally a texture the color tints, and how the surface catches light. Changes show
 //! straight away in the model editor and the world, and save to the library file.
 
-use {super::{model_editor::{Library, ModelEditor},
+use {super::{Editor,
+             model_editor::{Library, ModelEditor},
              pixel_editor::{Palette, texture_names}},
-     bevy::{ecs::system::SystemParam, platform::collections::HashMap, prelude::*},
-     bevy_egui::egui::{self, Color32, Key, Pos2, Sense, Stroke},
+     crate::Mode,
+     bevy::{camera::{RenderTarget, visibility::RenderLayers},
+            ecs::system::SystemParam,
+            platform::collections::HashMap,
+            prelude::*,
+            render::render_resource::TextureFormat},
+     bevy_egui::{EguiTextureHandle, EguiUserTextures,
+                 egui::{self, Color32, Pos2, Sense, Stroke}},
      std::{fs, path::Path, time::SystemTime},
      winterjam2026::{assets::{self, ASSETS_DIR},
                      material::{Mapping, ModelMaterial},
@@ -16,6 +23,14 @@ use {super::{model_editor::{Library, ModelEditor},
 
 const LIST_WIDTH: f32 = 240.0;
 const THUMBNAIL: f32 = 64.0;
+/// Render layer only the material preview's camera and lights see.
+const PREVIEW_LAYER: usize = 3;
+/// The preview's size, in pixels and in points.
+const PREVIEW_PIXELS: u32 = 400;
+const PREVIEW_SIDE: f32 = 200.0;
+/// How fast the preview's shapes turn, in radians a second, so highlights move across
+/// them.
+const PREVIEW_TURN: f32 = 0.5;
 
 pub(super) fn color32(Rgb([r, g, b]): Rgb) -> Color32 { Color32::from_rgb(r, g, b) }
 
@@ -27,6 +42,15 @@ fn color_row(ui: &mut egui::Ui, label: &str, color: &mut Rgb) {
     }
     ui.label(label);
   });
+}
+
+/// The name for a copy of material `name`: `name copy`, or `name copy 2` and on if
+/// that's taken.
+fn copy_name(list: &[ModelMaterial], name: &str) -> String {
+  (1..)
+    .map(|i| if i == 1 { format!("{name} copy") } else { format!("{name} copy {i}") })
+    .find(|copy| !list.iter().any(|m| m.name == *copy))
+    .unwrap_or_default()
 }
 
 /// A material name no material in `list` has yet.
@@ -90,7 +114,15 @@ pub(super) struct MaterialEditor {
   pub(super) show: bool,
   /// The name and color fields being typed into.
   rename: String,
-  hex: String
+  hex: String,
+  /// The picture of the material on lit shapes, once there is one.
+  preview: Option<egui::TextureId>,
+  /// The library before each change, to undo to, and after each undone one.
+  undo: Vec<Vec<ModelMaterial>>,
+  redo: Vec<Vec<ModelMaterial>>,
+  /// The library before the change underway, as a slider drag or a name being typed,
+  /// which is one undo step once it ends.
+  changing: Option<Vec<ModelMaterial>>
 }
 
 impl MaterialEditor {
@@ -109,22 +141,21 @@ impl MaterialEditor {
     taken: &[String],
     palette: &mut Palette,
     thumbnails: &mut Thumbnails
-  ) -> (Option<(String, String)>, bool) {
+  ) -> (Option<(String, String)>, bool, bool) {
+    let mut cloned = false;
     let mut renamed = None;
     // The button first from the right, so the name field takes only the width left. One
     // row high: a layout given the whole height would center the row in it.
     let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
     ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+      cloned = ui.button("Clone").on_hover_text("Makes a copy of it to change").clicked();
+      // Renamed as it's typed, whenever the name is free.
       let new_name = self.rename.trim().to_string();
-      let free = !new_name.is_empty() && new_name != material.name && !taken.contains(&new_name);
-      let clicked = ui.add_enabled(free, egui::Button::new("Rename")).clicked();
-      let response = ui.add(
-        egui::TextEdit::singleline(&mut self.rename)
-          .desired_width(ui.available_width())
-          .hint_text("name")
-      );
-      let entered = response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
-      if free && (clicked || entered) {
+      if taken.contains(&new_name) && new_name != material.name {
+        ui.weak("name taken");
+      }
+      ui.add(egui::TextEdit::singleline(&mut self.rename).desired_width(ui.available_width()).hint_text("name"));
+      if !new_name.is_empty() && new_name != material.name && !taken.contains(&new_name) {
         renamed = Some((material.name.clone(), new_name))
       }
     });
@@ -187,6 +218,10 @@ impl MaterialEditor {
           ui.weak("The palette is shared with the texture editor");
         }
         let ui = right;
+        // On a ball and a cube, lit, so how shiny it is shows.
+        if let Some(preview) = self.preview {
+          ui.image(egui::load::SizedTexture::new(preview, egui::Vec2::splat(PREVIEW_SIDE)));
+        }
         ui.strong("TEXTURE");
         let mut textures = texture_names(Path::new(TEXTURES_DIR));
         textures.sort();
@@ -328,7 +363,7 @@ impl MaterialEditor {
           .clicked();
       }
     });
-    (renamed, deleted)
+    (renamed, deleted, cloned)
   }
 }
 
@@ -349,6 +384,13 @@ impl MaterialEditorUi<'_> {
     let Self { editor, model_editor, palette, thumbnails, terrain, library } = self;
     let palette_before = palette.clone();
     let mut list = library.model_materials.list().to_vec();
+    let ctx = root.ctx().clone();
+    let (mut undo, mut redo) = ctx.input_mut(|input| {
+      (
+        input.consume_shortcut(&ModelEditor::UNDO),
+        ModelEditor::REDO.iter().any(|shortcut| input.consume_shortcut(shortcut))
+      )
+    });
 
     egui::Panel::left("material_list").default_size(LIST_WIDTH).show(root, |ui| {
       ui.add_space(4.0);
@@ -357,6 +399,12 @@ impl MaterialEditorUi<'_> {
         list.push(ModelMaterial { name: name.clone(), ..default() });
         editor.open(&name)
       }
+      ui.columns(2, |columns| {
+        let undo_redo = [(&mut undo, "Undo", !editor.undo.is_empty()), (&mut redo, "Redo", !editor.redo.is_empty())];
+        columns.iter_mut().zip(undo_redo).for_each(|(ui, (clicked, label, enabled))| {
+          *clicked |= ui.add_enabled(enabled, egui::Button::new(label)).clicked()
+        })
+      });
       egui::ScrollArea::vertical().show(ui, |ui| {
         list.iter().for_each(|material| {
           ui.horizontal(|ui| {
@@ -371,25 +419,32 @@ impl MaterialEditorUi<'_> {
     });
 
     let taken = list.iter().map(|m| m.name.clone()).collect::<Vec<_>>();
-    let (renamed, deleted) = egui::CentralPanel::default()
+    let (mut renamed, deleted, cloned) = egui::CentralPanel::default()
       .show(root, |ui| {
         egui::ScrollArea::vertical()
           .show(ui, |ui| {
             if let Some(selected) = editor.selected.clone()
               && let Some(material) = list.iter_mut().find(|m| m.name == selected)
             {
-              let (renamed, deleted) =
+              let (renamed, deleted, cloned) =
                 editor.material_ui(ui, material, &taken, palette, thumbnails);
-              (renamed, deleted.then_some(selected))
+              (renamed, deleted.then_some(selected.clone()), cloned.then_some(selected))
             } else {
               ui.weak("Pick a material on the left, or make a new one");
-              (None, None)
+              (None, None, None)
             }
           })
           .inner
       })
       .inner;
 
+    if let Some(name) = &cloned
+      && let Some(material) = list.iter().find(|m| m.name == *name).cloned()
+    {
+      let copy = copy_name(&list, name);
+      list.push(ModelMaterial { name: copy.clone(), ..material });
+      editor.open(&copy)
+    }
     if let Some(name) = &deleted {
       list.retain(|m| m.name != *name);
       model_editor.forget_material(name);
@@ -402,8 +457,41 @@ impl MaterialEditorUi<'_> {
       editor.selected = Some(new.clone())
     }
 
+    // Undoing ends the change underway first, so it's what's undone.
+    if (undo || redo)
+      && let Some(before) = editor.changing.take()
+    {
+      editor.undo.push(before);
+      editor.redo.clear()
+    }
+    let restored = match (undo, redo) {
+      (true, _) => editor.undo.pop().inspect(|_| editor.redo.push(list.clone())),
+      (_, true) => editor.redo.pop().inspect(|_| editor.undo.push(list.clone())),
+      _ => None
+    };
+    if let Some(restored) = restored {
+      // A rename undone or redone renames what's made of it back too: it keeps its place.
+      let differ = list.iter().zip(&restored).filter(|(a, b)| a.name != b.name).collect::<Vec<_>>();
+      if let [(now, then)] = differ.as_slice()
+        && list.len() == restored.len()
+      {
+        renamed = Some((now.name.clone(), then.name.clone()))
+      }
+      let selected = editor
+        .selected
+        .take()
+        .map(|name| renamed.as_ref().filter(|(old, _)| *old == name).map_or(name, |(_, new)| new.clone()))
+        .filter(|name| restored.iter().any(|m| m.name == *name));
+      editor.rename = selected.clone().unwrap_or_default();
+      editor.selected = selected;
+      list = restored
+    }
+
     let old = library.model_materials.list();
     if list != old {
+      if !undo && !redo {
+        editor.changing.get_or_insert_with(|| old.to_vec());
+      }
       let mapping = |list: &[ModelMaterial]| {
         list.iter().map(|m| (m.name.clone(), m.mapping, m.tile)).collect::<Vec<_>>()
       };
@@ -423,6 +511,14 @@ impl MaterialEditorUi<'_> {
         model_meshes.reload_all(model_materials, meshes)
       }
     }
+    // A change ends when nothing is held or typed into.
+    if !ctx.input(|input| input.pointer.any_down())
+      && !ctx.text_edit_focused()
+      && let Some(before) = editor.changing.take()
+    {
+      editor.undo.push(before);
+      editor.redo.clear()
+    }
     if **palette != palette_before
       && let Err(error) = palette.save()
     {
@@ -431,6 +527,88 @@ impl MaterialEditorUi<'_> {
   }
 }
 
+/// The offscreen camera, lights and shapes showing the material being changed.
+#[derive(Resource)]
+struct MaterialPreview {
+  camera: Entity,
+  shapes: [Entity; 2]
+}
+
+/// Renders the material being changed onto a ball and a cube, turning under a lamp and
+/// a sun, while the material editor is open on screen or on the tablet.
+fn show_material_preview(
+  mut editor: ResMut<MaterialEditor>,
+  preview: Option<Res<MaterialPreview>>,
+  open: Res<Editor>,
+  mode: Res<State<Mode>>,
+  time: Res<Time<Real>>,
+  mut library: Library,
+  mut textures: ResMut<EguiUserTextures>,
+  mut cameras: Query<&mut Camera>,
+  mut shapes: Query<(&mut Transform, &mut MeshMaterial3d<StandardMaterial>)>,
+  mut commands: Commands
+) {
+  let shown = *mode.get() == Mode::Edit && *open == Editor::Materials && editor.selected.is_some();
+  match preview {
+    None if shown => {
+      let layer = RenderLayers::layer(PREVIEW_LAYER);
+      let image = library.images.add(Image::new_target_texture(
+        PREVIEW_PIXELS,
+        PREVIEW_PIXELS,
+        TextureFormat::Bgra8UnormSrgb,
+        None
+      ));
+      editor.preview = Some(textures.add_image(EguiTextureHandle::Strong(image.clone())));
+      let camera = commands
+        .spawn((
+          Camera3d::default(),
+          Camera { order: -3, clear_color: ClearColorConfig::Custom(Color::srgb(0.16, 0.17, 0.19)), ..default() },
+          RenderTarget::Image(image.into()),
+          Transform::from_xyz(0.0, 0.9, 2.6).looking_at(Vec3::ZERO, Vec3::Y),
+          layer.clone()
+        ))
+        .id();
+      commands.spawn((
+        PointLight { intensity: 300_000.0, range: 20.0, ..default() },
+        Transform::from_xyz(1.4, 1.6, 1.8),
+        layer.clone()
+      ));
+      commands.spawn((
+        DirectionalLight { illuminance: 4_000.0, ..default() },
+        Transform::from_xyz(-2.0, 3.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
+        layer.clone()
+      ));
+      let Library { meshes, .. } = &mut library;
+      let shapes = [(meshes.add(Sphere::new(0.45).mesh().uv(32, 18)), -0.6), (meshes.add(Cuboid::from_length(0.7)), 0.6)]
+        .map(|(mesh, x)| {
+          commands
+            .spawn((Mesh3d(mesh), MeshMaterial3d::<StandardMaterial>::default(), Transform::from_xyz(x, 0.0, 0.0), layer.clone()))
+            .id()
+        });
+      commands.insert_resource(MaterialPreview { camera, shapes })
+    }
+    None => {}
+    Some(preview) => {
+      if let Ok(mut camera) = cameras.get_mut(preview.camera) {
+        camera.is_active = shown
+      }
+      if shown && let Some(name) = editor.selected.clone() {
+        let Library { model_materials, materials, images, .. } = &mut library;
+        let material = model_materials.handle(&name, materials, images);
+        let turn = Quat::from_rotation_y(time.elapsed_secs() * PREVIEW_TURN) * Quat::from_rotation_x(0.4);
+        preview.shapes.iter().for_each(|&shape| {
+          if let Ok((mut transform, mut handle)) = shapes.get_mut(shape) {
+            transform.rotation = turn;
+            if handle.0 != material {
+              handle.0 = material.clone()
+            }
+          }
+        })
+      }
+    }
+  }
+}
+
 pub fn plugin(app: &mut App) {
-  app.init_resource::<MaterialEditor>().init_resource::<Thumbnails>();
+  app.init_resource::<MaterialEditor>().init_resource::<Thumbnails>().add_systems(Update, show_material_preview);
 }

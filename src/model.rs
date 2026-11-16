@@ -1,8 +1,9 @@
-//! Low poly models: vertices joined into flat polygons, each made of a [`ModelMaterial`]
-//! from the shared library. Authored in the model editor and saved
+//! Low poly models: convex shapes, each made of a [`ModelMaterial`] from the shared
+//! library. Authored in the model editor and saved
 //! as `{MODELS_DIR}/{name}.model.ron`, which the world places like any glTF model.
 
 use {crate::{assets::{self, ASSETS_DIR},
+             hull,
              material::{Mapping, ModelMaterial, ModelMaterials}},
      bevy::{asset::RenderAssetUsages, platform::collections::HashMap, prelude::*,
             render::render_resource::PrimitiveTopology},
@@ -54,13 +55,6 @@ impl<'de> Deserialize<'de> for Rgb {
   }
 }
 
-/// How a face looks: the name of the [`ModelMaterial`] it's made of, or nothing for a
-/// plain one.
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
-pub struct Look {
-  pub material: String
-}
-
 /// A flat polygon through `vertices`, counterclockwise seen from the side it faces.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Face {
@@ -69,61 +63,155 @@ pub struct Face {
   pub material: String
 }
 
-impl Face {
-  pub fn new(vertices: Vec<usize>, look: &Look) -> Self {
-    Self { vertices, material: look.material.clone() }
-  }
-
-  pub fn look(&self) -> Look { Look { material: self.material.clone() } }
-
-  pub fn set_look(&mut self, look: &Look) { self.material.clone_from(&look.material) }
+/// A convex shape: everything between its corners, all of one [`ModelMaterial`], by
+/// name, or nothing for a plain one.
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+pub struct Shape {
+  pub corners: Vec<Vec3>,
+  #[serde(default, skip_serializing_if = "String::is_empty")]
+  pub material: String
 }
 
-/// A model as saved on disk. The origin is where it stands when placed in the world.
+impl Shape {
+  /// The same shape with only the corners on its outside.
+  pub fn tidied(self) -> Self { Self { corners: hull::hull_corners(&self.corners), ..self } }
+}
+
+/// A model as saved on disk: convex shapes. The origin is where it stands when placed
+/// in the world.
 #[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
 pub struct LowPoly {
-  pub vertices: Vec<Vec3>,
-  pub faces: Vec<Face>
+  pub shapes: Vec<Shape>
+}
+
+/// Models as they were saved before they were made of shapes: vertices joined into
+/// polygons.
+#[derive(Deserialize)]
+struct OldLowPoly {
+  vertices: Vec<Vec3>,
+  faces: Vec<Face>
+}
+
+impl From<OldLowPoly> for LowPoly {
+  /// Each piece of faces joined at their vertices becomes the shape around it, of the
+  /// material most of its faces had.
+  fn from(OldLowPoly { vertices, faces }: OldLowPoly) -> Self {
+    // Which piece each vertex is in, joining pieces face by face.
+    let mut piece = (0..vertices.len()).collect::<Vec<_>>();
+    fn find(piece: &mut [usize], v: usize) -> usize {
+      let parent = piece[v];
+      if parent == v {
+        v
+      } else {
+        let root = find(piece, parent);
+        piece[v] = root;
+        root
+      }
+    }
+    faces.iter().for_each(|face| {
+      face.vertices.windows(2).for_each(|pair| {
+        let (a, b) = (find(&mut piece, pair[0]), find(&mut piece, pair[1]));
+        piece[a] = b
+      })
+    });
+    let mut pieces = HashMap::<usize, (Vec<Vec3>, HashMap<String, usize>)>::new();
+    faces.iter().for_each(|face| {
+      let root = face.vertices.first().map(|&v| find(&mut piece, v));
+      if let Some(root) = root {
+        let (_, materials) = pieces.entry(root).or_default();
+        *materials.entry(face.material.clone()).or_default() += 1
+      }
+    });
+    (0..vertices.len()).for_each(|v| {
+      let root = find(&mut piece, v);
+      if let Some((corners, _)) = pieces.get_mut(&root) {
+        corners.push(vertices[v])
+      }
+    });
+    let mut shapes = pieces
+      .into_values()
+      .map(|(corners, materials)| Shape {
+        material: materials.into_iter().max_by_key(|(_, count)| *count).map(|(name, _)| name).unwrap_or_default(),
+        corners
+      }
+      .tidied())
+      .filter(|shape| shape.corners.len() >= 3)
+      .collect::<Vec<_>>();
+    // In a lasting order, so loading twice gives the same model.
+    shapes.sort_by(|a, b| a.corners.first().map(|p| p.to_array()).partial_cmp(&b.corners.first().map(|p| p.to_array())).unwrap_or(std::cmp::Ordering::Equal));
+    Self { shapes }
+  }
 }
 
 impl LowPoly {
   /// Precision positions are saved with, to keep the files readable.
   const SAVED_PRECISION: f32 = 10_000.0;
 
-  /// Reads the model at `path`, relative to [`ASSETS_DIR`].
+  /// Reads the model at `path`, relative to [`ASSETS_DIR`]: made of shapes, or of faces
+  /// as models were before.
   pub fn load(path: &str) -> Result<Self, String> {
     let bytes = assets::read(path).ok_or_else(|| format!("{path} doesn't exist"))?;
     let text = str::from_utf8(&bytes).map_err(|error| format!("{path}: {error}"))?;
-    ron::from_str(text).map_err(|error| format!("{path}: {error}"))
+    ron::from_str::<Self>(text).or_else(|error| {
+      ron::from_str::<OldLowPoly>(text).map(Self::from).map_err(|_| format!("{path}: {error}"))
+    })
   }
 
   /// Writes the model to `path`, relative to [`ASSETS_DIR`].
   pub fn save(&self, path: &str) -> io::Result<()> {
+    let round = |v: Vec3| (v * Self::SAVED_PRECISION).round() / Self::SAVED_PRECISION + 0.0;
     let rounded = Self {
-      vertices: self
-        .vertices
+      shapes: self
+        .shapes
         .iter()
-        .map(|v| (*v * Self::SAVED_PRECISION).round() / Self::SAVED_PRECISION + 0.0)
-        .collect(),
-      faces: self.faces.clone()
+        .map(|shape| Shape { corners: shape.corners.iter().copied().map(round).collect(), ..shape.clone() })
+        .collect()
     };
     let path = Path::new(ASSETS_DIR).join(path);
     if let Some(parent) = path.parent() {
       fs::create_dir_all(parent)?
     }
-    ron::ser::to_string_pretty(&rounded, ron::ser::PrettyConfig::new().depth_limit(2))
+    ron::ser::to_string_pretty(&rounded, ron::ser::PrettyConfig::new().depth_limit(3))
       .map_err(io::Error::other)
       .and_then(|text| fs::write(path, text))
   }
 
+  /// The faces of every shape, with the shape each came from.
+  pub fn surface(&self) -> (Surface, Vec<usize>) {
+    self.shapes.iter().enumerate().fold((Surface::default(), Vec::new()), |(mut surface, mut from), (s, shape)| {
+      if let Some(hull) = hull::hull(&shape.corners) {
+        let offset = surface.vertices.len();
+        surface.vertices.extend(&shape.corners);
+        hull.faces.into_iter().for_each(|face| {
+          surface.faces.push(Face {
+            vertices: face.into_iter().map(|v| v + offset).collect(),
+            material: shape.material.clone()
+          });
+          from.push(s)
+        })
+      }
+      (surface, from)
+    })
+  }
+
+  /// The meshes as the game renders them, lit by the scene, their materials giving the
+  /// color.
+  pub fn meshes(&self, materials: &ModelMaterials) -> Vec<(String, Mesh)> {
+    self.surface().0.meshes_with(|name| materials.get(name), |_, _, _| LinearRgba::WHITE)
+  }
+}
+
+/// The outside of a model: vertices joined into flat polygons, for drawing it.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct Surface {
+  pub vertices: Vec<Vec3>,
+  pub faces: Vec<Face>
+}
+
+impl Surface {
   /// The corners of face `face`.
   pub fn corners(&self, face: usize) -> impl Iterator<Item = Vec3> + '_ {
     self.faces[face].vertices.iter().map(|&v| self.vertices[v])
-  }
-
-  pub fn face_center(&self, face: usize) -> Vec3 {
-    let count = self.faces[face].vertices.len().max(1);
-    self.corners(face).sum::<Vec3>() / count as f32
   }
 
   /// The unit normal of a face, by Newell's method so slightly bent polygons work too.
@@ -141,13 +229,6 @@ impl LowPoly {
           )
       })
       .normalize_or_zero()
-  }
-
-  /// The triangles of face `face`, as a fan from its first corner.
-  pub fn face_triangles(&self, face: usize) -> impl Iterator<Item = [Vec3; 3]> + '_ {
-    let vertices = &self.faces[face].vertices;
-    (1..vertices.len().saturating_sub(1))
-      .map(move |i| [vertices[0], vertices[i], vertices[i + 1]].map(|v| self.vertices[v]))
   }
 
   /// Texture coordinates of each corner of face `face`, projected along the axis it
@@ -214,12 +295,6 @@ impl LowPoly {
         (name, mesh.into())
       })
       .collect()
-  }
-
-  /// The meshes as the game renders them, lit by the scene, their materials giving the
-  /// color.
-  pub fn meshes(&self, materials: &ModelMaterials) -> Vec<(String, Mesh)> {
-    self.meshes_with(|name| materials.get(name), |_, _, _| LinearRgba::WHITE)
   }
 }
 
@@ -307,61 +382,67 @@ mod tests {
     assert_eq!(Rgb([1, 2, 255]).hex(), "#0102ff")
   }
 
+  fn cube(material: &str) -> Shape {
+    Shape {
+      corners: (0..8).map(|i| Vec3::new((i & 1) as f32, (i >> 1 & 1) as f32, (i >> 2) as f32)).collect(),
+      material: material.into()
+    }
+  }
+
   #[test]
   fn models_round_trip_through_ron() {
-    let model = LowPoly {
-      vertices: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
-      faces: vec![Face::new(vec![0, 1, 2], &Look::default())]
-    };
+    let model = LowPoly { shapes: vec![cube("")] };
     let text = ron::to_string(&model).unwrap();
     assert!(!text.contains("material"));
     assert_eq!(ron::from_str::<LowPoly>(&text).unwrap(), model);
-    assert_eq!(model.face_normal(0), Vec3::Z);
-    let parts = model.meshes_with(|_| None, |_, color, _| color.color().to_linear());
+    let (surface, from) = model.surface();
+    assert_eq!(surface.faces.len(), 6);
+    assert_eq!(from, [0; 6]);
+    let parts = surface.meshes_with(|_| None, |_, color, _| color.color().to_linear());
     assert_eq!(parts.len(), 1);
-    assert_eq!(parts[0].1.count_vertices(), 3)
+    assert_eq!(parts[0].1.count_vertices(), 36)
+  }
+
+  #[test]
+  fn old_models_become_shapes() {
+    let old = "(vertices: [(0,0,0), (1,0,0), (0,1,0), (0,0,1), (5,5,5), (6,5,5), (5,6,5)], \
+               faces: [(vertices: [0, 2, 1], material: \"wood\"), (vertices: [0, 1, 3]), \
+                       (vertices: [0, 3, 2], material: \"wood\"), (vertices: [1, 2, 3]), \
+                       (vertices: [4, 5, 6])])";
+    let model = LowPoly::from(ron::from_str::<OldLowPoly>(old).unwrap());
+    assert_eq!(model.shapes.len(), 2);
+    assert!(model.shapes.iter().any(|shape| shape.material == "wood" && shape.corners.len() == 4));
   }
 
   #[test]
   fn materials_split_meshes_and_map_textures() {
-    let wood = Look { material: "wood".into() };
-    let mut model = LowPoly {
-      vertices: vec![
-        Vec3::ZERO,
-        Vec3::X * 2.0,
-        Vec3::new(2.0, 2.0, 0.0),
-        Vec3::Y * 2.0,
-        Vec3::Z,
-      ],
-      faces: vec![
-        Face::new(vec![0, 1, 2, 3], &wood),
-        Face::new(vec![0, 4, 1], &Look::default()),
-      ]
-    };
+    let model = LowPoly { shapes: vec![cube("wood"), cube("")] };
     let text = ron::to_string(&model).unwrap();
     assert!(text.contains("material:\"wood\""));
-    assert_eq!(ron::from_str::<LowPoly>(&text).unwrap(), model);
-    let parts = model.meshes_with(|_| None, |_, color, _| color.color().to_linear());
+    let parts = model.surface().0.meshes_with(|_| None, |_, color, _| color.color().to_linear());
     let names = parts.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
     assert_eq!(names, ["wood", ""]);
-    assert_eq!(parts[0].1.count_vertices(), 6);
 
     // A wall facing +z: u runs along x, v down y, so the texture is upright.
-    assert_eq!(model.face_uvs(0, Mapping::Tile, 1.0), [
+    let mut wall = Surface {
+      vertices: vec![Vec3::ZERO, Vec3::X * 2.0, Vec3::new(2.0, 2.0, 0.0), Vec3::Y * 2.0],
+      faces: vec![Face { vertices: vec![0, 1, 2, 3], material: default() }]
+    };
+    assert_eq!(wall.face_uvs(0, Mapping::Tile, 1.0), [
       Vec2::new(0.0, 0.0),
       Vec2::new(2.0, 0.0),
       Vec2::new(2.0, -2.0),
       Vec2::new(0.0, -2.0)
     ]);
-    assert_eq!(model.face_uvs(0, Mapping::Fit, 1.0), [
+    assert_eq!(wall.face_uvs(0, Mapping::Fit, 1.0), [
       Vec2::new(0.0, 1.0),
       Vec2::new(1.0, 1.0),
       Vec2::new(1.0, 0.0),
       Vec2::new(0.0, 0.0)
     ]);
     // Turned to face -z, x runs right to left seen from its side, and so does u.
-    model.faces[0].vertices.reverse();
-    assert_eq!(model.face_uvs(0, Mapping::Fit, 1.0), [
+    wall.faces[0].vertices.reverse();
+    assert_eq!(wall.face_uvs(0, Mapping::Fit, 1.0), [
       Vec2::new(1.0, 0.0),
       Vec2::new(0.0, 0.0),
       Vec2::new(0.0, 1.0),

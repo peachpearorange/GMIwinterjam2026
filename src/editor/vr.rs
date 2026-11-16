@@ -8,18 +8,20 @@
 //! tool on whatever the controller's tip touches, or else on what its laser points at.
 //!
 //! - Either grip grabs the world to move it. Both grips together turn it and change its
-//!   size, like stretching a photo.
+//!   size, like stretching a photo. In the model editor a grip holds the model, turning it
+//!   with the hand, or with the tip on a shape picks up that shape; gripping it with both
+//!   hands stretches it.
 //! - The left stick flies through the world, the right stick up and down. The right stick
 //!   scrolls the tablet when pointing at it.
 //! - The left trigger held is Shift, for picking several things.
-//! - X undoes, Y redoes. A builds the shape in Build from corners, B takes back its last
-//!   corner.
+//! - X undoes, Y redoes. In the model editor, A leaves a copy of a shape held behind.
 //!
 //! While the headset shows the world, the window shows what it sees.
 
 use {super::{Editor, enable_camera,
              material_editor::MaterialEditorUi,
              model_editor::{BACKGROUND, LAYER, ModelEditor, ModelEditorUi},
+             pixel_editor::PixelEditorUi,
              world_editor::{ReadPointer, WorldEditorUi, WorldPointer, read_mouse}},
      crate::Mode,
      bevy::{anti_alias::{fxaa::Fxaa, smaa::Smaa},
@@ -76,15 +78,29 @@ const MODEL_SCALE: (f32, f32) = (0.005, 50.0);
 const MODEL_RADIUS: f32 = 0.25;
 
 /// Size of the tablet in meters, its picture in pixels, and how big egui draws on it.
-const TABLET_SIZE: Vec2 = Vec2::new(0.32, 0.36);
-const TABLET_PIXELS: UVec2 = UVec2::new(1120, 1260);
-const TABLET_ZOOM: f32 = 2.0;
+const TABLET_SIZE: Vec2 = Vec2::new(0.4, 0.32);
+const TABLET_PIXELS: UVec2 = UVec2::new(1400, 1120);
+const TABLET_ZOOM: f32 = 1.4;
 const TABLET_BACKGROUND: Color = Color::srgb(0.11, 0.11, 0.13);
 /// Where the tablet sits from the left controller's grip: above it, leaning back
 /// toward the eyes.
 fn tablet_offset() -> Transform {
-  Transform::from_xyz(0.0, 0.19, 0.03).with_rotation(Quat::from_rotation_x(-0.55))
+  Transform::from_xyz(0.0, 0.21, 0.03).with_rotation(Quat::from_rotation_x(-0.55))
 }
+/// How far the laser can wander on the tablet between pressing and letting go and
+/// still click, in egui's points: about a centimeter.
+const TABLET_CLICK_SLACK: f32 = 30.0;
+/// The tablet showing the top `fraction` of its height, from the left grip: its top
+/// edge stays put.
+fn tablet_quad(fraction: f32) -> Transform {
+  tablet_offset()
+    * Transform::from_xyz(0.0, TABLET_SIZE.y * (1.0 - fraction) / 2.0, 0.0)
+      .with_scale(Vec3::new(1.0, fraction, 1.0))
+}
+/// The least of its height the tablet shows.
+const TABLET_LEAST_FRACTION: f32 = 0.2;
+/// The outline of the text field being typed into.
+const FOCUS_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 200, 40);
 /// How far a full push of the right stick scrolls the tablet, in points a second.
 const SCROLL_SPEED: f32 = 900.0;
 
@@ -358,7 +374,7 @@ fn space(mode: &Mode, editor: &Editor) -> Space {
 struct Grab {
   hands: [bool; 2],
   root: Transform,
-  points: [Vec3; 2]
+  grips: [Transform; 2]
 }
 
 /// Where the tracking root stands in each space, to come back to.
@@ -410,6 +426,7 @@ fn navigate(
   model_editor: Res<ModelEditor>,
   terrain: Option<Res<Terrain>>,
   tablet: Res<TabletPointer>,
+  shapes: Res<HeldShapes>,
   time: Res<Time<Real>>,
   desktop: Single<&Transform, (With<FreeCamera>, Without<XrTrackingRoot>)>,
   mut root: Single<&mut Transform, With<XrTrackingRoot>>,
@@ -444,13 +461,30 @@ fn navigate(
 
   // Grabbing.
   let hands = input.hands;
-  let held = [0, 1].map(|h| hands[h].squeeze.down && hands[h].tracked);
-  let points = [0, 1].map(|h| hands[h].grip.translation);
+  // A hand holding a shape of the model, or about to, leaves the model where it is.
+  let held = [0, 1].map(|h| {
+    hands[h].squeeze.down && hands[h].tracked && !(space == Space::Model && shapes.hands[h])
+  });
+  let grips = [0, 1].map(|h| hands[h].grip);
+  let points = grips.map(|grip| grip.translation);
   if navigation.grab.is_none_or(|grab| grab.hands != held) {
-    navigation.grab = held.contains(&true).then_some(Grab { hands: held, root: **root, points })
+    navigation.grab = held.contains(&true).then_some(Grab { hands: held, root: **root, grips })
   }
   let (low, high) = if space == Space::World { WORLD_SCALE } else { MODEL_SCALE };
-  if let Some(Grab { hands: held, root: then, points: from }) = navigation.grab {
+  if let Some(Grab { hands: held, root: then, grips: from_grips }) = navigation.grab
+    && space == Space::Model
+    && held != [true, true]
+  {
+    // One hand holds the model and carries it, turning as the hand turns.
+    let h = if held[LEFT] { LEFT } else { RIGHT };
+    let now = grips[h];
+    let inverse_rotation = now.rotation.inverse();
+    let inverse = Transform::from_rotation(inverse_rotation)
+      .with_translation(-(inverse_rotation * now.translation));
+    let moved = then.mul_transform(from_grips[h]).mul_transform(inverse);
+    **root = moved.with_scale(then.scale)
+  } else if let Some(Grab { hands: held, root: then, grips: from_grips }) = navigation.grab {
+    let from = from_grips.map(|grip| grip.translation);
     let (anchor_then, anchor_now, rotation, scale) = match held {
       [true, true] => {
         let (before, after) = (from[1] - from[0], points[1] - points[0]);
@@ -488,7 +522,25 @@ fn navigate(
   }
 }
 
-/// The right controller as the editors see it, in the world.
+/// A controller as the editors see it, in the world.
+#[derive(Clone, Copy, Default)]
+pub(super) struct VrHand {
+  pub tracked: bool,
+  /// The holding pose, without the world's size.
+  pub grip: Transform,
+  /// Where it touches things.
+  pub tip: Vec3,
+  pub squeeze: Button
+}
+
+/// Hands holding shapes of the model, or that would pick one up on gripping: the
+/// model editor says, and these don't hold the model.
+#[derive(Resource, Default)]
+pub(super) struct HeldShapes {
+  pub hands: [bool; 2]
+}
+
+/// The right controller as the editors see it, in the world, and both hands.
 #[derive(Resource)]
 pub(super) struct VrPointer {
   /// Whether the headset shows an editor.
@@ -503,17 +555,17 @@ pub(super) struct VrPointer {
   pub tip: Vec3,
   /// World units per meter.
   pub scale: f32,
-  pub head: Vec3,
   /// The right trigger, for the tools: never down for a press the tablet took.
   pub trigger: Button,
   pub shift: bool,
-  /// A, B, X and Y just pressed.
-  pub build: bool,
-  pub back: bool,
+  /// A, X and Y just pressed.
+  pub copy: bool,
   pub undo: bool,
   pub redo: bool,
   /// Degrees the controller has been twisted clockwise, counted from anywhere.
-  pub twist: f32
+  pub twist: f32,
+  /// The left hand and the right.
+  pub hands: [VrHand; 2]
 }
 
 impl Default for VrPointer {
@@ -526,14 +578,13 @@ impl Default for VrPointer {
       ray: Ray3d::new(Vec3::ZERO, Dir3::NEG_Z),
       tip: default(),
       scale: 1.0,
-      head: default(),
       trigger: default(),
       shift: false,
-      build: false,
-      back: false,
       undo: false,
+      copy: false,
       redo: false,
-      twist: 0.0
+      twist: 0.0,
+      hands: default()
     }
   }
 }
@@ -561,6 +612,18 @@ fn update_pointer(
   let twist = (2.0 * along.atan2(turned.w)).to_degrees();
   let twist = (twist + 540.0).rem_euclid(360.0) - 180.0;
   let forward = aim.rotation * Vec3::NEG_Z;
+  let vr_hands = [0, 1].map(|h| {
+    let hand = hands[h];
+    let rotation = root.rotation * hand.aim.rotation;
+    VrHand {
+      tracked: hand.tracked,
+      grip: Transform::from_translation(root.transform_point(hand.grip.translation))
+        .with_rotation(root.rotation * hand.grip.rotation),
+      tip: root.transform_point(hand.aim.translation)
+        + rotation * Vec3::NEG_Z * TIP_REACH * scale,
+      squeeze: hand.squeeze
+    }
+  });
   let mut trigger = pointer.trigger;
   trigger.update(right.trigger.down && !tablet.owns_press);
   *pointer = VrPointer {
@@ -571,15 +634,14 @@ fn update_pointer(
     ray: Ray3d::new(aim.translation, Dir3::new(forward).unwrap_or(Dir3::NEG_Z)),
     tip: aim.translation + forward * TIP_REACH * scale,
     scale,
-    head: root.transform_point(input.head.translation),
     trigger,
     shift: hands[LEFT].trigger.down,
-    build: right.lower.just_pressed(),
-    back: right.upper.just_pressed(),
+    copy: right.lower.just_pressed(),
     undo: hands[LEFT].lower.just_pressed(),
     redo: hands[LEFT].upper.just_pressed(),
     // The aim pose's -z points away, so a clockwise twist turns it negatively around it.
-    twist: pointer.twist - if twist.is_finite() { twist } else { 0.0 }
+    twist: pointer.twist - if twist.is_finite() { twist } else { 0.0 },
+    hands: vr_hands
   }
 }
 
@@ -785,15 +847,58 @@ struct TabletCamera;
 #[derive(Component)]
 struct TabletQuad;
 
-/// Keys typed on the tablet's keyboard, for the text field they're for.
+/// A key on the tablet's keyboard.
+#[derive(Clone, Copy)]
+enum TabletKey {
+  Char(char),
+  Shift,
+  Space,
+  Backspace,
+  Done
+}
+
+/// The tablet's keyboard, for typing into the text field with the focus. Its keys
+/// aren't egui buttons: a click on one would take the focus from the field.
 #[derive(Default)]
 struct Keyboard {
-  /// The field typed into, kept focused while keys are clicked.
-  target: Option<egui::Id>,
-  pending: Vec<egui::Event>,
+  /// Whether a text field has the focus, so the keyboard shows.
+  shown: bool,
   shift: bool,
-  /// Whether a key was clicked this frame, so the field wasn't left.
-  refocus: bool
+  /// Where each key was drawn last frame, in egui's points.
+  keys: Vec<(egui::Rect, TabletKey)>,
+  /// Where the keys and the gaps between them were: a press there, between keys too,
+  /// doesn't reach egui, so the field keeps the focus.
+  area: Option<egui::Rect>
+}
+
+impl Keyboard {
+  /// Presses `key`: what it sends the text field.
+  fn press(&mut self, key: TabletKey) -> Vec<egui::Event> {
+    let tap = |key| {
+      [true, false]
+        .map(|pressed| egui::Event::Key {
+          key,
+          physical_key: None,
+          pressed,
+          repeat: false,
+          modifiers: egui::Modifiers::NONE
+        })
+        .to_vec()
+    };
+    match key {
+      TabletKey::Char(c) => {
+        vec![egui::Event::Text(if self.shift { c.to_ascii_uppercase() } else { c }.to_string())]
+      }
+      TabletKey::Space => vec![egui::Event::Text(" ".into())],
+      TabletKey::Backspace => tap(egui::Key::Backspace),
+      // Enter takes the focus from the field, and what's typed counts.
+      TabletKey::Done => tap(egui::Key::Enter),
+      TabletKey::Shift => {
+        self.shift = !self.shift;
+        vec![]
+      }
+    }
+  }
 }
 
 #[derive(Resource)]
@@ -803,6 +908,9 @@ struct Tablet {
   mesh: Handle<Mesh>,
   /// The tablet's area in egui's points.
   rect: egui::Rect,
+  /// How much of its height, from the top, the tablet shows: as much as what's on it
+  /// needs.
+  fraction: f32,
   keyboard: Keyboard,
   /// Whether its style has been set up.
   styled: bool
@@ -816,7 +924,9 @@ struct TabletPointer {
   /// Where in the world, for the laser.
   point: Option<Vec3>,
   /// Whether a press began on the tablet and hasn't been let go.
-  owns_press: bool
+  owns_press: bool,
+  /// Whether that press was on the keyboard, which egui doesn't hear of.
+  on_key: bool
 }
 
 /// Makes the tablet's picture once the window has its UI, so the window's stays first.
@@ -835,7 +945,8 @@ fn make_tablet(
   let image = images.add(Image::new_target_texture(
     TABLET_PIXELS.x,
     TABLET_PIXELS.y,
-    TextureFormat::Bgra8UnormSrgb,
+    // bevy_egui's pipeline assumes this format for non-HDR targets.
+    TextureFormat::Rgba8UnormSrgb,
     None
   ));
   let context = commands
@@ -864,29 +975,40 @@ fn make_tablet(
       egui::Pos2::ZERO,
       egui::vec2(TABLET_PIXELS.x as f32, TABLET_PIXELS.y as f32) / TABLET_ZOOM
     ),
+    fraction: 1.0,
     keyboard: default(),
     styled: false
   })
 }
 
-/// Puts the tablet in the left hand.
+/// Puts the tablet in the left hand, showing as much of it as what's on it needs.
 fn hold_tablet(
   tablet: Option<Res<Tablet>>,
   poses: Query<(Entity, &HandPose)>,
-  quads: Query<(), With<TabletQuad>>,
+  mut quads: Query<&mut Transform, With<TabletQuad>>,
+  mut materials: ResMut<Assets<StandardMaterial>>,
   mut commands: Commands
 ) {
-  let Some(tablet) = tablet else { return };
-  if quads.is_empty() {
-    if let Some((grip, _)) = poses.iter().find(|(_, pose)| pose.hand == LEFT && !pose.aim) {
+  if let Some(tablet) = tablet {
+    let quad = tablet_quad(tablet.fraction);
+    if quads.is_empty()
+      && let Some((grip, _)) = poses.iter().find(|(_, pose)| pose.hand == LEFT && !pose.aim)
+    {
       commands.entity(grip).with_child((
         TabletQuad,
         Mesh3d(tablet.mesh.clone()),
         MeshMaterial3d(tablet.material.clone()),
-        tablet_offset(),
+        quad,
         NotShadowCaster,
         RenderLayers::layer(VR_LAYER)
       ));
+    }
+    quads.iter_mut().for_each(|mut transform| {
+      transform.set_if_neq(quad);
+    });
+    let crop = bevy::math::Affine2::from_scale(Vec2::new(1.0, tablet.fraction));
+    if let Some(mut material) = materials.get_mut(&tablet.material).filter(|material| material.uv_transform != crop) {
+      material.uv_transform = crop
     }
   }
 }
@@ -906,11 +1028,11 @@ fn tablet_input(
   let mut send = |event| {
     events.write(EguiInputEvent { context, event });
   };
-  tablet.keyboard.pending.drain(..).for_each(&mut send);
   let (left, right) = (input.hands[LEFT], input.hands[RIGHT]);
   let shown = input.running && left.tracked && right.tracked;
   let scale = root.scale.x;
-  let quad = root.mul_transform(left.grip).mul_transform(tablet_offset());
+  let fraction = tablet.fraction;
+  let quad = root.mul_transform(left.grip).mul_transform(tablet_quad(fraction));
   let aim = root.mul_transform(right.aim);
   let (origin, direction) = (aim.translation, aim.rotation * Vec3::NEG_Z);
   let normal = quad.rotation * Vec3::Z;
@@ -919,7 +1041,7 @@ fn tablet_input(
   let offset = point - quad.translation;
   let uv = Vec2::new(
     offset.dot(quad.rotation * Vec3::X) / (TABLET_SIZE.x * scale) + 0.5,
-    0.5 - offset.dot(quad.rotation * Vec3::Y) / (TABLET_SIZE.y * scale)
+    0.5 - offset.dot(quad.rotation * Vec3::Y) / (TABLET_SIZE.y * fraction * scale)
   );
   let hit = shown
     && t.is_finite()
@@ -928,24 +1050,31 @@ fn tablet_input(
     && (0.0..=1.0).contains(&uv.x)
     && (0.0..=1.0).contains(&uv.y);
   let rect = tablet.rect;
-  let at = rect.min + egui::vec2(uv.x, uv.y).clamp(egui::Vec2::ZERO, egui::Vec2::splat(1.0))
-    * rect.size();
+  let at = rect.min
+    + egui::vec2(uv.x, uv.y * fraction).clamp(egui::Vec2::ZERO, egui::vec2(1.0, fraction)) * rect.size();
   let modifiers = egui::Modifiers { shift: left.trigger.down, ..default() };
   if hit || pointer.owns_press && shown {
     send(egui::Event::PointerMoved(at));
     if hit && right.trigger.just_pressed() {
       pointer.owns_press = true;
-      send(egui::Event::PointerButton {
-        pos: at,
-        button: egui::PointerButton::Primary,
-        pressed: true,
-        modifiers
-      })
+      let keyboard = &mut tablet.keyboard;
+      pointer.on_key = keyboard.shown && keyboard.area.is_some_and(|area| area.contains(at));
+      if pointer.on_key {
+        let key = keyboard.keys.iter().find(|(rect, _)| rect.contains(at)).map(|&(_, key)| key);
+        key.into_iter().flat_map(|key| keyboard.press(key)).for_each(&mut send)
+      } else {
+        send(egui::Event::PointerButton {
+          pos: at,
+          button: egui::PointerButton::Primary,
+          pressed: true,
+          modifiers
+        })
+      }
     }
     if hit && right.stick.y != 0.0 {
       send(egui::Event::MouseWheel {
         unit: egui::MouseWheelUnit::Point,
-        delta: egui::vec2(0.0, -right.stick.y * SCROLL_SPEED * time.delta_secs()),
+        delta: egui::vec2(0.0, right.stick.y * SCROLL_SPEED * time.delta_secs()),
         phase: egui::TouchPhase::Move,
         modifiers
       })
@@ -955,57 +1084,47 @@ fn tablet_input(
   }
   if pointer.owns_press && (!right.trigger.down || !shown) {
     pointer.owns_press = false;
-    send(egui::Event::PointerButton {
-      pos: at,
-      button: egui::PointerButton::Primary,
-      pressed: false,
-      modifiers
-    })
+    if !std::mem::take(&mut pointer.on_key) {
+      send(egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers
+      })
+    }
   }
   pointer.at = hit.then_some(at);
   pointer.point = (hit || pointer.owns_press && shown).then_some(point)
 }
 
-/// A keyboard on the tablet for typing into text fields, as the headset has none.
+/// A keyboard on the tablet for typing into text fields, as the headset has none. Its
+/// keys only show hovering: `tablet_input` presses them.
 fn keyboard_ui(ui: &mut egui::Ui, keyboard: &mut Keyboard) {
   const ROWS: [&str; 4] = ["1234567890", "qwertyuiop", "asdfghjkl-", "zxcvbnm_/."];
-  let key = egui::vec2(44.0, 38.0);
-  let mut typed = Vec::new();
+  let size = egui::vec2(44.0, 38.0);
+  let shift = keyboard.shift;
+  let mut keys = Vec::new();
+  let mut key = |ui: &mut egui::Ui, width: f32, button: egui::Button, key: TabletKey| {
+    let response = ui.add_sized(size * egui::vec2(width, 1.0), button.sense(egui::Sense::hover()));
+    keys.push((response.rect, key))
+  };
   ROWS.into_iter().for_each(|row| {
     ui.horizontal(|ui| {
       row.chars().for_each(|c| {
-        let c = if keyboard.shift { c.to_ascii_uppercase() } else { c };
-        if ui.add_sized(key, egui::Button::new(c.to_string())).clicked() {
-          typed.push(egui::Event::Text(c.to_string()))
-        }
+        let shown = if shift { c.to_ascii_uppercase() } else { c };
+        key(ui, 1.0, egui::Button::new(shown.to_string()), TabletKey::Char(c))
       })
     });
   });
   ui.horizontal(|ui| {
-    if ui.add_sized(key * egui::vec2(2.0, 1.0), egui::Button::selectable(keyboard.shift, "Shift")).clicked() {
-      keyboard.shift = !keyboard.shift;
-      keyboard.refocus = true
-    }
-    if ui.add_sized(key * egui::vec2(4.0, 1.0), egui::Button::new("Space")).clicked() {
-      typed.push(egui::Event::Text(" ".into()))
-    }
-    if ui.add_sized(key * egui::vec2(2.0, 1.0), egui::Button::new("⌫")).clicked() {
-      typed.extend([true, false].map(|pressed| egui::Event::Key {
-        key: egui::Key::Backspace,
-        physical_key: None,
-        pressed,
-        repeat: false,
-        modifiers: egui::Modifiers::NONE
-      }))
-    }
-    if ui.add_sized(key * egui::vec2(2.0, 1.0), egui::Button::new("Done")).clicked() {
-      keyboard.target = None
-    }
+    key(ui, 2.0, egui::Button::selectable(shift, "Shift"), TabletKey::Shift);
+    key(ui, 4.0, egui::Button::new("Space"), TabletKey::Space);
+    key(ui, 2.0, egui::Button::new("⌫"), TabletKey::Backspace);
+    key(ui, 2.0, egui::Button::new("Done"), TabletKey::Done)
   });
-  if !typed.is_empty() {
-    keyboard.pending.extend(typed);
-    keyboard.refocus = true
-  }
+  let spacing = ui.spacing().item_spacing;
+  keyboard.area = keys.iter().map(|(rect, _)| rect.expand2(spacing)).reduce(|area, rect| area.union(rect));
+  keyboard.keys = keys
 }
 
 /// The tablet's UI: the editors it can show, and the one showing.
@@ -1016,49 +1135,88 @@ fn tablet_ui(
   mut next: ResMut<NextState<Mode>>,
   mut tablet: ResMut<Tablet>,
   mut navigation: ResMut<Navigation>,
-  mut editors: ParamSet<(WorldEditorUi, ModelEditorUi, MaterialEditorUi)>
+  mut editors: ParamSet<(WorldEditorUi, ModelEditorUi, MaterialEditorUi, PixelEditorUi)>
 ) {
   let ctx = context.get_mut().clone();
   if !tablet.styled {
     ctx.set_zoom_factor(TABLET_ZOOM);
+    // A laser shakes as the trigger is pulled: still a click, not a drag or a scroll.
+    ctx.options_mut(|options| {
+      options.input_options.max_click_dist = TABLET_CLICK_SLACK;
+      options.input_options.max_click_duration = 1.5
+    });
     ctx.all_styles_mut(|style| {
-      style.spacing.button_padding = egui::vec2(10.0, 6.0);
-      style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-      style.spacing.interact_size.y = 30.0;
-      style.spacing.scroll.bar_width = 14.0;
+      style.spacing.button_padding = egui::vec2(6.0, 4.0);
+      style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+      style.spacing.interact_size.y = 24.0;
+      style.spacing.scroll.bar_width = 12.0;
       // A laser shakes more than a mouse.
-      style.interaction.interact_radius = 8.0
+      style.interaction.interact_radius = 8.0;
+      // No hover hints: one stays open while the laser moves toward it, covering what's
+      // under it and taking its click.
+      style.interaction.tooltip_delay = f32::INFINITY;
+      // The text field being typed into stands out.
+      style.visuals.selection.stroke.width = 3.0
     });
     tablet.styled = true
   }
   tablet.rect = ctx.viewport_rect();
 
-  // Text fields keep the keyboard up until another click.
+  // The keyboard shows while a text field has the focus.
   let keyboard = &mut tablet.keyboard;
-  let focused = ctx.memory(|memory| memory.focused()).filter(|_| ctx.egui_wants_keyboard_input());
-  if focused.is_some() {
-    keyboard.target = focused
-  } else if !keyboard.refocus {
-    keyboard.target = None
+  keyboard.shown = ctx.text_edit_focused();
+  if !keyboard.shown {
+    keyboard.keys.clear();
+    keyboard.area = None
   }
-  keyboard.refocus = false;
 
   let mut root = super::root_ui(&ctx);
-  if *mode.get() == Mode::Play {
-    egui::CentralPanel::default().show(&mut root, |ui| {
-      ui.vertical_centered_justified(|ui| {
-        if ui.add_sized([ui.available_width(), 60.0], egui::Button::new("Edit")).clicked() {
-          next.set(Mode::Edit)
-        }
+  // Where what's on the tablet ends, for showing only that much of it: all of it for
+  // editors filling it with panels, and while the keyboard is up at the bottom.
+  let bottom = if *mode.get() == Mode::Play {
+    egui::CentralPanel::default()
+      .show(&mut root, |ui| {
+        let edit = ui.vertical_centered_justified(|ui| {
+          if ui.add_sized([ui.available_width(), 60.0], egui::Button::new("Edit")).clicked() {
+            next.set(Mode::Edit)
+          }
+        });
+        Some(edit.response.rect.bottom())
       })
-    });
-    return;
+      .inner
+  } else {
+    edit_ui(&mut root, &mut editor, &mut next, keyboard, &mut navigation, &mut editors)
+  };
+  // The text field being typed into, outlined over everything.
+  if let Some(field) = ctx.memory(|memory| memory.focused()).filter(|_| tablet.keyboard.shown)
+    && let Some(response) = ctx.read_response(field)
+  {
+    ctx
+      .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("vr_focus")))
+      .rect_stroke(response.rect.expand(3.0), 3.0, egui::Stroke::new(3.0, FOCUS_COLOR), egui::StrokeKind::Outside);
   }
-  egui::Panel::top("vr_editors").show(&mut root, |ui| {
+  let height = tablet.rect.height().max(1.0);
+  tablet.fraction = bottom
+    .filter(|_| !tablet.keyboard.shown)
+    .map_or(1.0, |bottom| ((bottom + 8.0) / height).clamp(TABLET_LEAST_FRACTION, 1.0))
+}
+
+/// The tablet's UI while editing: the editors it can show, the one showing and the
+/// keyboard. Where what's on it ends, if it doesn't fill it.
+fn edit_ui(
+  root: &mut egui::Ui,
+  editor: &mut Editor,
+  next: &mut NextState<Mode>,
+  keyboard: &mut Keyboard,
+  navigation: &mut Navigation,
+  editors: &mut ParamSet<(WorldEditorUi, ModelEditorUi, MaterialEditorUi, PixelEditorUi)>
+) -> Option<f32> {
+  egui::Panel::top("vr_editors").show(root, |ui| {
     ui.horizontal(|ui| {
-      ui.selectable_value(&mut *editor, Editor::World, "World");
-      ui.selectable_value(&mut *editor, Editor::Models, "Models");
-      ui.selectable_value(&mut *editor, Editor::Materials, "Materials");
+      ui.selectable_value(editor, Editor::World, "World");
+      ui.selectable_value(editor, Editor::Models, "Models");
+      ui.selectable_value(editor, Editor::Materials, "Materials");
+      ui.selectable_value(editor, Editor::Textures, "Textures");
       ui.separator();
       let reset = match *editor {
         Editor::Models | Editor::Materials => "Show whole model",
@@ -1072,25 +1230,33 @@ fn tablet_ui(
       }
     });
   });
-  if keyboard.target.is_some() {
-    egui::Panel::bottom("vr_keyboard").show(&mut root, |ui| keyboard_ui(ui, keyboard));
-  }
-  if let Some(target) = keyboard.target.filter(|_| keyboard.refocus) {
-    ctx.memory_mut(|memory| memory.request_focus(target))
-  }
+  // Always there, empty while hidden: its showing up would change the ids of what's
+  // drawn after it, taking the focus from the field it's for.
+  let panel = egui::Panel::bottom("vr_keyboard").resizable(false).show_separator_line(keyboard.shown);
+  let panel = if keyboard.shown { panel } else { panel.frame(egui::Frame::NONE).exact_size(0.0) };
+  panel.show(root, |ui| {
+    if keyboard.shown {
+      keyboard_ui(ui, keyboard)
+    }
+  });
+  // The panel itself takes the whole height: what's in it, in its own scope, doesn't.
+  let measured = |root: &mut egui::Ui, content: &mut dyn FnMut(&mut egui::Ui)| {
+    egui::CentralPanel::default().show(root, |ui| Some(ui.scope(|ui| content(ui)).response.rect.bottom())).inner
+  };
   match *editor {
-    Editor::World => {
-      egui::CentralPanel::default().show(&mut root, |ui| editors.p0().panel(ui));
+    Editor::World => measured(root, &mut |ui| editors.p0().panel(ui)),
+    Editor::Models => measured(root, &mut |ui| editors.p1().vr_panel(ui)),
+    Editor::Materials => {
+      editors.p2().ui(root);
+      None
     }
-    Editor::Models => {
-      egui::CentralPanel::default().show(&mut root, |ui| editors.p1().vr_panel(ui));
+    Editor::Textures => {
+      editors.p3().ui(root);
+      None
     }
-    Editor::Materials => editors.p2().ui(&mut root),
-    _ => {
-      egui::CentralPanel::default().show(&mut root, |ui| {
-        ui.label("This editor works on the screen.");
-      });
-    }
+    _ => measured(root, &mut |ui| {
+      ui.label("This editor works on the screen.");
+    })
   }
 }
 
@@ -1100,6 +1266,7 @@ pub fn plugin(app: &mut App) {
     .init_resource::<VrPointer>()
     .init_resource::<Navigation>()
     .init_resource::<TabletPointer>()
+    .init_resource::<HeldShapes>()
     .init_gizmo_group::<VrGizmos>()
     .init_schedule(TabletPass)
     .add_systems(Startup, (configure_gizmos, create_actions.run_if(session_available)))

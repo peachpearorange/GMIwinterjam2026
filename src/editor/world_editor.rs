@@ -371,6 +371,9 @@ pub(super) struct WorldEditor {
   saved: Option<String>,
   /// Set by Ctrl+S to save on the next autosave check rather than waiting.
   save_now: bool,
+  /// Undo or redo clicked in the panel, for the next undo check.
+  undo_clicked: bool,
+  redo_clicked: bool,
   /// Whether the pointer is over the 3D view rather than the UI.
   pointer_in_view: bool,
   /// Lasts while the left mouse button stays held after pressing it on the terrain.
@@ -416,6 +419,8 @@ impl Default for WorldEditor {
       status: "Saves by itself as you work".into(),
       saved: None,
       save_now: false,
+      undo_clicked: false,
+      redo_clicked: false,
       pointer_in_view: false,
       stroke: None,
       sky_brush: Brush {
@@ -548,7 +553,10 @@ impl WorldEditorUi<'_, '_> {
         editor.save_now = true
       }
       ui.label(&editor.status);
-      ui.weak("Ctrl+Z undoes, Ctrl+Y redoes");
+      ui.horizontal(|ui| {
+        editor.undo_clicked = ui.button("Undo  Ctrl+Z").clicked();
+        editor.redo_clicked = ui.button("Redo  Ctrl+Y").clicked()
+      });
       if let Some(terrain) = terrain {
         ui.collapsing("Resize world", |ui| {
           let (cells_x, cells_z) = terrain.cells();
@@ -1391,8 +1399,11 @@ fn undo_redo(
   let z = keys.just_pressed(KeyCode::KeyZ);
   let typing = egui_wants_input.wants_any_keyboard_input();
   let redoing = control && (keys.just_pressed(KeyCode::KeyY) || shift && z) && !typing
-    || pointer.redo;
-  let undoing = control && !shift && z && !typing || pointer.undo;
+    || pointer.redo
+    || std::mem::take(&mut editor.redo_clicked);
+  let undoing = control && !shift && z && !typing
+    || pointer.undo
+    || std::mem::take(&mut editor.undo_clicked);
   let (from, to) = if undoing { (undo, redo) } else { (redo, undo) };
   if (undoing || redoing)
     && !busy
