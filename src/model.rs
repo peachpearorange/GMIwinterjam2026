@@ -1,5 +1,6 @@
 //! Low poly models: convex shapes, each made of a [`ModelMaterial`] from the shared
-//! library. Authored in the model editor and saved
+//! library, and optionally a skeleton of [`Bone`]s with [`Animation`]s bending them (see
+//! [`crate::skeleton`]). Authored in the model editor and saved
 //! as `{MODELS_DIR}/{name}.model.ron`, which the world places like any glTF model.
 
 use {crate::{assets::{self, ASSETS_DIR},
@@ -77,11 +78,66 @@ impl Shape {
   pub fn tidied(self) -> Self { Self { corners: hull::hull_corners(&self.corners), ..self } }
 }
 
-/// A model as saved on disk: convex shapes. The origin is where it stands when placed
-/// in the world.
+/// A bone of a model's skeleton, as it lies in the model at rest: it turns around its
+/// head, and points to its tail. A bone's parent comes before it.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Bone {
+  pub head: Vec3,
+  pub tail: Vec3,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub parent: Option<usize>
+}
+
+/// How a bone is posed: turned around its head from how it lies at rest, in its
+/// parent's frame, and moved, which only bones without a parent do.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Pose {
+  #[serde(default = "no_turn", skip_serializing_if = "is_no_turn")]
+  pub turn: Quat,
+  #[serde(default, skip_serializing_if = "is_no_shift")]
+  pub shift: Vec3
+}
+
+fn no_turn() -> Quat { Quat::IDENTITY }
+
+fn is_no_turn(turn: &Quat) -> bool { *turn == Quat::IDENTITY }
+
+fn is_no_shift(shift: &Vec3) -> bool { *shift == Vec3::ZERO }
+
+impl Default for Pose {
+  fn default() -> Self { Self { turn: Quat::IDENTITY, shift: Vec3::ZERO } }
+}
+
+/// The pose of every bone at one moment of an animation.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Key {
+  /// Seconds into the animation.
+  pub time: f32,
+  /// One for each bone, in order.
+  pub poses: Vec<Pose>
+}
+
+/// Poses the skeleton goes through, over and over, easing from each key to the next.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Animation {
+  /// What the game plays it by.
+  pub name: String,
+  /// Seconds it takes, after which it starts again.
+  pub length: f32,
+  /// In order of time.
+  #[serde(default)]
+  pub keys: Vec<Key>
+}
+
+/// A model as saved on disk: convex shapes, and the skeleton bending them. The origin is
+/// where it stands when placed in the world.
 #[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
 pub struct LowPoly {
-  pub shapes: Vec<Shape>
+  pub shapes: Vec<Shape>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub bones: Vec<Bone>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub animations: Vec<Animation>
 }
 
 /// Models as they were saved before they were made of shapes: vertices joined into
@@ -139,7 +195,7 @@ impl From<OldLowPoly> for LowPoly {
       .collect::<Vec<_>>();
     // In a lasting order, so loading twice gives the same model.
     shapes.sort_by(|a, b| a.corners.first().map(|p| p.to_array()).partial_cmp(&b.corners.first().map(|p| p.to_array())).unwrap_or(std::cmp::Ordering::Equal));
-    Self { shapes }
+    Self { shapes, ..default() }
   }
 }
 
@@ -160,18 +216,42 @@ impl LowPoly {
   /// Writes the model to `path`, relative to [`ASSETS_DIR`].
   pub fn save(&self, path: &str) -> io::Result<()> {
     let round = |v: Vec3| (v * Self::SAVED_PRECISION).round() / Self::SAVED_PRECISION + 0.0;
+    let round_turn = |turn: Quat| {
+      let rounded = Quat::from_vec4(round(turn.xyz()).extend(turn.w)).normalize();
+      if rounded.abs_diff_eq(Quat::IDENTITY, 1e-6) { Quat::IDENTITY } else { rounded }
+    };
     let rounded = Self {
       shapes: self
         .shapes
         .iter()
         .map(|shape| Shape { corners: shape.corners.iter().copied().map(round).collect(), ..shape.clone() })
+        .collect(),
+      bones: self
+        .bones
+        .iter()
+        .map(|bone| Bone { head: round(bone.head), tail: round(bone.tail), ..*bone })
+        .collect(),
+      animations: self
+        .animations
+        .iter()
+        .map(|animation| Animation {
+          keys: animation
+            .keys
+            .iter()
+            .map(|key| Key {
+              poses: key.poses.iter().map(|pose| Pose { turn: round_turn(pose.turn), shift: round(pose.shift) }).collect(),
+              ..*key
+            })
+            .collect(),
+          ..animation.clone()
+        })
         .collect()
     };
     let path = Path::new(ASSETS_DIR).join(path);
     if let Some(parent) = path.parent() {
       fs::create_dir_all(parent)?
     }
-    ron::ser::to_string_pretty(&rounded, ron::ser::PrettyConfig::new().depth_limit(3))
+    ron::ser::to_string_pretty(&rounded, ron::ser::PrettyConfig::new().depth_limit(4))
       .map_err(io::Error::other)
       .and_then(|text| fs::write(path, text))
   }
@@ -215,8 +295,11 @@ impl Surface {
   }
 
   /// The unit normal of a face, by Newell's method so slightly bent polygons work too.
-  pub fn face_normal(&self, face: usize) -> Vec3 {
-    let corners = self.corners(face).collect::<Vec<_>>();
+  pub fn face_normal(&self, face: usize) -> Vec3 { self.face_normal_at(&self.vertices, face) }
+
+  /// The unit normal of a face with its vertices at `vertices`.
+  fn face_normal_at(&self, vertices: &[Vec3], face: usize) -> Vec3 {
+    let corners = self.faces[face].vertices.iter().map(|&v| vertices[v]).collect::<Vec<_>>();
     corners
       .iter()
       .zip(corners.iter().cycle().skip(1))
@@ -265,6 +348,17 @@ impl Surface {
     material: impl Fn(&str) -> Option<&'a ModelMaterial>,
     color: impl Fn(usize, Rgb, Vec3) -> LinearRgba
   ) -> Vec<(String, Mesh)> {
+    self.meshes_posed(&self.vertices, material, color)
+  }
+
+  /// [`Self::meshes_with`] with the vertices moved to `posed`, as a skeleton bends them:
+  /// faces keep the textures they have at rest.
+  pub fn meshes_posed<'a>(
+    &self,
+    posed: &[Vec3],
+    material: impl Fn(&str) -> Option<&'a ModelMaterial>,
+    color: impl Fn(usize, Rgb, Vec3) -> LinearRgba
+  ) -> Vec<(String, Mesh)> {
     let mut parts = Vec::<(String, Vec<usize>)>::new();
     self.faces.iter().enumerate().for_each(|(f, face)| {
       match parts.iter_mut().find(|(name, _)| *name == face.material) {
@@ -279,13 +373,14 @@ impl Surface {
           material(&name).cloned().unwrap_or_default();
         let mut mesh = MeshData::default();
         faces.into_iter().for_each(|f| {
-          let normal = self.face_normal(f).to_array();
-          let color = color(f, base, self.face_normal(f)).to_f32_array();
+          let normal = self.face_normal_at(posed, f);
+          let color = color(f, base, normal).to_f32_array();
+          let normal = normal.to_array();
           let uvs = self.face_uvs(f, mapping, tile);
           let corners = &self.faces[f].vertices;
           (1..corners.len().saturating_sub(1)).for_each(|i| {
             [0, i, i + 1].into_iter().for_each(|corner| {
-              mesh.positions.push(self.vertices[corners[corner]].to_array());
+              mesh.positions.push(posed[corners[corner]].to_array());
               mesh.normals.push(normal);
               mesh.colors.push(color);
               mesh.uvs.push(uvs[corner].to_array())
@@ -391,7 +486,7 @@ mod tests {
 
   #[test]
   fn models_round_trip_through_ron() {
-    let model = LowPoly { shapes: vec![cube("")] };
+    let model = LowPoly { shapes: vec![cube("")], ..default() };
     let text = ron::to_string(&model).unwrap();
     assert!(!text.contains("material"));
     assert_eq!(ron::from_str::<LowPoly>(&text).unwrap(), model);
@@ -401,6 +496,29 @@ mod tests {
     let parts = surface.meshes_with(|_| None, |_, color, _| color.color().to_linear());
     assert_eq!(parts.len(), 1);
     assert_eq!(parts[0].1.count_vertices(), 36)
+  }
+
+  #[test]
+  fn skeletons_and_animations_round_trip_through_ron() {
+    let model = LowPoly {
+      shapes: vec![cube("")],
+      bones: vec![
+        Bone { head: Vec3::ZERO, tail: Vec3::Y, parent: None },
+        Bone { head: Vec3::Y, tail: Vec3::Y * 2.0, parent: Some(0) },
+      ],
+      animations: vec![Animation {
+        name: "wave".into(),
+        length: 1.5,
+        keys: vec![Key {
+          time: 0.5,
+          poses: vec![Pose::default(), Pose { turn: Quat::from_rotation_z(0.5), shift: Vec3::X }]
+        }]
+      }]
+    };
+    let text = ron::to_string(&model).unwrap();
+    assert_eq!(ron::from_str::<LowPoly>(&text).unwrap(), model);
+    // Models without them save as before.
+    assert!(!ron::to_string(&LowPoly { shapes: vec![cube("")], ..default() }).unwrap().contains("bones"))
   }
 
   #[test]
@@ -416,7 +534,7 @@ mod tests {
 
   #[test]
   fn materials_split_meshes_and_map_textures() {
-    let model = LowPoly { shapes: vec![cube("wood"), cube("")] };
+    let model = LowPoly { shapes: vec![cube("wood"), cube("")], ..default() };
     let text = ron::to_string(&model).unwrap();
     assert!(text.contains("material:\"wood\""));
     let parts = model.surface().0.meshes_with(|_| None, |_, color, _| color.color().to_linear());

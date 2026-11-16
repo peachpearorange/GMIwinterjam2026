@@ -11,6 +11,9 @@
 //! in play each is swapped for a copy that comes alive here. The shelter is at the
 //! marker named [`SHELTER_MARKER`], or where the guy starts without one.
 //!
+//! They play their models' animations called [`IDLE`] and [`WALK`], and bears [`EAT`]
+//! after catching a penguin.
+//!
 //! Screens shown: [`RESCUE_SCREEN`] during it, then [`OVER_SCREEN`] or
 //! [`CAUGHT_SCREEN`]. Their texts can show `{penguins}`, `{penguins saved}`,
 //! `{penguins caught}` and `{penguins left}`.
@@ -21,11 +24,17 @@ use {super::{PlayOnly, Player, Stage,
      crate::{Mode, START_MARKER},
      bevy::prelude::*,
      winterjam2026::{terrain::Terrain,
+                     skeleton::Animate,
                      ui::{ShownScreens, UiValues},
                      world::{Markers, Model}}};
 
 const PENGUIN_MODEL: &str = "models/penguin.model.ron";
 const BEAR_MODEL: &str = "models/polarbear.model.ron";
+/// The animations penguins and bears play, by name, when their models have them.
+const IDLE: &str = "idle";
+const WALK: &str = "walk";
+/// Bears, after catching a penguin.
+const EAT: &str = "eat";
 /// The marker the shelter is at.
 const SHELTER_MARKER: &str = "shelter";
 /// How far around the shelter its yard reaches, in world units. Kept clear of snow, and
@@ -143,8 +152,13 @@ fn setup(
     commands.insert_resource(Shelter { xz });
     let mut penguins = 0;
     placed.iter().for_each(|(entity, Model { path }, &transform)| {
-      let copy =
-        (PlayOnly, Model { path: path.clone() }, transform, Visibility::default());
+      let copy = (
+        PlayOnly,
+        Model { path: path.clone() },
+        transform,
+        Visibility::default(),
+        Animate::new(IDLE)
+      );
       match path.as_str() {
         PENGUIN_MODEL => {
           penguins += 1;
@@ -280,18 +294,18 @@ fn move_penguins(
   shelter: Res<Shelter>,
   mut tally: ResMut<Tally>,
   players: Query<&Transform, With<Player>>,
-  mut penguins: Query<(&mut Transform, &mut Penguin), Without<Player>>
+  mut penguins: Query<(&mut Transform, &mut Penguin, &mut Animate), Without<Player>>
 ) {
   let seconds = time.delta_secs();
   let guy = players.single().ok().map(|player| player.translation.xz());
-  penguins.iter_mut().for_each(|(mut transform, mut penguin)| {
+  penguins.iter_mut().for_each(|(mut transform, mut penguin, mut animate)| {
     let xz = transform.translation.xz();
-    if penguin.saved {
-      return;
-    }
-    if xz.distance(shelter.xz) <= SAVED_RADIUS {
+    if !penguin.saved && xz.distance(shelter.xz) <= SAVED_RADIUS {
       penguin.saved = true;
-      tally.saved += 1;
+      tally.saved += 1
+    }
+    if penguin.saved {
+      animate.play(IDLE);
       return;
     }
     let target = next_on(ways.to_shelter.as_ref(), xz, shelter.xz).or_else(|| {
@@ -304,12 +318,13 @@ fn move_penguins(
       let speed = PENGUIN_SPEED * 1.0.lerp(PENGUIN_WADING_SPEED, wading);
       walk(&mut transform, target, speed, seconds, &terrain)
     }
+    animate.play(if target.is_some() { WALK } else { IDLE })
   });
   let mut all = penguins.iter_mut().collect::<Vec<_>>();
   let positions =
-    all.iter().map(|(transform, _)| transform.translation.xz()).collect::<Vec<_>>();
+    all.iter().map(|(transform, ..)| transform.translation.xz()).collect::<Vec<_>>();
   all.iter_mut().zip(spread(&positions, PENGUIN_SPACING)).for_each(
-    |((transform, _), push)| {
+    |((transform, ..), push)| {
       let xz = transform.translation.xz() + push;
       transform.translation = Vec3::new(xz.x, terrain.height(xz), xz.y)
     }
@@ -326,7 +341,7 @@ fn move_bears(
   mut tally: ResMut<Tally>,
   players: Query<&Transform, (With<Player>, Without<Bear>)>,
   penguins: Query<(Entity, &Transform, &Penguin), Without<Bear>>,
-  mut bears: Query<(&mut Transform, &mut Bear)>,
+  mut bears: Query<(&mut Transform, &mut Bear, &mut Animate)>,
   mut commands: Commands
 ) {
   let seconds = time.delta_secs();
@@ -339,9 +354,10 @@ fn move_bears(
     .map(|(entity, transform, _)| (Some(entity), transform.translation.xz()))
     .chain(guy.map(|guy| (None, guy)))
     .collect::<Vec<_>>();
-  bears.iter_mut().for_each(|(mut transform, mut bear)| {
+  bears.iter_mut().for_each(|(mut transform, mut bear, mut animate)| {
     if bear.eating > 0.0 {
       bear.eating -= seconds;
+      animate.play(EAT);
       return;
     }
     let xz = transform.translation.xz();
@@ -350,6 +366,7 @@ fn move_bears(
       .enumerate()
       .min_by(|a, b| a.1.1.distance(xz).total_cmp(&b.1.1.distance(xz)))
       .map(|(i, &(entity, at))| (i, entity, at));
+    let mut walking = false;
     if let Some((i, entity, at)) = nearest {
       if at.distance(xz) <= BEAR_REACH {
         match entity {
@@ -369,15 +386,17 @@ fn move_bears(
           BEAR_SPEED * 1.0.lerp(BEAR_WADING_SPEED, wading),
           seconds,
           &terrain
-        )
+        );
+        walking = true
       }
     }
+    animate.play(if walking { WALK } else { IDLE })
   });
   let mut all = bears.iter_mut().collect::<Vec<_>>();
   let positions =
-    all.iter().map(|(transform, _)| transform.translation.xz()).collect::<Vec<_>>();
+    all.iter().map(|(transform, ..)| transform.translation.xz()).collect::<Vec<_>>();
   all.iter_mut().zip(spread(&positions, BEAR_SPACING)).for_each(
-    |((transform, _), push)| {
+    |((transform, ..), push)| {
       let mut xz = transform.translation.xz() + push;
       // Kept out of the shelter's yard.
       let from_shelter = xz - shelter.xz;

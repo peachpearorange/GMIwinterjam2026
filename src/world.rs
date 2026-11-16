@@ -7,6 +7,7 @@ use {crate::{assets::{self, ASSETS_DIR},
              material::ModelMaterials,
              model::{MODEL_EXTENSION, ModelMeshes, Rgb},
              scene::{self, SunLight},
+             skeleton::{self, Animate},
              terrain::{self, Terrain, add_legacy_materials}},
      bevy::{asset::RenderAssetUsages,
             ecs::system::SystemParam,
@@ -85,9 +86,9 @@ fn attach_model_scenes(
 struct ShownModel(u64, u64);
 
 /// Gives each low poly model a child per material it uses, again whenever models or
-/// materials change.
+/// materials change. Animated ones show their own, bending, see [`skeleton`].
 fn show_low_poly_models(
-  models: Query<(Entity, &Model, Option<&ShownModel>)>,
+  models: Query<(Entity, &Model, Option<&ShownModel>), Without<Animate>>,
   mut model_meshes: ResMut<ModelMeshes>,
   mut model_materials: ResMut<ModelMaterials>,
   mut meshes: ResMut<Assets<Mesh>>,
@@ -312,7 +313,7 @@ impl Plugin for WorldPlugin {
     app
       .init_resource::<ModelMeshes>()
       .init_resource::<ModelMaterials>()
-      .add_plugins((billboard::plugin, scene::plugin, terrain::plugin))
+      .add_plugins((billboard::plugin, scene::plugin, skeleton::plugin, terrain::plugin))
       .add_systems(Startup, load_world)
       .add_systems(Update, (attach_model_scenes, show_low_poly_models, show_lights));
   }

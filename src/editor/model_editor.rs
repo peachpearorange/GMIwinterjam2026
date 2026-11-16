@@ -6,11 +6,15 @@
 //! faces, and picked up by hand to move, turn, stretch and copy.
 //!
 //! On screen the editor shows the model, turned by dragging and zoomed with the wheel,
-//! beside its materials and files.
+//! beside its materials and files. The Animation tab works on the same model: see
+//! [`animation`].
 
 // The tools are only used in the headset.
 #![cfg_attr(not(feature = "vr"), allow(dead_code))]
 
+mod animation;
+#[cfg(feature = "vr")]
+mod animation_vr;
 #[cfg(feature = "vr")]
 pub(super) mod vr;
 
@@ -32,7 +36,8 @@ use {super::{Editor, name_problem,
      winterjam2026::{assets::ASSETS_DIR,
                      hull,
                      material::{ModelMaterial, ModelMaterials},
-                     model::{LowPoly, MODEL_EXTENSION, ModelMeshes, Shape},
+                     model::{LowPoly, MODEL_EXTENSION, ModelMeshes, Pose, Shape},
+                     skeleton,
                      world::MODELS_DIR}};
 
 /// Render layer only the model editor's camera sees.
@@ -202,7 +207,7 @@ struct Preview {
   materials: HashMap<String, Handle<StandardMaterial>>,
   materials_for: u64,
   /// What the model was last built from.
-  built: Option<(LowPoly, Option<usize>, Vec<usize>, u64)>,
+  built: Option<(LowPoly, Option<usize>, Vec<usize>, u64, Option<Vec<Pose>>)>,
   /// The see-through shape being swept out, and what it was last built from.
   ghost: Entity,
   ghost_materials: HashMap<(String, bool), Handle<StandardMaterial>>,
@@ -238,13 +243,20 @@ pub struct ModelEditor {
   vr_shown: bool,
   #[cfg(feature = "vr")]
   vr: vr::VrTool,
+  /// The Animation tab's tool, animation and moment.
+  animation: animation::AnimationState,
+  #[cfg(feature = "vr")]
+  vr_bones: animation_vr::VrBones,
   pub(super) status: String
 }
 
 impl Default for ModelEditor {
   fn default() -> Self {
     Self {
-      model: LowPoly { shapes: vec![Shape { corners: Primitive::Cube.corners(1.0), material: default() }] },
+      model: LowPoly {
+        shapes: vec![Shape { corners: Primitive::Cube.corners(1.0), material: default() }],
+        ..default()
+      },
       name: default(),
       saved: None,
       undo: default(),
@@ -263,6 +275,9 @@ impl Default for ModelEditor {
       vr_shown: false,
       #[cfg(feature = "vr")]
       vr: default(),
+      animation: default(),
+      #[cfg(feature = "vr")]
+      vr_bones: default(),
       status: default()
     }
   }
@@ -316,8 +331,12 @@ impl ModelEditor {
     self.held.clear();
     #[cfg(feature = "vr")]
     {
-      self.vr = default()
+      self.vr = default();
+      self.vr_bones = default()
     }
+    // The first animation, if it has any, at its start.
+    self.animation =
+      animation::AnimationState { tool: self.animation.tool, open: Some(0), ..default() };
     self.frame();
     self.status = default()
   }
@@ -758,8 +777,11 @@ fn sync_preview(
   let new_image = |images: &mut Assets<Image>, size: UVec2| {
     images.add(Image::new_target_texture(size.x, size.y, TextureFormat::Bgra8UnormSrgb, None))
   };
-  let shown = *mode.get() == Mode::Edit && *open == Editor::Models || editor.vr_shown;
+  let shown = *mode.get() == Mode::Edit && matches!(*open, Editor::Models | Editor::Animation)
+    || editor.vr_shown;
   let layer = RenderLayers::layer(LAYER);
+  // Bent as the Animation tab shows it.
+  let poses = (*open == Editor::Animation).then(|| editor.shown_poses()).flatten();
   match preview {
     None if shown => {
       let image = new_image(images, editor.viewport_pixels);
@@ -804,7 +826,7 @@ fn sync_preview(
         *transform = editor.view.transform()
       }
       if shown {
-        build_preview(&editor, &mut preview, &layer, model_materials, meshes, materials, images, &mut commands)
+        build_preview(&editor, poses, &mut preview, &layer, model_materials, meshes, materials, images, &mut commands)
       }
     }
   }
@@ -815,6 +837,7 @@ fn sync_preview(
 #[allow(clippy::too_many_arguments)]
 fn build_preview(
   editor: &ModelEditor,
+  poses: Option<Vec<Pose>>,
   preview: &mut Preview,
   layer: &RenderLayers,
   model_materials: &mut ModelMaterials,
@@ -840,7 +863,7 @@ fn build_preview(
     let (corners, erasing, material, _) = &ghost;
     let mesh = corners.as_ref().and_then(|corners| {
       let shape = Shape { corners: corners.clone(), material: if *erasing { default() } else { material.clone() } };
-      LowPoly { shapes: vec![shape] }
+      LowPoly { shapes: vec![shape], ..default() }
         .surface()
         .0
         .meshes_with(
@@ -871,12 +894,20 @@ fn build_preview(
     preview.ghost_built = Some(ghost)
   }
 
-  let state = (editor.model.clone(), editor.hover, editor.held.clone(), revision);
+  let state = (editor.model.clone(), editor.hover, editor.held.clone(), revision, poses);
   if preview.built.as_ref() != Some(&state) {
-    let (model, hovered, held, _) = &state;
+    let (model, hovered, held, _, poses) = &state;
     let (surface, from) = model.surface();
+    let posed = match poses {
+      Some(poses) => {
+        let weights = surface.vertices.iter().map(|&v| skeleton::weights(&model.bones, v)).collect::<Vec<_>>();
+        skeleton::posed(&surface.vertices, &weights, &skeleton::bone_transforms(&model.bones, poses))
+      }
+      None => surface.vertices.clone()
+    };
     let glowing = |f: usize| model_materials.get(&surface.faces[f].material).is_some_and(ModelMaterial::glows);
-    let parts = surface.meshes_with(
+    let parts = surface.meshes_posed(
+      &posed,
       |name| model_materials.get(name),
       |f, color, normal| {
         let base = color.color().to_linear();
@@ -932,15 +963,31 @@ fn configure_gizmos(mut store: ResMut<GizmoConfigStore>) {
 }
 
 pub fn plugin(app: &mut App) {
-  app.init_resource::<ModelEditor>().init_gizmo_group::<ModelGizmos>().add_systems(Startup, configure_gizmos).add_systems(
-    Update,
-    (
-      sync_preview,
-      draw_grid.run_if(|mode: Res<State<Mode>>, open: Res<Editor>, editor: Res<ModelEditor>| {
-        *mode.get() == Mode::Edit && *open == Editor::Models || editor.vr_shown
-      })
-    )
-  );
+  let editing = |tab: Editor| {
+    move |mode: Res<State<Mode>>, open: Res<Editor>| *mode.get() == Mode::Edit && *open == tab
+  };
+  app
+    .init_resource::<ModelEditor>()
+    .init_gizmo_group::<ModelGizmos>()
+    .init_gizmo_group::<animation::BoneGizmos>()
+    .add_systems(Startup, (configure_gizmos, animation::configure_gizmos))
+    .add_systems(
+      Update,
+      (
+        sync_preview,
+        draw_grid.run_if(|mode: Res<State<Mode>>, open: Res<Editor>, editor: Res<ModelEditor>| {
+          *mode.get() == Mode::Edit && matches!(*open, Editor::Models | Editor::Animation) || editor.vr_shown
+        }),
+        (animation::play.before(sync_preview), animation::draw_bones).run_if(editing(Editor::Animation))
+      )
+    );
   #[cfg(feature = "vr")]
-  app.add_systems(Update, vr::use_vr_tools.after(super::vr::PointerSet).before(sync_preview));
+  app.add_systems(
+    Update,
+    (vr::use_vr_tools, animation_vr::use_vr_bone_tools)
+      .chain()
+      .after(super::vr::PointerSet)
+      .before(sync_preview)
+      .before(animation::draw_bones)
+  );
 }

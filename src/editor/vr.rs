@@ -364,7 +364,7 @@ pub(super) enum Space {
 
 fn space(mode: &Mode, editor: &Editor) -> Space {
   match (mode, editor) {
-    (Mode::Edit, Editor::Models | Editor::Materials) => Space::Model,
+    (Mode::Edit, Editor::Models | Editor::Animation | Editor::Materials) => Space::Model,
     _ => Space::World
   }
 }
@@ -1215,11 +1215,12 @@ fn edit_ui(
     ui.horizontal(|ui| {
       ui.selectable_value(editor, Editor::World, "World");
       ui.selectable_value(editor, Editor::Models, "Models");
+      ui.selectable_value(editor, Editor::Animation, "Animation");
       ui.selectable_value(editor, Editor::Materials, "Materials");
       ui.selectable_value(editor, Editor::Textures, "Textures");
       ui.separator();
       let reset = match *editor {
-        Editor::Models | Editor::Materials => "Show whole model",
+        Editor::Models | Editor::Animation | Editor::Materials => "Show whole model",
         _ => "Back to start"
       };
       if ui.button(reset).clicked() {
@@ -1246,6 +1247,7 @@ fn edit_ui(
   match *editor {
     Editor::World => measured(root, &mut |ui| editors.p0().panel(ui)),
     Editor::Models => measured(root, &mut |ui| editors.p1().vr_panel(ui)),
+    Editor::Animation => measured(root, &mut |ui| editors.p1().vr_animation_panel(ui)),
     Editor::Materials => {
       editors.p2().ui(root);
       None

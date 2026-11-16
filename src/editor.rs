@@ -81,6 +81,8 @@ pub enum Editor {
   World,
   Textures,
   Models,
+  /// Skeletons and animations of the model open in [`Self::Models`].
+  Animation,
   Materials,
   /// The in-game camera and the light, over the live world.
   Scene,
@@ -202,6 +204,7 @@ fn edit_ui(
       ui.selectable_value(&mut *editor, Editor::World, "World");
       ui.selectable_value(&mut *editor, Editor::Textures, "Textures");
       ui.selectable_value(&mut *editor, Editor::Models, "Models");
+      ui.selectable_value(&mut *editor, Editor::Animation, "Animation");
       ui.selectable_value(&mut *editor, Editor::Materials, "Materials");
       ui.selectable_value(&mut *editor, Editor::Scene, "Scene");
       ui.selectable_value(&mut *editor, Editor::Ui, "UI");
@@ -215,6 +218,7 @@ fn edit_ui(
     Editor::World => editors.p0().ui(&mut root),
     Editor::Textures => editors.p1().ui(&mut root),
     Editor::Models => editors.p2().ui(&mut root),
+    Editor::Animation => editors.p2().animation_ui(&mut root),
     Editor::Materials => editors.p3().ui(&mut root),
     Editor::Scene => editors.p5().ui(&mut root),
     Editor::Ui => editors.p6().ui(&mut root)
