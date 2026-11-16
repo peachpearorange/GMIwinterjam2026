@@ -1,11 +1,15 @@
-//! Playing: a snowman walks the world, watched from behind, while snow settles over the
-//! ground and then rises to bury it. Wherever the snowman goes, he clears the snow away.
+//! Playing: the guy walks the world, watched from behind, while snow settles over the
+//! ground and then rises to bury it. Wherever he goes, he clears the snow away.
+//!
+//! Play goes through [`Stage`]s, each its own little game, as the snow gets deeper.
 //!
 //! WASD or the arrow keys walk, Shift runs, and deep snow ahead slows him. The camera
 //! keeps one angle, and the scroll wheel zooms. Everything here starts afresh each time
 //! play starts.
 
 mod audio;
+mod nav;
+mod rescue;
 mod snow;
 mod snowfall;
 
@@ -18,8 +22,8 @@ use {crate::{Mode, START_MARKER},
                      ui::{ShownScreens, UiFile},
                      world::Markers}};
 
-/// The player's picture, a placeholder until there's a proper model.
-const PLAYER_TEXTURE: &str = "textures/snowman.png";
+/// The player's picture.
+const PLAYER_TEXTURE: &str = "textures/guy front right.png";
 /// The player's height in world units.
 const PLAYER_HEIGHT: f32 = 1.8;
 /// World units per second.
@@ -31,6 +35,19 @@ const DEEPEST_SNOW_SPEED: f32 = 0.35;
 const CAMERA_PITCH: f32 = 0.65;
 /// How far the camera stays from the player, in world units, at the closest and farthest.
 const DISTANCE_RANGE: (f32, f32) = (2.5, 40.0);
+
+/// Where play has got to. Each stage is its own little game.
+#[derive(SubStates, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[source(Mode = Mode::Play)]
+pub enum Stage {
+  /// The snow settles and starts rising.
+  #[default]
+  Snowfall,
+  /// The snow is deep: penguins are snowed in and polar bears hunt. See [`rescue`].
+  Rescue,
+  /// The rescue is over, and the snow is as deep as it gets.
+  AfterRescue
+}
 
 /// The one walking around.
 #[derive(Component)]
@@ -157,13 +174,23 @@ fn finish(
 
 pub fn plugin(app: &mut App) {
   app
-    .add_plugins(snow::plugin)
+    .add_sub_state::<Stage>()
+    .add_plugins((snow::plugin, rescue::plugin))
     .init_resource::<FollowCamera>()
     .add_systems(OnEnter(Mode::Play), (start, audio::start, snowfall::start))
     .add_systems(OnExit(Mode::Play), finish)
     .add_systems(
       Update,
-      (stop_free_camera, spawn_player, move_player, snow::update(), audio::update, follow_player, snowfall::update)
+      (
+        stop_free_camera,
+        spawn_player,
+        move_player,
+        snow::update(),
+        rescue::update(),
+        audio::update,
+        follow_player,
+        snowfall::update
+      )
         .chain()
         .run_if(in_state(Mode::Play))
     );

@@ -41,7 +41,7 @@ const RISE_DELAY: f32 = (FULL_STAGE as f32 + 1.0) * STAGE_SECONDS;
 /// How fast the snow rises, in world units per second.
 const RISE_PER_SECOND: f32 = 0.01;
 /// How deep the snow gets at most, in world units.
-const MAX_DEPTH: f32 = 0.9;
+pub const MAX_DEPTH: f32 = 0.9;
 /// How many chunks a frame have their snow held to [`MAX_DEPTH`], each in turn.
 const CHUNKS_CAPPED_PER_FRAME: u32 = 4;
 /// How far settled snow lies above the ground, so it doesn't flicker into it.
@@ -108,6 +108,8 @@ pub struct Snow {
   /// How deep the deepest snow the player cleared this frame was, when any was.
   /// Zero for snow that had only settled.
   pub dug: Option<f32>,
+  /// Places kept clear of snow all the time, as world xz and radius.
+  pub yards: Vec<(Vec2, f32)>,
   /// How many chunks have had their turn at being held to [`MAX_DEPTH`].
   capped: u32,
   /// Chunks whose meshes need building again, as the snow there changed.
@@ -145,6 +147,7 @@ impl Snow {
       start,
       clock: 0.0,
       dug: None,
+      yards: vec![],
       capped: 0,
       dirty: default(),
       chunks: default()
@@ -176,9 +179,27 @@ impl Snow {
   /// holds back what has got deep enough.
   fn level(&self) -> f32 { self.clock * RISE_PER_SECOND }
 
+  /// Seconds into play the world is as buried as it gets.
+  const BURIED_SECONDS: f32 = MAX_DEPTH / RISE_PER_SECOND + RISE_DELAY + SPREAD_SECONDS / 2.0;
+
   /// How far the world is toward as buried as it gets, 0..1.
-  pub fn buried(&self) -> f32 {
-    (self.clock / (MAX_DEPTH / RISE_PER_SECOND + RISE_DELAY + SPREAD_SECONDS / 2.0)).min(1.0)
+  pub fn buried(&self) -> f32 { (self.clock / Self::BURIED_SECONDS).min(1.0) }
+
+  /// Lets time pass for the snow until the world is `buried` that far, when it isn't
+  /// yet. For trying out what comes later without waiting.
+  pub fn skip_to(&mut self, buried: f32) {
+    let clock = buried * Self::BURIED_SECONDS;
+    if clock > self.clock {
+      self.clock = clock;
+      self.mark_dirty(UVec2::ZERO, self.size - UVec2::ONE)
+    }
+  }
+
+  /// How deep the snow is at world `xz`, in world units, from the nearest grid point.
+  pub fn depth_at(&self, xz: Vec2) -> f32 {
+    let last = (self.size - UVec2::ONE).as_vec2();
+    let p = ((xz - self.origin) / self.step).round().clamp(Vec2::ZERO, last).as_uvec2();
+    self.depth(self.index(p)).clamp(0.0, MAX_DEPTH)
   }
 
   /// The rising snow's height at point `i` before being moved up by [`Self::level`]: so
@@ -325,20 +346,21 @@ impl Snow {
     )
   }
 
-  /// Clears the snow within [`DIG_RADIUS`] of `xz`, marking the chunks it changes.
-  fn dig(&mut self, xz: Vec2) {
-    let (min, max) = self.around(xz, DIG_RADIUS);
+  /// Clears the snow within `radius` of `xz`, marking the chunks it changes. Gives how
+  /// deep the deepest snow cleared was, when any was, zero for snow that had only settled.
+  fn clear(&mut self, xz: Vec2, radius: f32) -> Option<f32> {
+    let (min, max) = self.around(xz, radius);
     let clock = self.clock;
     // Points cleared a moment ago are left alone, so standing still doesn't rebuild
     // the snow every frame. Half a stage on, they still look bare.
     let cleared = (min.y..=max.y)
       .flat_map(|z| (min.x..=max.x).map(move |x| UVec2::new(x, z)))
       .filter(|&p| {
-        self.xz(p).distance(xz) <= DIG_RADIUS
+        self.xz(p).distance(xz) <= radius
           && clock - self.start[self.index(p)] > STAGE_SECONDS / 2.0
       })
       .collect::<Vec<_>>();
-    self.dug = cleared
+    let deepest = cleared
       .iter()
       .map(|&p| self.index(p))
       .filter(|&i| clock - self.start[i] >= STAGE_SECONDS)
@@ -351,7 +373,11 @@ impl Snow {
       });
       self.mark_dirty(min, max)
     }
+    deepest
   }
+
+  /// Clears the snow around the player at `xz`.
+  fn dig(&mut self, xz: Vec2) { self.dug = self.clear(xz, DIG_RADIUS) }
 
   /// Lets snow steeper than [`STEEPEST_SLOPE`] near `xz` slide downhill for `seconds`,
   /// so walls left by digging slump into what was cleared. Snow only moves, none is made
@@ -626,6 +652,10 @@ fn advance(
       snow.dig(player.translation.xz());
       snow.slump(player.translation.xz(), time.delta_secs())
     }
+    std::mem::take(&mut snow.yards).into_iter().for_each(|(xz, radius)| {
+      snow.clear(xz, radius);
+      snow.yards.push((xz, radius))
+    });
     (0..CHUNKS_CAPPED_PER_FRAME).for_each(|_| snow.cap_next_chunk());
     std::mem::take(&mut snow.dirty).into_iter().for_each(|chunk| {
       if let Some(ChunkMeshes { body, cover }) = snow.chunks.get(&chunk) {
