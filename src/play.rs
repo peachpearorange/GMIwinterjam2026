@@ -12,6 +12,7 @@
 mod audio;
 mod nav;
 mod rescue;
+mod shots;
 mod snow;
 mod snowfall;
 
@@ -278,7 +279,7 @@ fn finish(
 pub fn plugin(app: &mut App) {
   app
     .add_sub_state::<Stage>()
-    .add_plugins((snow::plugin, rescue::plugin))
+    .add_plugins((snow::plugin, rescue::plugin, shots::plugin))
     .init_resource::<FollowCamera>()
     .add_systems(OnEnter(Mode::Play), (start, audio::start, snowfall::start))
     .add_systems(OnExit(Mode::Play), finish)
@@ -288,6 +289,7 @@ pub fn plugin(app: &mut App) {
         stop_free_camera,
         spawn_player,
         grab_cursor,
+        shots::update(),
         aim_camera,
         move_player,
         snow::update(),
