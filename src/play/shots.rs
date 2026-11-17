@@ -4,6 +4,7 @@
 //! snow, and quits.
 
 use {super::{FollowCamera, Player, snow::Snow},
+     crate::Mode,
      bevy::{prelude::*,
             render::view::screenshot::{Screenshot, save_to_disk}},
      std::path::PathBuf,
@@ -96,7 +97,9 @@ pub fn plugin(app: &mut App) {
   if let Some(folder) = std::env::var_os("WINTERJAM_SHOTS") {
     let folder = PathBuf::from(folder);
     std::fs::create_dir_all(&folder).ok();
-    app.insert_resource(Tour { folder, shot: 0, wait: LOAD_FRAMES });
+    app
+      .insert_resource(Tour { folder, shot: 0, wait: LOAD_FRAMES })
+      .add_systems(Startup, |mut next: ResMut<NextState<Mode>>| next.set(Mode::Play));
   }
 }
 
