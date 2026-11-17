@@ -27,9 +27,9 @@ const SPACING: f32 = 6.0;
 const NEAREST: f32 = 2.5;
 /// How wide and tall a sheet is, in world units: enough to fill the view.
 const SHEET_SIZE: Vec2 = Vec2::new(120.0, 60.0);
-/// How far above the camera sheets reach, in world units. The camera looks down, so
-/// most of a sheet is below it.
-const ABOVE_CAMERA: f32 = 6.0;
+/// How far above the camera sheets reach, in world units: high enough that their top
+/// edge stays out of view when looking straight ahead through the player's eyes.
+const ABOVE_CAMERA: f32 = 25.0;
 /// How fast flakes fall, in world units per second.
 const FALL_SPEED: f32 = 1.28;
 /// How fast flakes drift toward +x, in world units per second.
