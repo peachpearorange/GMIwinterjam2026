@@ -619,6 +619,8 @@ struct PixelEditor {
   grid: bool,
   /// Shows the previous frame faintly where the current one is transparent.
   onion: bool,
+  /// Shows copies of the texture all around it, as it repeats on a surface.
+  tiled: bool,
   gesture: Option<(PointerButton, Gesture)>,
   /// The canvas size fields, for New and Set.
   new_size: UVec2,
@@ -848,6 +850,9 @@ impl PixelEditor {
       }
       if ui.button(format!("Onion: {}", on_off(self.onion))).clicked() {
         self.onion = !self.onion
+      }
+      if ui.button(format!("Tiled: {}", on_off(self.tiled))).clicked() {
+        self.tiled = !self.tiled
       }
       if ui.button(format!("Select: {}", if self.lasso { "lasso" } else { "box" })).clicked() {
         self.lasso = !self.lasso
@@ -1389,13 +1394,29 @@ impl PixelEditor {
     let min = min(self);
     let to_screen = |at: Vec2| min + egui::vec2(at.x, at.y) * zoom;
     let art = egui::Rect::from_min_max(to_screen(Vec2::ZERO), to_screen(size.as_vec2()));
-    self.open.view.iter().for_each(|(_, texture)| {
-      painter.image(
-        texture.id(),
-        art,
-        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-        Color32::WHITE
+    // Tiled, copies fill the view around the texture, in its true colors so seams show as
+    // they would on a surface. The grid stays on the one painted.
+    let copies = |from: f32, to: f32, start: f32, step: f32| {
+      ((from - start) / step).floor().max(-64.0) as i32..=((to - start) / step).ceil().min(64.0) as i32
+    };
+    let tiles = if self.tiled {
+      let (xs, ys) = (
+        copies(view.min.x, view.max.x, art.min.x, art.width()),
+        copies(view.min.y, view.max.y, art.min.y, art.height())
       );
+      ys.flat_map(|y| xs.clone().map(move |x| IVec2::new(x, y))).collect()
+    } else {
+      vec![IVec2::ZERO]
+    };
+    self.open.view.iter().for_each(|(_, texture)| {
+      tiles.iter().for_each(|&tile| {
+        painter.image(
+          texture.id(),
+          art.translate(egui::vec2(tile.x as f32 * art.width(), tile.y as f32 * art.height())),
+          egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+          Color32::WHITE
+        );
+      })
     });
     if self.grid && zoom >= Self::GRID_MIN_ZOOM {
       let stroke = egui::Stroke::new(1.0, Color32::from_black_alpha(70));
@@ -1474,6 +1495,7 @@ impl Default for PixelEditor {
       pan: egui::Vec2::ZERO,
       grid: true,
       onion: false,
+      tiled: false,
       gesture: None,
       new_size: Self::START_SIZE,
       followed_size: Self::START_SIZE,

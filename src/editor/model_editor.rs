@@ -462,6 +462,21 @@ impl ModelEditor {
         self.add_primitive(primitive)
       }
       ui.separator();
+      ui.strong("MODEL SIZE");
+      let height = self.bounds().map_or(0.0, |(min, max)| max.y - min.y);
+      ui.label(format!("{height:.2} m tall"));
+      let mut factor = None;
+      ui.horizontal_wrapped(|ui| {
+        [("×½", 0.5), ("×0.9", 0.9), ("×1.1", 1.1), ("×2", 2.0)].into_iter().for_each(|(label, by)| {
+          if ui.button(label).clicked() {
+            factor = Some(by)
+          }
+        })
+      });
+      if let Some(factor) = factor {
+        self.edit(|model| model.scale(factor))
+      }
+      ui.separator();
       ui.strong("TOOLS");
       let tool = &mut self.tool;
       grid(
@@ -954,6 +969,9 @@ fn draw_grid(editor: Res<ModelEditor>, mut gizmos: Gizmos<ModelGizmos>) {
   gizmos.line(Vec3::NEG_X * extent, Vec3::X * extent, x.with_alpha(0.75));
   gizmos.line(Vec3::NEG_Z * extent, Vec3::Z * extent, z.with_alpha(0.75));
   gizmos.line(Vec3::ZERO, Vec3::Y * 0.5, y.with_alpha(0.75));
+  // Beside the model, clear of it.
+  let right = editor.model.shapes.iter().flat_map(|shape| shape.corners.iter()).map(|v| v.x).fold(0.0f32, f32::max);
+  super::meter_ruler(&mut gizmos, Vec3::new(right + 0.3, 0.0, 0.0))
 }
 
 fn configure_gizmos(mut store: ResMut<GizmoConfigStore>) {

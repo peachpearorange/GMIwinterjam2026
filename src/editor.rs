@@ -49,6 +49,24 @@ fn in_lasso(lasso: &[Vec2], point: Vec2) -> bool {
     == 1
 }
 
+const RULER_COLOR: Color = Color::srgba(1.0, 0.85, 0.3, 0.9);
+
+/// A 1 meter ruler standing up from `base`, for judging sizes by: ticks every 10 cm,
+/// longer at the half and the ends.
+fn meter_ruler<G: GizmoConfigGroup>(gizmos: &mut Gizmos<G>, base: Vec3) {
+  gizmos.line(base, base + Vec3::Y, RULER_COLOR);
+  (0..=10).for_each(|i| {
+    let at = base + Vec3::Y * (i as f32 / 10.0);
+    let half = match i {
+      0 | 10 => 0.08,
+      5 => 0.05,
+      _ => 0.025
+    };
+    gizmos.line(at - Vec3::X * half, at + Vec3::X * half, RULER_COLOR);
+    gizmos.line(at - Vec3::Z * half, at + Vec3::Z * half, RULER_COLOR)
+  })
+}
+
 /// What's wrong with `name` as a file name, if anything. Names take letters, digits,
 /// spaces, `_` and `-`, with `/` between folders.
 fn name_problem(name: &str) -> Option<String> {

@@ -237,9 +237,11 @@ impl MaterialEditor {
           }
           textures.into_iter().for_each(|name| {
             let path = format!("textures/{name}.png");
-            // The thumbnail with the texture's name under it, cut short to its width.
+            // The thumbnail with the texture's name under it, cut short to its width. Its
+            // size given up front, so the row wraps before it rather than running off.
+            let tile = egui::vec2(THUMBNAIL, THUMBNAIL + 2.0 + ui.text_style_height(&egui::TextStyle::Small));
             let clicked = ui
-              .vertical(|ui| {
+              .allocate_ui_with_layout(tile, egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.set_width(THUMBNAIL);
                 ui.spacing_mut().item_spacing.y = 2.0;
                 let (rect, response) =

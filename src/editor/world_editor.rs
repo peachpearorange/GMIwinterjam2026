@@ -980,6 +980,8 @@ fn use_tool(
     editor.stroke = None;
   }
   if let Some(hit) = hit {
+    // Where the pointer is on the ground, for judging sizes by.
+    super::meter_ruler(&mut gizmos, hit);
     let (cells_x, cells_z) = terrain.cells();
     let cell_size = terrain.cell_size;
     let center = terrain.to_grid(hit.xz());

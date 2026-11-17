@@ -203,6 +203,22 @@ impl LowPoly {
   /// Precision positions are saved with, to keep the files readable.
   const SAVED_PRECISION: f32 = 10_000.0;
 
+  /// Makes it `factor` times its size around its origin, so it stands where it did:
+  /// its shapes, its bones and how far its animations move them.
+  pub fn scale(&mut self, factor: f32) {
+    self.shapes.iter_mut().flat_map(|shape| shape.corners.iter_mut()).for_each(|corner| *corner *= factor);
+    self.bones.iter_mut().for_each(|bone| {
+      bone.head *= factor;
+      bone.tail *= factor
+    });
+    self
+      .animations
+      .iter_mut()
+      .flat_map(|animation| animation.keys.iter_mut())
+      .flat_map(|key| key.poses.iter_mut())
+      .for_each(|pose| pose.shift *= factor)
+  }
+
   /// Reads the model at `path`, relative to [`ASSETS_DIR`]: made of shapes, or of faces
   /// as models were before.
   pub fn load(path: &str) -> Result<Self, String> {
