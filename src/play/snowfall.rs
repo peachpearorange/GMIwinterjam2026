@@ -1,152 +1,143 @@
-//! Snow falling through the air during play. Upright sheets stand across the world,
-//! facing the camera, one every [`SPACING`] along the way it looks, each showing a
-//! picture of flakes over and over. The picture stays put on its sheet and slides
-//! straight down it, with a little drift to the side. Only the sheets in front of the
-//! camera exist: as it moves, the sheet it passes becomes the next one far ahead.
-//!
-//! The picture is animated: the textures `falling snow 1`, `falling snow 2` and on are
-//! its frames, each fading into the next. Without any there's no falling snow.
+//! Snow falling through the air during play: lots of small copies of a flake model,
+//! each falling, drifting and slowly tumbling. They fill a box around the camera, and
+//! each stays put in the world: one that leaves the box, by falling out of the bottom or
+//! by the camera moving away, comes back in on the far side.
 
 use {super::PlayOnly,
      bevy::{light::{NotShadowCaster, NotShadowReceiver},
-            math::Affine2,
             prelude::*},
-     winterjam2026::{billboard::WorldCamera, material::ModelMaterials}};
+     winterjam2026::{billboard::WorldCamera,
+                     material::ModelMaterials,
+                     model::{LowPoly, ModelMeshes}}};
 
-/// The `n`th frame of the picture of flakes, from 1: tiling, see-through between them.
-fn flakes_texture(n: usize) -> String { format!("textures/falling snow {n}.png") }
-
-/// Seconds a frame of the flakes' animation takes to fade into the next.
-const FRAME_SECONDS: f32 = 0.625;
-/// How many sheets of flakes stand in front of the camera.
-const SHEETS: usize = 4;
-/// World units between sheets, along the way the camera looks.
-const SPACING: f32 = 6.0;
-/// The nearest a sheet comes in front of the camera, in world units. Nearer, its flakes
-/// would be big blurry squares.
-const NEAREST: f32 = 2.5;
-/// How wide and tall a sheet is, in world units: enough to fill the view.
-const SHEET_SIZE: Vec2 = Vec2::new(120.0, 60.0);
-/// How far above the camera sheets reach, in world units: high enough that their top
-/// edge stays out of view when looking straight ahead through the player's eyes.
-const ABOVE_CAMERA: f32 = 25.0;
-/// How fast flakes fall, in world units per second.
-const FALL_SPEED: f32 = 1.28;
+/// The model each flake is a copy of.
+const FLAKE_MODEL: &str = "models/tree.model.ron";
+/// How big a flake is across its widest side, in world units.
+const FLAKE_SIZE: f32 = 0.12;
+/// How many flakes there are.
+const FLAKES: usize = 1500;
+/// The box around the camera flakes fill: how far it reaches to each side, and below
+/// and above the camera.
+const REACH: f32 = 22.0;
+const BELOW: f32 = 12.0;
+const ABOVE: f32 = 14.0;
+/// How fast flakes fall, in world units per second, the slowest and fastest.
+const FALL_SPEED: (f32, f32) = (0.9, 1.6);
 /// How fast flakes drift toward +x, in world units per second.
 const DRIFT_SPEED: f32 = 0.35;
-/// How wide one tile of the picture is, in world units. Its height follows from the
-/// picture's shape, keeping its pixels square.
-const TILE_WIDTH: f32 = 1.5;
-/// How far each sheet's picture is slid from the one before, in tiles, so they don't
-/// line up.
-const SHEET_SHIFT: Vec2 = Vec2::new(0.37, 0.61);
-/// How far into the animation each sheet is from the one before, in frames, so they
-/// don't all fade together.
-const SHEET_FRAME_SHIFT: f32 = 0.37;
+/// How far flakes sway from side to side, in world units, and how many times a second.
+const SWAY: f32 = 0.3;
+const SWAY_RATE: f32 = 0.4;
+/// How fast flakes tumble, in turns per second, the fastest.
+const TUMBLE_SPEED: f32 = 0.25;
 
-/// Shows one frame of the falling flakes on one of the sheets in front of the camera.
+/// One falling flake.
 #[derive(Component)]
-pub struct ShowsFallingSnow {
-  /// Which sheet in front of the camera, 0 the nearest.
-  sheet: usize,
-  /// Which frame of the animation, and how many there are.
-  frame: usize,
-  frames: usize,
-  /// How big a tile of the frame's picture is, in world units.
-  tile: Vec2
+pub struct Flake {
+  /// Where it would be with no sway, in the world.
+  at: Vec3,
+  fall: f32,
+  /// The axis it tumbles about, and how fast, in radians per second.
+  axis: Dir3,
+  spin: f32,
+  /// Where in its sway it starts, in radians.
+  phase: f32
 }
 
-/// Stands up the sheets, each once for every frame, when there are pictures of flakes.
+/// A repeatable number in 0..1 for the `n`th flake's `k`th property.
+fn random(n: usize, k: u32) -> f32 {
+  let mut x = (n as u32).wrapping_mul(0x9e37_79b9) ^ k.wrapping_mul(0x85eb_ca6b);
+  x ^= x >> 16;
+  x = x.wrapping_mul(0x7feb_352d);
+  x ^= x >> 15;
+  x = x.wrapping_mul(0x846c_a68b);
+  x ^= x >> 16;
+  x as f32 / u32::MAX as f32
+}
+
+/// How much to scale the flake model so its widest side is [`FLAKE_SIZE`].
+fn flake_scale() -> f32 {
+  let model = LowPoly::load(FLAKE_MODEL).unwrap_or_default();
+  let corners = model.shapes.iter().flat_map(|shape| shape.corners.iter().copied());
+  let (low, high) = corners.fold((Vec3::MAX, Vec3::MIN), |(low, high), corner| {
+    (low.min(corner), high.max(corner))
+  });
+  let widest = (high - low).max_element();
+  if widest.is_finite() && widest > 0.0 { FLAKE_SIZE / widest } else { 1.0 }
+}
+
+/// Scatters the flakes through the box around the camera.
 pub fn start(
+  camera: Single<&Transform, With<WorldCamera>>,
+  mut model_meshes: ResMut<ModelMeshes>,
   mut model_materials: ResMut<ModelMaterials>,
-  mut images: ResMut<Assets<Image>>,
   mut meshes: ResMut<Assets<Mesh>>,
   mut materials: ResMut<Assets<StandardMaterial>>,
+  mut images: ResMut<Assets<Image>>,
   mut commands: Commands
 ) {
-  let textures = (1..)
-    .map_while(|n| model_materials.texture(&flakes_texture(n), &mut images))
-    .collect::<Vec<_>>();
-  let frames = textures
-    .into_iter()
-    .filter_map(|texture| {
-      images.get(&texture).map(|image| image.size_f32()).map(|pixels| (texture, pixels))
+  let parts = model_meshes
+    .get(FLAKE_MODEL, &model_materials, &mut meshes)
+    .iter()
+    .map(|(material, mesh)| {
+      (mesh.clone(), model_materials.handle(material, &mut materials, &mut images))
     })
     .collect::<Vec<_>>();
-  let mesh = meshes.add(Rectangle::from_size(SHEET_SIZE));
-  (0..SHEETS).for_each(|sheet| {
-    frames.iter().enumerate().for_each(|(frame, (texture, pixels))| {
-      commands.spawn((
-        ShowsFallingSnow {
-          sheet,
-          frame,
-          frames: frames.len(),
-          tile: TILE_WIDTH * Vec2::new(1.0, pixels.y / pixels.x)
-        },
+  if parts.is_empty() {
+    return;
+  }
+  let scale = Vec3::splat(flake_scale());
+  let origin = camera.translation;
+  (0..FLAKES).for_each(|n| {
+    let box_point = Vec3::new(random(n, 0), random(n, 1), random(n, 2));
+    let at = origin
+      + Vec3::new(REACH * 2.0, BELOW + ABOVE, REACH * 2.0) * box_point
+      - Vec3::new(REACH, BELOW, REACH);
+    let axis = Dir3::new(Vec3::new(random(n, 3), random(n, 4), random(n, 5)) - 0.5)
+      .unwrap_or(Dir3::Y);
+    let flake = Flake {
+      at,
+      fall: FALL_SPEED.0.lerp(FALL_SPEED.1, random(n, 6)),
+      axis,
+      spin: TUMBLE_SPEED * std::f32::consts::TAU * (random(n, 7) * 2.0 - 1.0),
+      phase: random(n, 8) * std::f32::consts::TAU
+    };
+    let rotation = Quat::from_axis_angle(*axis, random(n, 9) * std::f32::consts::TAU);
+    commands
+      .spawn((
+        flake,
         PlayOnly,
-        Mesh3d(mesh.clone()),
-        MeshMaterial3d(materials.add(StandardMaterial {
-          base_color_texture: Some(texture.clone()),
-          alpha_mode: AlphaMode::Blend,
-          unlit: true,
-          fog_enabled: false,
-          cull_mode: None,
-          ..default()
-        })),
-        NotShadowCaster,
-        NotShadowReceiver
-      ));
-    })
+        Transform { translation: at, rotation, scale },
+        Visibility::default()
+      ))
+      .with_children(|flake| {
+        parts.iter().for_each(|(mesh, material)| {
+          flake.spawn((
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(material.clone()),
+            NotShadowCaster,
+            NotShadowReceiver
+          ));
+        })
+      });
   })
 }
 
-/// Stands each sheet where it belongs in front of the camera, with its picture where
-/// the flakes have fallen to in the world, as see-through as its frame is for now.
+/// Lets each flake fall, drift, sway and tumble, bringing back in on the far side any
+/// that left the box around the camera.
 pub fn update(
   time: Res<Time>,
-  camera: Single<&Transform, (With<WorldCamera>, Without<ShowsFallingSnow>)>,
-  mut sheets: Query<(
-    &ShowsFallingSnow,
-    &mut Transform,
-    &MeshMaterial3d<StandardMaterial>
-  )>,
-  mut materials: ResMut<Assets<StandardMaterial>>
+  camera: Single<&Transform, (With<WorldCamera>, Without<Flake>)>,
+  mut flakes: Query<(&mut Flake, &mut Transform)>
 ) {
-  let &Transform { translation: camera, rotation, .. } = *camera;
-  // Sheets face the camera's level heading, so looking up or down doesn't tilt them.
-  let (yaw, ..) = rotation.to_euler(EulerRot::YXZ);
-  let turn = Quat::from_rotation_y(yaw);
-  let (ahead, right) = (turn * Vec3::NEG_Z, turn * Vec3::X);
-  let seconds = time.elapsed_secs_wrapped();
-  let fallen = Vec2::new(DRIFT_SPEED, FALL_SPEED) * seconds;
-  // Which of all the sheets along the way the camera looks is the nearest in front.
-  let along = camera.dot(ahead);
-  let first = ((along + NEAREST) / SPACING).ceil();
-  sheets.iter_mut().for_each(|(shows, mut transform, material)| {
-    let &ShowsFallingSnow { sheet, frame, frames, tile } = shows;
-    let standing = first + sheet as f32;
-    let middle = (camera + ahead * (standing * SPACING - along))
-      .with_y(camera.y + ABOVE_CAMERA - SHEET_SIZE.y / 2.0);
-    *transform = Transform::from_translation(middle).with_rotation(turn);
-    if let Some(mut material) = materials.get_mut(&material.0) {
-      // The picture's place at the sheet's top left corner: u runs to the right and v
-      // down.
-      let corner = Vec2::new(
-        middle.dot(right) - SHEET_SIZE.x / 2.0 - fallen.x,
-        -(middle.y + SHEET_SIZE.y / 2.0 + fallen.y)
-      );
-      material.uv_transform = Affine2::from_scale_angle_translation(
-        SHEET_SIZE / tile,
-        0.0,
-        (corner / tile + SHEET_SHIFT * standing).rem_euclid(Vec2::ONE)
-      );
-      // Fully there at its own time in the animation, fading over a frame either side.
-      let now = (seconds / FRAME_SECONDS + SHEET_FRAME_SHIFT * standing)
-        .rem_euclid(frames as f32);
-      let away = (now - frame as f32).abs();
-      let shown =
-        if frames > 1 { (1.0 - away.min(frames as f32 - away)).max(0.0) } else { 1.0 };
-      material.base_color = Color::WHITE.with_alpha(shown)
-    }
+  let (dt, seconds) = (time.delta_secs(), time.elapsed_secs_wrapped());
+  let size = Vec3::new(REACH * 2.0, BELOW + ABOVE, REACH * 2.0);
+  let corner = camera.translation - Vec3::new(REACH, BELOW, REACH);
+  flakes.iter_mut().for_each(|(mut flake, mut transform)| {
+    let moved = flake.at + Vec3::new(DRIFT_SPEED, -flake.fall, 0.0) * dt;
+    flake.at = corner + (moved - corner).rem_euclid(size);
+    let sway = (seconds * SWAY_RATE * std::f32::consts::TAU + flake.phase).sin_cos();
+    transform.translation = flake.at + Vec3::new(sway.0, 0.0, sway.1) * SWAY;
+    transform.rotate_axis(flake.axis, flake.spin * dt)
   })
 }
