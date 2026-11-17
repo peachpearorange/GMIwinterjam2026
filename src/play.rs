@@ -47,8 +47,10 @@ const FIRST_PERSON_PITCH: (f32, f32) = (-1.5, 1.5);
 const MOUSE_SENSITIVITY: f32 = 0.003;
 /// The height of the player's eyes, as a share of his height.
 const EYE_HEIGHT: f32 = 0.92;
-/// How far above the ground the camera stays when watching from behind.
-const CAMERA_CLEARANCE: f32 = 0.3;
+/// How far above the ground and snow the camera stays when watching from behind.
+const CAMERA_CLEARANCE: f32 = 0.4;
+/// World units between the points checked for ground in the way of the camera.
+const CLEARANCE_STEP: f32 = 0.25;
 /// Swaps between watching from behind and seeing through the player's eyes.
 const VIEW_KEY: KeyCode = KeyCode::KeyV;
 
@@ -228,10 +230,12 @@ fn move_player(
   })
 }
 
-/// Sees through the player's eyes, or watches him from behind, kept above the ground.
+/// Sees through the player's eyes, or watches him from behind. From behind, it comes in
+/// in front of any hill or snow that would hide him.
 fn follow_player(
   follow: Res<FollowCamera>,
   terrain: Res<Terrain>,
+  snow: Option<Res<snow::Snow>>,
   players: Query<&Transform, With<Player>>,
   mut cameras: Query<&mut Transform, (With<WorldCamera>, Without<Player>)>
 ) {
@@ -241,8 +245,22 @@ fn follow_player(
       player.translation + Vec3::Y * PLAYER_HEIGHT * EYE_HEIGHT
     } else {
       let focus = player.translation + Vec3::Y * PLAYER_HEIGHT * 0.7;
-      let at = focus + rotation * Vec3::Z * follow.distance;
-      at.with_y(at.y.max(terrain.height(at.xz()) + CAMERA_CLEARANCE))
+      let back = rotation * Vec3::Z;
+      let ground = |at: Vec3| {
+        let xz = at.xz();
+        terrain.height(xz) + snow.as_ref().map_or(0.0, |snow| snow.depth_at(xz))
+      };
+      let steps = (follow.distance / CLEARANCE_STEP).ceil() as usize;
+      let clear = (1..=steps)
+        .map(|step| (step as f32 * CLEARANCE_STEP).min(follow.distance))
+        .take_while(|&distance| {
+          let at = focus + back * distance;
+          at.y >= ground(at) + CAMERA_CLEARANCE
+        })
+        .last()
+        .unwrap_or(0.0);
+      let at = focus + back * clear.max(CLEARANCE_STEP);
+      at.with_y(at.y.max(ground(at) + CAMERA_CLEARANCE))
     };
     let looking = Transform { translation, rotation, ..default() };
     cameras.iter_mut().for_each(|mut camera| *camera = looking)

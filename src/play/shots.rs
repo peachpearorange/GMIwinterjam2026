@@ -1,6 +1,6 @@
 //! A tour of camera shots for looking over the game without playing it: run with
 //! `WINTERJAM_SHOTS=<folder>` and play stands the player at a few places, saves what the
-//! camera sees from behind and through his eyes, first on bare ground and then in deep
+//! camera sees from behind and through his eyes, first early on and then in deep
 //! snow, and quits.
 
 use {super::{FollowCamera, Player, snow::Snow},
@@ -83,7 +83,7 @@ fn tour(
     "{:02}-{}-{}-{}.png",
     tour.shot,
     spot.name,
-    if deep { "deep" } else { "bare" },
+    if deep { "deep" } else { "early" },
     if first_person { "first" } else { "third" }
   );
   commands.spawn(Screenshot::primary_window()).observe(save_to_disk(tour.folder.join(name)));

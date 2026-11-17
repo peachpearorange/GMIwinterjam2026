@@ -1,8 +1,8 @@
-//! Snow falling through the air during play. Upright sheets stand across the world, one
-//! every [`SPACING`] along z, each showing a picture of flakes over and over. The
-//! picture stays put in the world and slides straight down it, with a little drift to
-//! the side. Only the sheets in front of the camera exist: as it moves, the sheet it
-//! passes becomes the next one far ahead.
+//! Snow falling through the air during play. Upright sheets stand across the world,
+//! facing the camera, one every [`SPACING`] along the way it looks, each showing a
+//! picture of flakes over and over. The picture stays put on its sheet and slides
+//! straight down it, with a little drift to the side. Only the sheets in front of the
+//! camera exist: as it moves, the sheet it passes becomes the next one far ahead.
 //!
 //! The picture is animated: the textures `falling snow 1`, `falling snow 2` and on are
 //! its frames, each fading into the next. Without any there's no falling snow.
@@ -20,8 +20,11 @@ fn flakes_texture(n: usize) -> String { format!("textures/falling snow {n}.png")
 const FRAME_SECONDS: f32 = 0.625;
 /// How many sheets of flakes stand in front of the camera.
 const SHEETS: usize = 4;
-/// World units between sheets, along z.
+/// World units between sheets, along the way the camera looks.
 const SPACING: f32 = 6.0;
+/// The nearest a sheet comes in front of the camera, in world units. Nearer, its flakes
+/// would be big blurry squares.
+const NEAREST: f32 = 2.5;
 /// How wide and tall a sheet is, in world units: enough to fill the view.
 const SHEET_SIZE: Vec2 = Vec2::new(120.0, 60.0);
 /// How far above the camera sheets reach, in world units. The camera looks down, so
@@ -109,24 +112,27 @@ pub fn update(
   )>,
   mut materials: ResMut<Assets<StandardMaterial>>
 ) {
-  let &Transform { translation: camera, .. } = *camera;
+  let &Transform { translation: camera, rotation, .. } = *camera;
+  // Sheets face the camera's level heading, so looking up or down doesn't tilt them.
+  let (yaw, ..) = rotation.to_euler(EulerRot::YXZ);
+  let turn = Quat::from_rotation_y(yaw);
+  let (ahead, right) = (turn * Vec3::NEG_Z, turn * Vec3::X);
   let seconds = time.elapsed_secs_wrapped();
   let fallen = Vec2::new(DRIFT_SPEED, FALL_SPEED) * seconds;
-  // Which of all the sheets across the world the camera has just passed.
-  let passed = (camera.z / SPACING).floor();
+  // Which of all the sheets along the way the camera looks is the nearest in front.
+  let along = camera.dot(ahead);
+  let first = ((along + NEAREST) / SPACING).ceil();
   sheets.iter_mut().for_each(|(shows, mut transform, material)| {
     let &ShowsFallingSnow { sheet, frame, frames, tile } = shows;
-    let standing = passed - sheet as f32;
-    let middle = Vec3::new(
-      camera.x,
-      camera.y + ABOVE_CAMERA - SHEET_SIZE.y / 2.0,
-      standing * SPACING
-    );
-    *transform = Transform::from_translation(middle);
+    let standing = first + sheet as f32;
+    let middle = (camera + ahead * (standing * SPACING - along))
+      .with_y(camera.y + ABOVE_CAMERA - SHEET_SIZE.y / 2.0);
+    *transform = Transform::from_translation(middle).with_rotation(turn);
     if let Some(mut material) = materials.get_mut(&material.0) {
-      // The picture's place at the sheet's top left corner: u runs along x and v down y.
+      // The picture's place at the sheet's top left corner: u runs to the right and v
+      // down.
       let corner = Vec2::new(
-        middle.x - SHEET_SIZE.x / 2.0 - fallen.x,
+        middle.dot(right) - SHEET_SIZE.x / 2.0 - fallen.x,
         -(middle.y + SHEET_SIZE.y / 2.0 + fallen.y)
       );
       material.uv_transform = Affine2::from_scale_angle_translation(
