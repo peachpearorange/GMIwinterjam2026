@@ -3,9 +3,11 @@
 //!
 //! Play goes through [`Stage`]s, each its own little game, as the snow gets deeper.
 //!
-//! WASD or the arrow keys walk, Shift runs, and deep snow ahead slows him. The camera
-//! keeps one angle, and the scroll wheel zooms. Everything here starts afresh each time
-//! play starts.
+//! WASD or the arrow keys walk, relative to where the camera looks; Shift runs, and deep
+//! snow ahead slows him. The mouse turns the camera, which watches him from behind or
+//! sees through his eyes: V swaps between them, and the scroll wheel zooms, zooming all
+//! the way in to his eyes and back out. Escape frees the cursor and a click takes it
+//! back. Everything here starts afresh each time play starts.
 
 mod audio;
 mod nav;
@@ -15,8 +17,9 @@ mod snowfall;
 
 use {crate::{Mode, START_MARKER},
      bevy::{camera_controller::free_camera::FreeCameraState,
-            input::mouse::AccumulatedMouseScroll,
-            prelude::*},
+            input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
+            prelude::*,
+            window::{CursorGrabMode, CursorOptions, PrimaryWindow}},
      winterjam2026::{billboard::{Billboard, BillboardMode, WorldCamera},
                      terrain::Terrain,
                      ui::{ShownScreens, UiFile},
@@ -31,10 +34,22 @@ const WALK_SPEED: f32 = 4.5;
 const RUN_SPEED: f32 = 9.0;
 /// The share of his speed the player keeps heading into the deepest snow.
 const DEEPEST_SNOW_SPEED: f32 = 0.35;
-/// How far the camera looks down on the player, in radians. It looks toward -z.
+/// How far the camera looks down at the start, in radians. It looks toward -z.
 const CAMERA_PITCH: f32 = 0.65;
 /// How far the camera stays from the player, in world units, at the closest and farthest.
 const DISTANCE_RANGE: (f32, f32) = (2.5, 40.0);
+/// How far the camera can look up (negative) and down, in radians, watching from behind
+/// and through his eyes. From behind it can't look far up, or it would sink underground.
+const THIRD_PERSON_PITCH: (f32, f32) = (-0.35, 1.45);
+const FIRST_PERSON_PITCH: (f32, f32) = (-1.5, 1.5);
+/// Radians the camera turns per pixel the mouse moves.
+const MOUSE_SENSITIVITY: f32 = 0.003;
+/// The height of the player's eyes, as a share of his height.
+const EYE_HEIGHT: f32 = 0.92;
+/// How far above the ground the camera stays when watching from behind.
+const CAMERA_CLEARANCE: f32 = 0.3;
+/// Swaps between watching from behind and seeing through the player's eyes.
+const VIEW_KEY: KeyCode = KeyCode::KeyV;
 
 /// Where play has got to. Each stage is its own little game.
 #[derive(SubStates, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -57,14 +72,31 @@ pub struct Player;
 #[derive(Component)]
 pub struct PlayOnly;
 
-/// How far the camera watches the player from.
+/// Where the camera looks from and toward.
 #[derive(Resource)]
 struct FollowCamera {
-  distance: f32
+  /// How far it watches the player from, when watching from behind.
+  distance: f32,
+  /// Its turn about the vertical, in radians; zero looks toward -z.
+  yaw: f32,
+  /// How far it looks down, in radians.
+  pitch: f32,
+  /// Whether it sees through the player's eyes rather than watching from behind.
+  first_person: bool
 }
 
 impl Default for FollowCamera {
-  fn default() -> Self { Self { distance: 9.0 } }
+  fn default() -> Self {
+    Self { distance: 9.0, yaw: 0.0, pitch: CAMERA_PITCH, first_person: false }
+  }
+}
+
+impl FollowCamera {
+  fn rotation(&self) -> Quat { Quat::from_euler(EulerRot::YXZ, self.yaw, -self.pitch, 0.0) }
+
+  fn pitch_range(&self) -> (f32, f32) {
+    if self.first_person { FIRST_PERSON_PITCH } else { THIRD_PERSON_PITCH }
+  }
 }
 
 /// Puts the player at the start marker, or the middle of the world without one, once the
@@ -101,9 +133,70 @@ fn stop_free_camera(mut cameras: Query<&mut FreeCameraState>) {
     .for_each(|mut state| state.enabled = false)
 }
 
-/// Walks the player over the ground, up the screen being toward -z, slower the deeper
-/// the snow he's heading into.
+/// Holds the cursor in the window during play, so the mouse turns the camera. Escape
+/// lets it go, and a click takes it back.
+fn grab_cursor(
+  keys: Res<ButtonInput<KeyCode>>,
+  buttons: Res<ButtonInput<MouseButton>>,
+  mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>
+) {
+  let grab = if keys.just_pressed(KeyCode::Escape) {
+    false
+  } else if buttons.just_pressed(MouseButton::Left) {
+    true
+  } else {
+    return;
+  };
+  cursors.iter_mut().for_each(|mut cursor| set_grab(&mut cursor, grab))
+}
+
+fn set_grab(cursor: &mut CursorOptions, grab: bool) {
+  cursor.grab_mode = if grab { CursorGrabMode::Locked } else { CursorGrabMode::None };
+  cursor.visible = !grab
+}
+
+/// Turns the camera with the mouse while the cursor is held, swaps the view with
+/// [`VIEW_KEY`], and zooms with the wheel: in to the player's eyes, and back out.
+fn aim_camera(
+  mut follow: ResMut<FollowCamera>,
+  keys: Res<ButtonInput<KeyCode>>,
+  motion: Res<AccumulatedMouseMotion>,
+  scroll: Res<AccumulatedMouseScroll>,
+  windows: Query<(&Window, &CursorOptions), With<PrimaryWindow>>,
+  mut players: Query<&mut Visibility, With<Player>>
+) {
+  if keys.just_pressed(VIEW_KEY) {
+    follow.first_person = !follow.first_person
+  }
+  if scroll.delta.y > 0.0 && !follow.first_person && follow.distance <= DISTANCE_RANGE.0 {
+    follow.first_person = true
+  } else if scroll.delta.y < 0.0 && follow.first_person {
+    follow.first_person = false;
+    follow.distance = DISTANCE_RANGE.0
+  } else if scroll.delta.y != 0.0 && !follow.first_person {
+    follow.distance = (follow.distance * 0.9_f32.powf(scroll.delta.y.signum()))
+      .clamp(DISTANCE_RANGE.0, DISTANCE_RANGE.1)
+  }
+  let held = windows
+    .iter()
+    .any(|(window, cursor)| window.focused && cursor.grab_mode != CursorGrabMode::None);
+  if held {
+    follow.yaw -= motion.delta.x * MOUSE_SENSITIVITY;
+    follow.pitch += motion.delta.y * MOUSE_SENSITIVITY
+  }
+  let (low, high) = follow.pitch_range();
+  follow.pitch = follow.pitch.clamp(low, high);
+  // He'd fill the view from inside, so he isn't drawn while seen through his own eyes.
+  let shown = if follow.first_person { Visibility::Hidden } else { Visibility::Inherited };
+  players.iter_mut().for_each(|mut visibility| {
+    visibility.set_if_neq(shown);
+  })
+}
+
+/// Walks the player over the ground, up the screen being the way the camera faces,
+/// slower the deeper the snow he's heading into.
 fn move_player(
+  follow: Res<FollowCamera>,
   keys: Res<ButtonInput<KeyCode>>,
   time: Res<Time>,
   terrain: Res<Terrain>,
@@ -113,11 +206,12 @@ fn move_player(
   let axis = |plus: [KeyCode; 2], minus: [KeyCode; 2]| {
     keys.any_pressed(plus) as i8 as f32 - keys.any_pressed(minus) as i8 as f32
   };
-  let direction = Vec2::new(
+  let input = Vec3::new(
     axis([KeyCode::KeyD, KeyCode::ArrowRight], [KeyCode::KeyA, KeyCode::ArrowLeft]),
+    0.0,
     axis([KeyCode::KeyS, KeyCode::ArrowDown], [KeyCode::KeyW, KeyCode::ArrowUp])
-  )
-  .normalize_or_zero();
+  );
+  let direction = (Quat::from_rotation_y(follow.yaw) * input).xz().normalize_or_zero();
   let speed = if keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
     RUN_SPEED
   } else {
@@ -133,30 +227,37 @@ fn move_player(
   })
 }
 
-/// Watches the player from behind and above at a fixed angle, zooming with the wheel.
+/// Sees through the player's eyes, or watches him from behind, kept above the ground.
 fn follow_player(
-  mut follow: ResMut<FollowCamera>,
-  scroll: Res<AccumulatedMouseScroll>,
+  follow: Res<FollowCamera>,
+  terrain: Res<Terrain>,
   players: Query<&Transform, With<Player>>,
   mut cameras: Query<&mut Transform, (With<WorldCamera>, Without<Player>)>
 ) {
-  if scroll.delta.y != 0.0 {
-    follow.distance = (follow.distance * 0.9_f32.powf(scroll.delta.y.signum()))
-      .clamp(DISTANCE_RANGE.0, DISTANCE_RANGE.1)
-  }
   if let Ok(player) = players.single() {
-    let focus = player.translation + Vec3::Y * PLAYER_HEIGHT * 0.7;
-    let back = Quat::from_rotation_x(-CAMERA_PITCH) * Vec3::Z;
-    cameras.iter_mut().for_each(|mut camera| {
-      *camera = Transform::from_translation(focus + back * follow.distance)
-        .looking_at(focus, Vec3::Y)
-    })
+    let rotation = follow.rotation();
+    let translation = if follow.first_person {
+      player.translation + Vec3::Y * PLAYER_HEIGHT * EYE_HEIGHT
+    } else {
+      let focus = player.translation + Vec3::Y * PLAYER_HEIGHT * 0.7;
+      let at = focus + rotation * Vec3::Z * follow.distance;
+      at.with_y(at.y.max(terrain.height(at.xz()) + CAMERA_CLEARANCE))
+    };
+    let looking = Transform { translation, rotation, ..default() };
+    cameras.iter_mut().for_each(|mut camera| *camera = looking)
   }
 }
 
-/// Starts the camera afresh and shows the screens made to show during play.
-fn start(ui: Res<UiFile>, mut shown: ResMut<ShownScreens>, mut commands: Commands) {
+/// Starts the camera afresh, holds the cursor, and shows the screens made to show during
+/// play.
+fn start(
+  ui: Res<UiFile>,
+  mut shown: ResMut<ShownScreens>,
+  mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>,
+  mut commands: Commands
+) {
   commands.insert_resource(FollowCamera::default());
+  cursors.iter_mut().for_each(|mut cursor| set_grab(&mut cursor, true));
   shown.0 = ui.shown_during_play()
 }
 
@@ -164,8 +265,10 @@ fn start(ui: Res<UiFile>, mut shown: ResMut<ShownScreens>, mut commands: Command
 fn finish(
   played: Query<Entity, With<PlayOnly>>,
   mut shown: ResMut<ShownScreens>,
+  mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>,
   mut commands: Commands
 ) {
+  cursors.iter_mut().for_each(|mut cursor| set_grab(&mut cursor, false));
   played.iter().for_each(|entity| commands.entity(entity).despawn());
   shown.clear();
   commands.remove_resource::<audio::Footsteps>();
@@ -184,6 +287,8 @@ pub fn plugin(app: &mut App) {
       (
         stop_free_camera,
         spawn_player,
+        grab_cursor,
+        aim_camera,
         move_player,
         snow::update(),
         rescue::update(),
