@@ -237,32 +237,8 @@ impl MaterialEditor {
           }
           textures.into_iter().for_each(|name| {
             let path = format!("textures/{name}.png");
-            // The thumbnail with the texture's name under it, cut short to its width. Its
-            // size given up front, so the row wraps before it rather than running off.
-            let tile = egui::vec2(THUMBNAIL, THUMBNAIL + 2.0 + ui.text_style_height(&egui::TextStyle::Small));
-            let clicked = ui
-              .allocate_ui_with_layout(tile, egui::Layout::top_down(egui::Align::Min), |ui| {
-                ui.set_width(THUMBNAIL);
-                ui.spacing_mut().item_spacing.y = 2.0;
-                let (rect, response) =
-                  ui.allocate_exact_size(egui::Vec2::splat(THUMBNAIL), Sense::click());
-                if let Some(texture) = thumbnails.get(ui.ctx(), &path) {
-                  let uv = egui::Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0));
-                  ui.painter().image(texture, rect, uv, Color32::WHITE);
-                }
-                let stroke = if material.texture.as_deref() == Some(path.as_str()) {
-                  Stroke::new(3.0, Color32::WHITE)
-                } else {
-                  Stroke::new(1.0, Color32::from_gray(30))
-                };
-                ui.painter().rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
-                let label = ui.add(
-                  egui::Label::new(egui::RichText::new(&name).small()).truncate().sense(Sense::click())
-                );
-                response.on_hover_text(&name).clicked() || label.clicked()
-              })
-              .inner;
-            if clicked {
+            let picture = thumbnails.get(ui.ctx(), &path);
+            if super::thumbnail_tile(ui, THUMBNAIL, &name, picture, material.texture.as_deref() == Some(path.as_str())) {
               material.texture = Some(path)
             }
           })

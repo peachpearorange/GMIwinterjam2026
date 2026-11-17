@@ -15,6 +15,7 @@
 mod animation;
 #[cfg(feature = "vr")]
 mod animation_vr;
+mod thumbnails;
 #[cfg(feature = "vr")]
 pub(super) mod vr;
 
@@ -38,11 +39,20 @@ use {super::{Editor, name_problem,
                      material::{ModelMaterial, ModelMaterials},
                      model::{LowPoly, MODEL_EXTENSION, ModelMeshes, Pose, Shape},
                      skeleton,
-                     world::MODELS_DIR}};
+                     world::{MODELS_DIR, Model}}};
+
+pub(super) use thumbnails::ModelThumbnails;
 
 /// Render layer only the model editor's camera sees.
 pub(super) const LAYER: usize = 1;
 const FOV: f32 = 0.8;
+/// The side of a model's picture in the list to open them from.
+const THUMBNAIL: f32 = 64.0;
+/// Where deleted models go in [`ASSETS_DIR`], in case deleting one was a mistake. Hidden
+/// from builds by the leading dot.
+const DELETED_DIR: &str = ".backups/deleted";
+/// How a failed save's message starts, so a later save that works can clear it.
+const SAVE_FAILED: &str = "Can't save";
 pub(super) const BACKGROUND: Color = Color::srgb(0.19, 0.2, 0.23);
 /// The tint of shapes held in the hands.
 const HELD_TINT: Color = Color::srgb(1.0, 0.6, 0.12);
@@ -52,6 +62,14 @@ const AXIS_COLORS: [Color; 3] =
   [Color::srgb(0.91, 0.29, 0.37), Color::srgb(0.49, 0.76, 0.29), Color::srgb(0.29, 0.55, 0.91)];
 
 fn model_path(name: &str) -> String { format!("models/{name}{MODEL_EXTENSION}") }
+
+/// A model name no saved model has yet, for a model saved before it's named.
+fn free_model_name() -> String {
+  (1..)
+    .map(|i| if i == 1 { "model".to_string() } else { format!("model {i}") })
+    .find(|name| !Path::new(ASSETS_DIR).join(model_path(name)).exists())
+    .unwrap_or_default()
+}
 
 /// Names of the models in `dir` and its subfolders, relative to [`MODELS_DIR`], like
 /// `props/barrel` for `assets/models/props/barrel.model.ron`.
@@ -75,6 +93,12 @@ fn model_names(dir: &Path) -> Vec<String> {
       }
     })
     .collect()
+}
+
+/// A change to a model's file that copies placed in the world follow, by asset path.
+enum FileChange {
+  Renamed { old: String, new: String },
+  Deleted(String)
 }
 
 /// The window's view of the model: looking at `target` from `distance` away.
@@ -217,8 +241,15 @@ struct Preview {
 #[derive(Resource)]
 pub struct ModelEditor {
   model: LowPoly,
-  /// What the open model saves as, like `props/barrel`.
+  /// What the open model saves as, like `props/barrel`: empty until it's first saved.
   name: String,
+  /// The name field, which renames the model once typing ends.
+  name_field: String,
+  /// Files renamed or deleted, for placed copies to follow.
+  file_changes: Vec<FileChange>,
+  /// Delete was clicked once for a model placed in the world, so the next click deletes
+  /// those copies too.
+  delete_asked: bool,
   saved: Option<LowPoly>,
   undo: Vec<LowPoly>,
   redo: Vec<LowPoly>,
@@ -258,6 +289,9 @@ impl Default for ModelEditor {
         ..default()
       },
       name: default(),
+      name_field: default(),
+      file_changes: default(),
+      delete_asked: false,
       saved: None,
       undo: default(),
       redo: default(),
@@ -285,6 +319,8 @@ impl Default for ModelEditor {
 
 impl ModelEditor {
   const MAX_UNDO: usize = 200;
+  /// How long after a change the model saves by itself, in seconds.
+  const AUTOSAVE_DELAY: f32 = 0.5;
   const SIDE_PANEL_WIDTH: f32 = 240.0;
   const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
   pub(super) const UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
@@ -326,9 +362,11 @@ impl ModelEditor {
     self.model = model;
     self.undo.clear();
     self.redo.clear();
+    self.name_field.clone_from(&name);
     self.name = name;
     self.sweep.clear();
     self.held.clear();
+    self.delete_asked = false;
     #[cfg(feature = "vr")]
     {
       self.vr = default();
@@ -362,21 +400,81 @@ impl ModelEditor {
     self.saved.as_ref().map_or(!self.undo.is_empty(), |saved| *saved != self.model)
   }
 
+  /// Saves the model, under a name of its own if it has none yet. Only a failure shows.
   fn save(&mut self, library: &mut Library) {
-    let name = self.name.trim().to_string();
-    self.status = if let Some(problem) = name_problem(&name) {
-      problem
-    } else {
-      let path = model_path(&name);
-      match self.model.save(&path) {
-        Ok(()) => {
-          library.model_meshes.update(&path, &self.model, &library.model_materials, &mut library.meshes);
-          self.name = name;
-          self.saved = Some(self.model.clone());
-          format!("Saved {ASSETS_DIR}/{path}")
+    if self.name.is_empty() {
+      self.name = free_model_name()
+    }
+    let path = model_path(&self.name);
+    match self.model.save(&path) {
+      Ok(()) => {
+        library.model_meshes.update(&path, &self.model, &library.model_materials, &mut library.meshes);
+        self.saved = Some(self.model.clone());
+        if self.status.starts_with(SAVE_FAILED) {
+          self.status.clear()
         }
-        Err(error) => format!("Can't save {path}: {error}")
       }
+      Err(error) => self.status = format!("{SAVE_FAILED} {path}: {error}")
+    }
+  }
+
+  /// Saves what's not saved yet, before something else is opened. Whether it all is.
+  fn save_first(&mut self, library: &mut Library) -> bool {
+    if self.has_unsaved_work() {
+      self.save(library)
+    }
+    !self.has_unsaved_work()
+  }
+
+  /// Renames the model to what the name field says, moving its file, and the copies
+  /// placed in the world along with it.
+  fn rename(&mut self, library: &mut Library) {
+    let name = self.name_field.trim().to_string();
+    let (old, new) = (model_path(&self.name), model_path(&name));
+    let file = |path: &str| Path::new(ASSETS_DIR).join(path);
+    let moved = name_problem(&name)
+      .map_or(Ok(()), Err)
+      .and_then(|()| if file(&new).exists() { Err(format!("There's already a model called {name}")) } else { Ok(()) })
+      .and_then(|()| {
+        let saved_before = !self.name.is_empty() && file(&old).exists();
+        file(&new)
+          .parent()
+          .map_or(Ok(()), fs::create_dir_all)
+          .and_then(|()| if saved_before { fs::rename(file(&old), file(&new)) } else { Ok(()) })
+          .map(|()| saved_before)
+          .map_err(|error| format!("Can't rename it to {name}: {error}"))
+      });
+    match moved {
+      Ok(saved_before) => {
+        if saved_before {
+          self.file_changes.push(FileChange::Renamed { old, new })
+        }
+        self.status = format!("Renamed it to {name}");
+        self.name = name;
+        self.save(library)
+      }
+      Err(problem) => self.status = problem
+    }
+    self.name_field.clone_from(&self.name)
+  }
+
+  /// Moves the model's file into [`DELETED_DIR`], taking the copies placed in the world
+  /// with it, and starts a new model.
+  fn delete(&mut self) {
+    let path = model_path(&self.name);
+    let kept = Path::new(ASSETS_DIR).join(DELETED_DIR).join(&path);
+    match kept
+      .parent()
+      .map_or(Ok(()), fs::create_dir_all)
+      .and_then(|()| fs::rename(Path::new(ASSETS_DIR).join(&path), &kept))
+    {
+      Ok(()) => {
+        let name = std::mem::take(&mut self.name);
+        self.file_changes.push(FileChange::Deleted(path));
+        self.open(default(), default(), false);
+        self.status = format!("Deleted {name}, keeping a copy in {ASSETS_DIR}/{DELETED_DIR}")
+      }
+      Err(error) => self.status = format!("Can't delete {name}: {error}", name = self.name)
     }
   }
 
@@ -406,13 +504,14 @@ impl ModelEditor {
     self.edit(|model| model.shapes.push(shape))
   }
 
-  /// New, undo and redo, and the name the model saves as, which stays in view above
-  /// the tablet's keyboard while it's typed.
-  fn top_bar(&mut self, ui: &mut egui::Ui, library: &mut Library) {
+  /// New, undo and redo, the name the model saves as, which stays in view above the
+  /// tablet's keyboard while it's typed, and Delete. `placed` is how many copies of it
+  /// are in the world.
+  fn top_bar(&mut self, ui: &mut egui::Ui, library: &mut Library, placed: usize) {
     // In the headset, the controller's buttons rather than the keyboard's.
     let (undo, redo) = if self.vr_shown { ("Undo  X", "Redo  Y") } else { ("Undo  Ctrl+Z", "Redo  Ctrl+Y") };
     ui.horizontal_wrapped(|ui| {
-      if ui.button("New").clicked() {
+      if ui.button("New").clicked() && self.save_first(library) {
         self.open(default(), default(), false)
       }
       if ui.add_enabled(!self.undo.is_empty(), egui::Button::new(undo)).clicked() {
@@ -422,10 +521,26 @@ impl ModelEditor {
         self.redo()
       }
       ui.separator();
-      ui.add(egui::TextEdit::singleline(&mut self.name).id_salt("model_name").desired_width(180.0).hint_text("name"));
-      ui.label(MODEL_EXTENSION);
-      if ui.button("Save").on_hover_text("Ctrl+S").clicked() {
-        self.save(library)
+      // Saved by itself, so naming is only ever renaming.
+      let field = ui
+        .add(egui::TextEdit::singleline(&mut self.name_field).id_salt("model_name").desired_width(180.0).hint_text("unnamed"))
+        .on_hover_text("Saves by itself · type to rename it");
+      if field.lost_focus() && self.name_field.trim() != self.name {
+        self.rename(library)
+      } else if !field.has_focus() {
+        self.name_field.clone_from(&self.name)
+      }
+      let label = if self.delete_asked {
+        format!("Delete it and its {placed} in the world")
+      } else {
+        "Delete".to_string()
+      };
+      if ui.add_enabled(!self.name.is_empty(), egui::Button::new(label)).clicked() {
+        if placed == 0 || self.delete_asked {
+          self.delete()
+        } else {
+          self.delete_asked = true
+        }
       }
     });
   }
@@ -499,33 +614,37 @@ impl ModelEditor {
     });
   }
 
-  /// The models to open, filling the height left, and how many shapes this one has.
-  fn models_panel(&mut self, ui: &mut egui::Ui) {
+  /// The models to open, pictured side by side, filling the height left, and how many
+  /// shapes this one has. Opening another saves this one first.
+  fn models_panel(&mut self, ui: &mut egui::Ui, library: &mut Library, thumbnails: &mut ModelThumbnails) {
     ui.vertical_centered(|ui| ui.strong("MODELS"));
     let mut names = model_names(Path::new(MODELS_DIR));
     names.sort();
-    let unsaved = self.has_unsaved_work();
-    let notes = if names.is_empty() || unsaved { 2.0 } else { 1.0 };
+    let notes = if names.is_empty() { 2.0 } else { 1.0 };
     let opened = egui::ScrollArea::vertical()
       .id_salt("models")
       .max_height(ui.available_height() - notes * ui.text_style_height(&egui::TextStyle::Body) - 12.0)
       .show(ui, |ui| {
-        names
-          .iter()
-          .filter(|&name| {
-            let response = ui.selectable_label(*name == self.name, name);
-            response.double_clicked() || response.clicked() && !unsaved
-          })
-          .last()
-          .cloned()
+        ui.horizontal_wrapped(|ui| {
+          names
+            .iter()
+            .filter(|&name| {
+              let picture = thumbnails.get(&model_path(name));
+              super::thumbnail_tile(ui, THUMBNAIL, name, picture, *name == self.name)
+            })
+            .last()
+            .cloned()
+        })
+        .inner
       })
       .inner;
     if names.is_empty() {
       ui.weak(format!("No models in {MODELS_DIR} yet"));
-    } else if unsaved {
-      ui.weak("Unsaved changes: double click to open another anyway");
     }
-    if let Some(name) = opened {
+    if let Some(name) = opened
+      && name != self.name
+      && self.save_first(library)
+    {
       match LowPoly::load(&model_path(&name)) {
         Ok(model) => self.open(name, model, true),
         Err(error) => self.status = error
@@ -676,10 +795,13 @@ impl ModelEditor {
 }
 
 #[derive(SystemParam)]
-pub struct ModelEditorUi<'w> {
+pub struct ModelEditorUi<'w, 's> {
   editor: ResMut<'w, ModelEditor>,
   material_editor: ResMut<'w, MaterialEditor>,
   thumbnails: ResMut<'w, Thumbnails>,
+  model_thumbnails: ResMut<'w, ModelThumbnails>,
+  /// The copies of models placed in the world.
+  placed: Query<'w, 's, &'static Model>,
   library: Library<'w>
 }
 
@@ -693,27 +815,29 @@ pub struct Library<'w> {
   pub(super) images: ResMut<'w, Assets<Image>>
 }
 
-impl ModelEditorUi<'_> {
+impl ModelEditorUi<'_, '_> {
+  /// How many copies of the open model are placed in the world.
+  fn placed_copies(&self) -> usize {
+    let path = model_path(&self.editor.name);
+    self.placed.iter().filter(|model| model.path == path).count()
+  }
+
   /// Draws the model editor over the whole window: the model beside its materials and
   /// files.
   pub fn ui(&mut self, root: &mut egui::Ui) {
-    let Self { editor, material_editor, thumbnails, library } = self;
+    let placed = self.placed_copies();
+    let Self { editor, material_editor, thumbnails, model_thumbnails, library, .. } = self;
     let editor = &mut **editor;
     editor.shortcuts(&root.ctx().clone(), library);
-    egui::Panel::top("model").show(root, |ui| editor.top_bar(ui, library));
+    egui::Panel::top("model").show(root, |ui| editor.top_bar(ui, library, placed));
     if !editor.status.is_empty() {
       egui::Panel::bottom("model_status").show(root, |ui| ui.label(&editor.status));
     }
     egui::Panel::right("model_side").default_size(ModelEditor::SIDE_PANEL_WIDTH).show(root, |ui| {
-      let unsaved = editor.saved.as_ref() != Some(&editor.model);
-      ui.strong(format!(
-        "{}{}",
-        if editor.name.is_empty() { "untitled" } else { &editor.name },
-        if unsaved { " *" } else { "" }
-      ));
+      ui.strong(if editor.name.is_empty() { "unnamed" } else { &editor.name });
       editor.material_panel(ui, library, thumbnails, 280.0);
       ui.separator();
-      editor.models_panel(ui)
+      editor.models_panel(ui, library, model_thumbnails)
     });
     egui::CentralPanel::default().show(root, |ui| editor.viewport(ui));
     if let Some(name) = editor.open_material.take() {
@@ -725,9 +849,10 @@ impl ModelEditorUi<'_> {
   /// files.
   #[cfg(feature = "vr")]
   pub fn vr_panel(&mut self, ui: &mut egui::Ui) {
-    let Self { editor, material_editor, thumbnails, library } = self;
+    let placed = self.placed_copies();
+    let Self { editor, material_editor, thumbnails, model_thumbnails, library, .. } = self;
     let editor = &mut **editor;
-    egui::Panel::top("model").show(ui, |ui| editor.top_bar(ui, library));
+    egui::Panel::top("model").show(ui, |ui| editor.top_bar(ui, library, placed));
     ui.columns(2, |columns| {
       // Each column keeps to its own width.
       columns.iter_mut().for_each(|column| column.set_clip_rect(column.max_rect().intersect(column.clip_rect())));
@@ -739,7 +864,7 @@ impl ModelEditorUi<'_> {
           let height = ui.available_height() / 2.0;
           editor.material_panel(ui, library, thumbnails, height);
           ui.separator();
-          editor.models_panel(ui)
+          editor.models_panel(ui, library, model_thumbnails)
         });
       }
     });
@@ -847,6 +972,14 @@ fn sync_preview(
   }
 }
 
+/// How bright a face turned toward `normal` shows in the editor's pictures of models,
+/// which have a fixed light rather than the world's.
+fn shade(normal: Vec3) -> f32 {
+  let light = Vec3::new(0.35, 1.0, 0.55).normalize();
+  let fill = Vec3::new(-0.6, -0.2, -0.4).normalize();
+  0.5 + 0.5 * normal.dot(light).max(0.0) + 0.12 * normal.dot(fill).max(0.0)
+}
+
 /// The model's meshes, shaded by a fixed light, with what's pointed at and held tinted,
 /// and the shape being swept out see-through.
 #[allow(clippy::too_many_arguments)]
@@ -868,9 +1001,6 @@ fn build_preview(
     preview.ghost_built = None;
     preview.materials_for = revision
   }
-  let light = Vec3::new(0.35, 1.0, 0.55).normalize();
-  let fill = Vec3::new(-0.6, -0.2, -0.4).normalize();
-  let shade = |normal: Vec3| 0.5 + 0.5 * normal.dot(light).max(0.0) + 0.12 * normal.dot(fill).max(0.0);
 
   let erasing = editor.tool == Tool::Erase;
   let ghost = (editor.sweep_shape(), erasing, editor.material.clone(), revision);
@@ -945,6 +1075,46 @@ fn build_preview(
   }
 }
 
+/// Saves the model a moment after it changes, so work is never lost and never needs
+/// naming first.
+fn autosave(
+  mut editor: ResMut<ModelEditor>,
+  mut library: Library,
+  time: Res<Time<Real>>,
+  mut changed_at: Local<Option<f32>>
+) {
+  let now = time.elapsed_secs();
+  *changed_at = editor.has_unsaved_work().then(|| changed_at.unwrap_or(now));
+  if changed_at.is_some_and(|at| now - at >= ModelEditor::AUTOSAVE_DELAY) {
+    editor.save(&mut library);
+    *changed_at = None
+  }
+}
+
+/// Points the copies placed in the world at the files of models renamed, and removes
+/// those of models deleted.
+fn follow_file_changes(
+  mut editor: ResMut<ModelEditor>,
+  mut models: Query<(Entity, &mut Model)>,
+  mut model_meshes: ResMut<ModelMeshes>,
+  mut commands: Commands
+) {
+  editor.file_changes.drain(..).for_each(|change| {
+    match change {
+      FileChange::Renamed { old, new } => models
+        .iter_mut()
+        .filter(|(_, model)| model.path == old)
+        .for_each(|(_, mut model)| model.path.clone_from(&new)),
+      FileChange::Deleted(path) => models
+        .iter()
+        .filter(|(_, model)| model.path == path)
+        .for_each(|(entity, _)| commands.entity(entity).despawn())
+    }
+    // Shown again, from the files as they are now.
+    model_meshes.generation += 1
+  })
+}
+
 /// Lines drawn in the model editor's 3D view, so the model hides what's behind it.
 #[derive(Default, Reflect, GizmoConfigGroup)]
 struct ModelGizmos;
@@ -986,6 +1156,7 @@ pub fn plugin(app: &mut App) {
   };
   app
     .init_resource::<ModelEditor>()
+    .init_resource::<ModelThumbnails>()
     .init_gizmo_group::<ModelGizmos>()
     .init_gizmo_group::<animation::BoneGizmos>()
     .add_systems(Startup, (configure_gizmos, animation::configure_gizmos))
@@ -993,6 +1164,9 @@ pub fn plugin(app: &mut App) {
       Update,
       (
         sync_preview,
+        autosave,
+        follow_file_changes.run_if(|editor: Res<ModelEditor>| !editor.file_changes.is_empty()),
+        thumbnails::render_thumbnails,
         draw_grid.run_if(|mode: Res<State<Mode>>, open: Res<Editor>, editor: Res<ModelEditor>| {
           *mode.get() == Mode::Edit && matches!(*open, Editor::Models | Editor::Animation) || editor.vr_shown
         }),

@@ -2,6 +2,7 @@
 //! billboards and lights.
 
 use {super::{material_editor::Thumbnails,
+             model_editor::ModelThumbnails,
              pixel_editor::{Palette, texture_names}},
      crate::Mode,
      bevy::{camera_controller::free_camera::FreeCamera, ecs::system::SystemParam,
@@ -180,6 +181,8 @@ pub(super) fn texture_paths() -> Vec<String> {
 
 /// How tall the model and billboard texture lists can grow before scrolling.
 const PICKER_HEIGHT: f32 = 320.0;
+/// The side of a model's picture in the list to place them from.
+const MODEL_THUMBNAIL: f32 = 64.0;
 
 /// A list to pick a model or texture from, one click each, with a picture beside each
 /// entry when `picture` gives one.
@@ -474,6 +477,7 @@ pub struct WorldEditorUi<'w, 's> {
   palette: Res<'w, Palette>,
   model_materials: Res<'w, ModelMaterials>,
   thumbnails: ResMut<'w, Thumbnails>,
+  model_thumbnails: ResMut<'w, ModelThumbnails>,
   /// Missing until the world has loaded.
   terrain: Option<Res<'w, Terrain>>,
   sky: ResMut<'w, Sky>,
@@ -537,6 +541,7 @@ impl WorldEditorUi<'_, '_> {
       palette,
       model_materials,
       thumbnails,
+      model_thumbnails,
       terrain,
       sky,
       images,
@@ -681,7 +686,18 @@ impl WorldEditorUi<'_, '_> {
               "Make models in the Models tab, or put .glb files in {MODELS_DIR}/"
             ));
           }
-          picker(ui, "models", &editor.models, &mut editor.model, |_, _| None);
+          egui::ScrollArea::vertical().id_salt("models").max_height(PICKER_HEIGHT).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+              editor.models.iter().for_each(|path| {
+                let name = path.strip_prefix("models/").unwrap_or(path);
+                let name = name.strip_suffix(MODEL_EXTENSION).unwrap_or(name);
+                let picture = model_thumbnails.get(path);
+                if super::thumbnail_tile(ui, MODEL_THUMBNAIL, name, picture, editor.model.as_ref() == Some(path)) {
+                  editor.model = Some(path.clone())
+                }
+              })
+            })
+          });
           ui.add(
             egui::Slider::new(&mut editor.model_yaw_degrees, -180.0..=180.0)
               .suffix("°")

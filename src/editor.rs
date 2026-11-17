@@ -67,6 +67,38 @@ fn meter_ruler<G: GizmoConfigGroup>(gizmos: &mut Gizmos<G>, base: Vec3) {
   })
 }
 
+/// A `side` points square picture with its name under it, cut short to its width, and
+/// outlined white when `selected`. Its size is given up front, so a wrapping row wraps
+/// before it rather than running off. Whether it was clicked.
+fn thumbnail_tile(
+  ui: &mut egui::Ui,
+  side: f32,
+  name: &str,
+  picture: Option<egui::TextureId>,
+  selected: bool
+) -> bool {
+  let tile = egui::vec2(side, side + 2.0 + ui.text_style_height(&egui::TextStyle::Small));
+  ui.allocate_ui_with_layout(tile, egui::Layout::top_down(egui::Align::Min), |ui| {
+    ui.set_width(side);
+    ui.spacing_mut().item_spacing.y = 2.0;
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::click());
+    if let Some(picture) = picture {
+      let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+      ui.painter().image(picture, rect, uv, egui::Color32::WHITE);
+    }
+    let stroke = if selected {
+      egui::Stroke::new(3.0, egui::Color32::WHITE)
+    } else {
+      egui::Stroke::new(1.0, egui::Color32::from_gray(30))
+    };
+    ui.painter().rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+    let label =
+      ui.add(egui::Label::new(egui::RichText::new(name).small()).truncate().sense(egui::Sense::click()));
+    response.on_hover_text(name).clicked() || label.clicked()
+  })
+  .inner
+}
+
 /// What's wrong with `name` as a file name, if anything. Names take letters, digits,
 /// spaces, `_` and `-`, with `/` between folders.
 fn name_problem(name: &str) -> Option<String> {

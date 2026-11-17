@@ -355,14 +355,15 @@ impl ModelEditor {
   }
 }
 
-impl ModelEditorUi<'_> {
+impl ModelEditorUi<'_, '_> {
   /// The Animation tab on screen: the model, bones and all, beside its animations.
   /// Bones are placed and posed in the headset.
   pub fn animation_ui(&mut self, root: &mut egui::Ui) {
+    let placed = self.placed_copies();
     let Self { editor, library, .. } = self;
     let editor = &mut **editor;
     editor.shortcuts(&root.ctx().clone(), library);
-    egui::Panel::top("animation").show(root, |ui| editor.top_bar(ui, library));
+    egui::Panel::top("animation").show(root, |ui| editor.top_bar(ui, library, placed));
     if !editor.status.is_empty() {
       egui::Panel::bottom("animation_status").show(root, |ui| ui.label(&editor.status));
     }
@@ -376,9 +377,10 @@ impl ModelEditorUi<'_> {
   /// The Animation tab on the VR tablet: the bone tools beside the animations.
   #[cfg(feature = "vr")]
   pub fn vr_animation_panel(&mut self, ui: &mut egui::Ui) {
+    let placed = self.placed_copies();
     let Self { editor, library, .. } = self;
     let editor = &mut **editor;
-    egui::Panel::top("animation").show(ui, |ui| editor.top_bar(ui, library));
+    egui::Panel::top("animation").show(ui, |ui| editor.top_bar(ui, library, placed));
     ui.columns(2, |columns| {
       columns.iter_mut().for_each(|column| column.set_clip_rect(column.max_rect().intersect(column.clip_rect())));
       if let [tools, side] = columns {
