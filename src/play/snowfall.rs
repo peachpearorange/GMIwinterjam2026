@@ -11,7 +11,7 @@ use {super::PlayOnly,
                      model::{LowPoly, ModelMeshes}}};
 
 /// The model each flake is a copy of.
-const FLAKE_MODEL: &str = "models/tree.model.ron";
+const FLAKE_MODEL: &str = "models/snowflake 1.model.ron";
 /// How big a flake is across its widest side, in world units.
 const FLAKE_SIZE: f32 = 0.12;
 /// How many flakes there are.
@@ -79,7 +79,7 @@ pub fn start(
   let parts = model_meshes
     .get(FLAKE_MODEL, &model_materials, &mut meshes)
     .iter()
-    .map(|(material, mesh)| {
+    .map(|(material, mesh, _)| {
       (mesh.clone(), model_materials.handle(material, &mut materials, &mut images))
     })
     .collect::<Vec<_>>();

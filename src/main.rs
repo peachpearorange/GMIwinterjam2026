@@ -83,7 +83,7 @@ fn spawn_camera(mut commands: Commands, markers: Markers, settings: Res<SceneSet
 fn main() {
   let mut app = App::new();
   let plugins = DefaultPlugins.build();
-  // Shows the game in a VR headset when an OpenXR runtime is running.
+  // Shows the game in a VR headset once "Activate VR" restarts it.
   #[cfg(feature = "vr")]
   let plugins = editor::vr::xr_plugins(plugins);
   app

@@ -437,17 +437,18 @@ fn edge_planes<'a>(
 /// the distance to the nearest point.
 pub fn outside_by(points: &[Vec3], p: Vec3) -> f32 {
   hull(points)
-    .map(|h| {
-      if h.is_flat() {
-        let (normal, d) = h.planes[0];
-        edge_planes(points, &h.faces[0], normal)
-          .map(|(n, e)| n.dot(p) - e)
-          .fold((normal.dot(p) - d).abs(), f32::max)
-      } else {
-        h.planes.iter().map(|&(n, d)| n.dot(p) - d).fold(f32::NEG_INFINITY, f32::max)
-      }
-    })
+    .map(|h| outside_hull_by(points, &h, p))
     .unwrap_or_else(|| points.iter().map(|q| q.distance(p)).fold(f32::INFINITY, f32::min))
+}
+
+/// [`outside_by`] for points whose hull `h` is already made, for checking many points.
+pub fn outside_hull_by(points: &[Vec3], h: &Hull, p: Vec3) -> f32 {
+  if h.is_flat() {
+    let (normal, d) = h.planes[0];
+    edge_planes(points, &h.faces[0], normal).map(|(n, e)| n.dot(p) - e).fold((normal.dot(p) - d).abs(), f32::max)
+  } else {
+    h.planes.iter().map(|&(n, d)| n.dot(p) - d).fold(f32::NEG_INFINITY, f32::max)
+  }
 }
 
 /// Whether p lies inside or on (within EPSILON of) the hull of the points.

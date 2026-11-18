@@ -18,6 +18,12 @@ const SAME_MOMENT: f32 = 1e-3;
 /// How near a key the timeline's pointer has to be to take it, in points.
 const KEY_REACH: f32 = 10.0;
 const TIMELINE_HEIGHT: f32 = 40.0;
+/// How much longer than the animation the timeline is, so its end has room to be
+/// dragged later.
+const TIMELINE_ROOM: f32 = 1.5;
+/// The shortest an animation can be, and the steps its length is dragged in, in seconds.
+const SHORTEST: f32 = 0.05;
+const LENGTH_STEP: f32 = 0.05;
 
 const BONE_COLOR: Color = Color::srgb(0.95, 0.85, 0.45);
 const HOVER_COLOR: Color = Color::WHITE;
@@ -68,6 +74,14 @@ pub(super) enum BonePart {
   Whole
 }
 
+/// Something being dragged along the timeline, with the model before, to undo to.
+pub(super) enum TimelineDrag {
+  /// A key, by index, kept in order of time as it moves.
+  Key { key: usize, before: winterjam2026::model::LowPoly },
+  /// The animation's end, over a timeline `seconds` long, which stays put meanwhile.
+  End { seconds: f32, before: winterjam2026::model::LowPoly }
+}
+
 /// The Animation tab's state, kept with the model it works on.
 #[derive(Default)]
 pub(super) struct AnimationState {
@@ -82,8 +96,7 @@ pub(super) struct AnimationState {
   pub dragged: Option<usize>,
   /// A bone being added, from its head to its tail.
   pub new_bone: Option<(Vec3, Vec3)>,
-  /// A key being moved along the timeline, by index, and the model before, to undo to.
-  pub moving_key: Option<(usize, winterjam2026::model::LowPoly)>
+  pub timeline_drag: Option<TimelineDrag>
 }
 
 /// A free name like `animation 2` among `animations`.
@@ -100,11 +113,10 @@ impl ModelEditor {
     self.animation.open.filter(|&a| a < self.model.animations.len())
   }
 
-  /// The poses shown: the moment of the open animation, or none, the skeleton at rest,
-  /// while placing bones in the headset, which happens at rest.
+  /// The poses shown: the moment of the open animation, playing or not, or none, the
+  /// skeleton at rest, without one.
   pub(super) fn shown_poses(&self) -> Option<Vec<Pose>> {
-    let posing = self.animation.tool == BoneTool::Pose || self.animation.playing || !self.vr_shown;
-    self.open_animation().filter(|_| posing).map(|a| {
+    self.open_animation().map(|a| {
       skeleton::pose_at(&self.model.animations[a], self.model.bones.len(), self.animation.time)
     })
   }
@@ -251,8 +263,6 @@ impl ModelEditor {
     ui.horizontal(|ui| {
       let animation = &mut self.model.animations[a];
       ui.add(egui::TextEdit::singleline(&mut animation.name).id_salt("animation_name").desired_width(140.0));
-      ui.label("seconds");
-      ui.add(egui::DragValue::new(&mut animation.length).range(0.05..=60.0).speed(0.01).max_decimals(2));
       delete = ui.button("Delete").clicked()
     });
     if delete {
@@ -271,16 +281,17 @@ impl ModelEditor {
     }
   }
 
-  /// Play, the moment shown, and the keys along the animation: clicking or dragging
-  /// along it shows that moment, near a key that key's; dragging a key moves it.
+  /// Play, the moment shown, and the keys along the animation, which reaches to its end
+  /// marker: clicking or dragging along it shows that moment, near a key that key's;
+  /// dragging a key moves it, and dragging the end marker makes it longer or shorter.
   fn timeline(&mut self, ui: &mut egui::Ui, a: usize) {
-    let length = self.model.animations[a].length.max(1e-3);
+    let length = self.model.animations[a].length.max(SHORTEST);
     ui.horizontal(|ui| {
       let play = if self.animation.playing { "⏸ Pause" } else { "▶ Play" };
       if ui.button(play).clicked() {
         self.animation.playing = !self.animation.playing
       }
-      ui.label(format!("{:.2} s", self.animation.time));
+      ui.label(format!("{:.2} / {length:.2} s", self.animation.time));
       let key = self.key_now();
       if ui.add_enabled(key.is_some(), egui::Button::new("Delete key")).clicked()
         && let Some(key) = key
@@ -293,8 +304,13 @@ impl ModelEditor {
     let (rect, response) =
       ui.allocate_exact_size(egui::vec2(ui.available_width(), TIMELINE_HEIGHT), Sense::click_and_drag());
     let track = rect.shrink2(egui::vec2(KEY_REACH, 0.0));
-    let x_of = |time: f32| track.left() + track.width() * (time / length).clamp(0.0, 1.0);
-    let time_of = |x: f32| ((x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0) * length;
+    // The end being dragged keeps the timeline as it was, so the end follows the pointer.
+    let seconds = match self.animation.timeline_drag {
+      Some(TimelineDrag::End { seconds, .. }) => seconds,
+      _ => length * TIMELINE_ROOM
+    };
+    let x_of = |time: f32| track.left() + track.width() * (time / seconds).clamp(0.0, 1.0);
+    let time_of = |x: f32| ((x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0) * seconds;
     let keys = self.model.animations[a].keys.iter().map(|key| key.time).collect::<Vec<_>>();
     let near_key = |x: f32| {
       keys
@@ -305,41 +321,74 @@ impl ModelEditor {
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(k, _)| k)
     };
+    let near_end = |x: f32| (x_of(length) - x).abs() <= KEY_REACH;
     if let Some(pointer) = response.interact_pointer_pos() {
       self.animation.playing = false;
+      // What's taken is what was under the press, not where the drag has got to: on the
+      // VR tablet a drag only starts once the laser has gone a way, steadying clicks.
       if response.drag_started() {
-        self.animation.moving_key = near_key(pointer.x).map(|k| (k, self.model.clone()))
+        let origin = ui.input(|input| input.pointer.press_origin()).map_or(pointer.x, |origin| origin.x);
+        let before = self.model.clone();
+        self.animation.timeline_drag = near_key(origin)
+          .map(|key| TimelineDrag::Key { key, before: before.clone() })
+          .or_else(|| near_end(origin).then(|| TimelineDrag::End { seconds, before }))
       }
-      match self.animation.moving_key.as_ref().map(|(k, _)| *k) {
-        Some(k) if response.dragged() => {
-          let time = time_of(pointer.x);
-          self.model.animations[a].keys[k].time = time;
+      match &mut self.animation.timeline_drag {
+        Some(TimelineDrag::Key { key, .. }) if response.dragged() => {
+          let time = time_of(pointer.x).min(length);
+          let keys = &mut self.model.animations[a].keys;
+          let mut moved = keys.remove(*key);
+          moved.time = time;
+          *key = keys.iter().position(|other| other.time > time).unwrap_or(keys.len());
+          keys.insert(*key, moved);
           self.animation.time = time
         }
-        _ => self.animation.time = near_key(pointer.x).map_or(time_of(pointer.x), |k| keys[k])
+        Some(TimelineDrag::End { .. }) if response.dragged() => {
+          let last = keys.last().copied().unwrap_or_default();
+          let stepped = (time_of(pointer.x) / LENGTH_STEP).round() * LENGTH_STEP;
+          let length = stepped.max(last).max(SHORTEST);
+          self.model.animations[a].length = length;
+          self.animation.time = self.animation.time.min(length)
+        }
+        _ => self.animation.time = near_key(pointer.x).map_or(time_of(pointer.x).min(length), |k| keys[k])
       }
     }
-    if response.drag_stopped()
-      && let Some((k, before)) = self.animation.moving_key.take()
-    {
-      // Back in order of time, the moved one landing on any it was dropped onto.
-      let keys = &mut self.model.animations[a].keys;
-      let moved = keys.remove(k);
-      keys.retain(|key| (key.time - moved.time).abs() >= SAME_MOMENT);
-      let at = keys.iter().position(|key| key.time > moved.time).unwrap_or(keys.len());
-      keys.insert(at, moved);
-      self.push_undo(before)
+    if response.drag_stopped() {
+      match self.animation.timeline_drag.take() {
+        Some(TimelineDrag::Key { key, before }) => {
+          // The moved one lands on any it was dropped onto.
+          let keys = &mut self.model.animations[a].keys;
+          let moved = keys.remove(key);
+          keys.retain(|other| (other.time - moved.time).abs() >= SAME_MOMENT);
+          let at = keys.iter().position(|other| other.time > moved.time).unwrap_or(keys.len());
+          keys.insert(at, moved);
+          self.push_undo(before)
+        }
+        Some(TimelineDrag::End { before, .. }) => self.push_undo(before),
+        None => {}
+      }
     }
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals();
     painter.rect_filled(rect, 4.0, visuals.extreme_bg_color);
+    let end = x_of(length);
+    // Past the end, where the end can be dragged to.
+    painter.rect_filled(
+      egui::Rect::from_min_max(egui::pos2(end, rect.top()), rect.max),
+      4.0,
+      visuals.faint_bg_color
+    );
     painter.line_segment(
-      [egui::pos2(track.left(), rect.center().y), egui::pos2(track.right(), rect.center().y)],
+      [egui::pos2(track.left(), rect.center().y), egui::pos2(end, rect.center().y)],
       visuals.widgets.noninteractive.fg_stroke
     );
+    painter.line_segment(
+      [egui::pos2(end, rect.top()), egui::pos2(end, rect.bottom())],
+      egui::Stroke::new(4.0, visuals.widgets.active.fg_stroke.color)
+    );
     let key_color = egui::Color32::from_rgb(242, 217, 115);
-    keys.iter().for_each(|&time| {
-      let center = egui::pos2(x_of(time), rect.center().y);
+    self.model.animations[a].keys.iter().for_each(|key| {
+      let center = egui::pos2(x_of(key.time), rect.center().y);
       let r = 7.0;
       painter.add(egui::Shape::convex_polygon(
         vec![center + egui::vec2(0.0, -r), center + egui::vec2(r, 0.0), center + egui::vec2(0.0, r), center + egui::vec2(-r, 0.0)],

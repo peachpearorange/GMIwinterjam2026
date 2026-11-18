@@ -1,0 +1,19 @@
+(
+    design_height: 270.0,
+    screens: [
+        (
+            name: "screen 1",
+            show_during_play: false,
+            elements: [
+                (name: "", anchor: TopLeft, position: (204.0, 95.0), kind: Text(content: "It do be snowing", font: None, size: 12.0, color: "#ffffffff", align: Left)),
+            ],
+        ),
+        (
+            name: "screen 2",
+            show_during_play: false,
+            elements: [
+                (name: "", anchor: TopLeft, position: (134.0, 90.0), kind: Text(content: "Oh no! The polar bears are coming!", font: None, size: 12.0, color: "#ffffffff", align: Left)),
+            ],
+        ),
+    ],
+)

@@ -262,6 +262,10 @@ fn edit_ui(
       if ui.button("▶ Play (F1)").clicked() {
         next.set(Mode::Play);
       }
+      #[cfg(feature = "vr")]
+      if !vr::active() && ui.button("Activate VR").clicked() {
+        vr::activate()
+      }
     });
   });
   match *editor {

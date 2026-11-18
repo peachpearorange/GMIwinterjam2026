@@ -1,6 +1,6 @@
-//! Editing in a VR headset, with the `vr` feature: `cargo run --features vr` while an
-//! OpenXR runtime runs, like WiVRn streaming to a headset. Without one the game starts
-//! on screen as usual.
+//! Editing in a VR headset, with the `vr` feature (on by default). The game starts on
+//! screen; "Activate VR" in the editor restarts it rendering to an OpenXR runtime, like
+//! WiVRn streaming to a headset.
 //!
 //! The world, model and material editors work in the headset with the tools they have on
 //! screen. The left hand holds a tablet showing the editor's panels, which the right
@@ -34,6 +34,7 @@ use {super::{Editor, enable_camera,
             post_process::bloom::Bloom,
             prelude::*,
             render::{pipelined_rendering::PipelinedRenderingPlugin,
+                     RenderPlugin,
                      render_resource::TextureFormat,
                      view::{ColorGrading, DebandDither, Msaa, Tonemapping}},
             transform::TransformSystems},
@@ -46,11 +47,11 @@ use {super::{Editor, enable_camera,
                        exts::OxrExtensions,
                        init::OxrInitPlugin,
                        openxr_session_running,
-                       resources::OxrInstance,
+                       resources::{OxrInstance, OxrSessionConfig},
                        session::OxrSession,
                        types::{AppInfo, Version}},
      bevy_mod_xr::{camera::XrCamera,
-                   session::{XrPreDestroySession, XrSessionCreated, XrTrackingRoot,
+                   session::{XrPreDestroySession, XrSessionCreated, XrState, XrTrackingRoot,
                              session_available},
                    spaces::{XrSpaceLocationFlags, XrSpaceSyncSet}},
      winterjam2026::{billboard::WorldCamera, scene::DitheredLighting, terrain::Terrain}};
@@ -82,20 +83,23 @@ const TABLET_SIZE: Vec2 = Vec2::new(0.4, 0.32);
 const TABLET_PIXELS: UVec2 = UVec2::new(1400, 1120);
 const TABLET_ZOOM: f32 = 1.4;
 const TABLET_BACKGROUND: Color = Color::srgb(0.11, 0.11, 0.13);
-/// Where the tablet sits from the left controller's grip: above it, leaning back
-/// toward the eyes.
-fn tablet_offset() -> Transform {
-  Transform::from_xyz(0.0, 0.21, 0.03).with_rotation(Quat::from_rotation_x(-0.55))
-}
+/// Where the tablet's bottom edge sits from the left controller's grip: on top of the
+/// controller, in meters.
+const TABLET_BASE: Vec3 = Vec3::new(0.0, 0.04, 0.0);
+/// How far the tablet faces round toward the left palm, in radians, so the hand turns
+/// toward the eyes a little to see it face on.
+const TABLET_TURN: f32 = 0.6;
+/// How far the tablet's face tilts up from the controller, in radians.
+const TABLET_LEAN: f32 = -0.55;
 /// How far the laser can wander on the tablet between pressing and letting go and
 /// still click, in egui's points: about a centimeter.
 const TABLET_CLICK_SLACK: f32 = 30.0;
-/// The tablet showing the top `fraction` of its height, from the left grip: its top
-/// edge stays put.
+/// The tablet showing the top `fraction` of its height, from the left grip: rising from
+/// its bottom edge on the controller, which stays put.
 fn tablet_quad(fraction: f32) -> Transform {
-  tablet_offset()
-    * Transform::from_xyz(0.0, TABLET_SIZE.y * (1.0 - fraction) / 2.0, 0.0)
-      .with_scale(Vec3::new(1.0, fraction, 1.0))
+  Transform::from_translation(TABLET_BASE)
+    .with_rotation(Quat::from_rotation_y(TABLET_TURN) * Quat::from_rotation_x(TABLET_LEAN))
+    * Transform::from_xyz(0.0, TABLET_SIZE.y * fraction / 2.0, 0.0).with_scale(Vec3::new(1.0, fraction, 1.0))
 }
 /// The least of its height the tablet shows.
 const TABLET_LEAST_FRACTION: f32 = 0.2;
@@ -113,14 +117,60 @@ pub fn xr_plugins(plugins: PluginGroupBuilder) -> PluginGroupBuilder {
   let mut exts = OxrExtensions::default();
   // Pico controllers.
   exts.raw_mut().bd_controller_interaction = true;
-  add_xr_plugins(plugins)
-    // Less delay between moving a controller and seeing it move.
-    .disable::<PipelinedRenderingPlugin>()
-    .set(OxrInitPlugin {
+  // Less delay between moving a controller and seeing it move.
+  let plugins = add_xr_plugins(plugins).disable::<PipelinedRenderingPlugin>();
+  if active() {
+    plugins.set(OxrInitPlugin {
       app_info: AppInfo { name: "Winter Jam 2026".into(), version: Version(0, 1, 0) },
       exts,
       ..default()
     })
+  } else {
+    // What OpenXR failing to start leaves, without asking the runtime, which waits for
+    // a headset to connect.
+    plugins.disable::<OxrInitPlugin>().enable::<RenderPlugin>().add_before::<RenderPlugin>(
+      |app: &mut App| {
+        app.init_resource::<OxrSessionConfig>().insert_resource(XrState::Unavailable);
+      }
+    )
+  }
+}
+
+/// Passed to the game to render to the headset.
+const VR_ARG: &str = "--vr";
+
+/// Whether this run renders to the headset: only once asked, by [`activate`], since
+/// starting OpenXR waits until a headset connects.
+pub fn active() -> bool { std::env::args().any(|arg| arg == VR_ARG) }
+
+/// The WiVRn headset app, as installed from its GitHub releases.
+const WIVRN_APP: &str = "org.meumeu.wivrn.github";
+/// The port WiVRn's server listens on.
+const WIVRN_PORT: &str = "tcp:9757";
+
+/// Restarts the game in place, rendering to the headset. Rendering is set up for VR or
+/// not when the game starts, so it can't change while running.
+///
+/// A headset plugged in by USB with adb is woken and its WiVRn app connected to this
+/// computer through the cable, so nothing needs doing in the headset.
+pub fn activate() {
+  use std::os::unix::process::CommandExt;
+  [
+    vec!["shell", "input", "keyevent", "KEYCODE_WAKEUP"],
+    vec!["reverse", WIVRN_PORT, WIVRN_PORT],
+    vec!["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", "wivrn+tcp://localhost:9757", WIVRN_APP]
+  ]
+  .into_iter()
+  .for_each(|args| {
+    std::process::Command::new("adb")
+      .args(&args)
+      .status()
+      .inspect_err(|error| warn!("adb {args:?}: {error}"))
+      .ok();
+  });
+  let mut args = std::env::args();
+  let error = args.next().map(|program| std::process::Command::new(program).args(args).arg(VR_ARG).exec());
+  error!("Couldn't restart in VR: {error:?}")
 }
 
 /// The controllers' poses, triggers, grips, sticks and buttons, one of each per hand.
@@ -848,14 +898,25 @@ struct TabletCamera;
 struct TabletQuad;
 
 /// A key on the tablet's keyboard.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum TabletKey {
   Char(char),
   Shift,
   Space,
   Backspace,
+  Left,
+  Right,
   Done
 }
+
+impl TabletKey {
+  /// Whether holding it down presses it again and again, like a keyboard's keys.
+  fn repeats(self) -> bool { !matches!(self, Self::Shift | Self::Done) }
+}
+
+/// Seconds a key is held before it starts repeating, and then between repeats.
+const KEY_REPEAT_DELAY: f32 = 0.45;
+const KEY_REPEAT_INTERVAL: f32 = 0.05;
 
 /// The tablet's keyboard, for typing into the text field with the focus. Its keys
 /// aren't egui buttons: a click on one would take the focus from the field.
@@ -868,7 +929,9 @@ struct Keyboard {
   keys: Vec<(egui::Rect, TabletKey)>,
   /// Where the keys and the gaps between them were: a press there, between keys too,
   /// doesn't reach egui, so the field keeps the focus.
-  area: Option<egui::Rect>
+  area: Option<egui::Rect>,
+  /// The key held down, and seconds until it's pressed again.
+  held: Option<(TabletKey, f32)>
 }
 
 impl Keyboard {
@@ -886,11 +949,14 @@ impl Keyboard {
         .to_vec()
     };
     match key {
+      // Shift goes for one letter, like a phone's.
       TabletKey::Char(c) => {
-        vec![egui::Event::Text(if self.shift { c.to_ascii_uppercase() } else { c }.to_string())]
+        vec![egui::Event::Text(if std::mem::take(&mut self.shift) { c.to_ascii_uppercase() } else { c }.to_string())]
       }
       TabletKey::Space => vec![egui::Event::Text(" ".into())],
       TabletKey::Backspace => tap(egui::Key::Backspace),
+      TabletKey::Left => tap(egui::Key::ArrowLeft),
+      TabletKey::Right => tap(egui::Key::ArrowRight),
       // Enter takes the focus from the field, and what's typed counts.
       TabletKey::Done => tap(egui::Key::Enter),
       TabletKey::Shift => {
@@ -1061,6 +1127,7 @@ fn tablet_input(
       pointer.on_key = keyboard.shown && keyboard.area.is_some_and(|area| area.contains(at));
       if pointer.on_key {
         let key = keyboard.keys.iter().find(|(rect, _)| rect.contains(at)).map(|&(_, key)| key);
+        keyboard.held = key.map(|key| (key, KEY_REPEAT_DELAY));
         key.into_iter().flat_map(|key| keyboard.press(key)).for_each(&mut send)
       } else {
         send(egui::Event::PointerButton {
@@ -1082,8 +1149,22 @@ fn tablet_input(
   } else if pointer.at.is_some() {
     send(egui::Event::PointerGone)
   }
+  // A key held down presses itself again and again.
+  let keyboard = &mut tablet.keyboard;
+  if let Some((key, wait)) = keyboard.held.as_mut()
+    && key.repeats()
+    && pointer.on_key
+  {
+    *wait -= time.delta_secs();
+    if *wait <= 0.0 {
+      *wait += KEY_REPEAT_INTERVAL;
+      let key = *key;
+      keyboard.press(key).into_iter().for_each(&mut send)
+    }
+  }
   if pointer.owns_press && (!right.trigger.down || !shown) {
     pointer.owns_press = false;
+    tablet.keyboard.held = None;
     if !std::mem::take(&mut pointer.on_key) {
       send(egui::Event::PointerButton {
         pos: at,
@@ -1103,8 +1184,11 @@ fn keyboard_ui(ui: &mut egui::Ui, keyboard: &mut Keyboard) {
   const ROWS: [&str; 4] = ["1234567890", "qwertyuiop", "asdfghjkl-", "zxcvbnm_/."];
   let size = egui::vec2(44.0, 38.0);
   let shift = keyboard.shift;
+  let held = keyboard.held.map(|(key, _)| key);
   let mut keys = Vec::new();
+  // The key held down shows pressed.
   let mut key = |ui: &mut egui::Ui, width: f32, button: egui::Button, key: TabletKey| {
+    let button = if held == Some(key) { button.selected(true) } else { button };
     let response = ui.add_sized(size * egui::vec2(width, 1.0), button.sense(egui::Sense::hover()));
     keys.push((response.rect, key))
   };
@@ -1118,7 +1202,9 @@ fn keyboard_ui(ui: &mut egui::Ui, keyboard: &mut Keyboard) {
   });
   ui.horizontal(|ui| {
     key(ui, 2.0, egui::Button::selectable(shift, "Shift"), TabletKey::Shift);
-    key(ui, 4.0, egui::Button::new("Space"), TabletKey::Space);
+    key(ui, 1.0, egui::Button::new("←"), TabletKey::Left);
+    key(ui, 3.0, egui::Button::new("Space"), TabletKey::Space);
+    key(ui, 1.0, egui::Button::new("→"), TabletKey::Right);
     key(ui, 2.0, egui::Button::new("⌫"), TabletKey::Backspace);
     key(ui, 2.0, egui::Button::new("Done"), TabletKey::Done)
   });

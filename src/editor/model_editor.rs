@@ -37,7 +37,7 @@ use {super::{Editor, name_problem,
      winterjam2026::{assets::ASSETS_DIR,
                      hull,
                      material::{ModelMaterial, ModelMaterials},
-                     model::{LowPoly, MODEL_EXTENSION, ModelMeshes, Pose, Shape},
+                     model::{Bone, LowPoly, MODEL_EXTENSION, ModelMeshes, Pose, Shape},
                      skeleton,
                      world::{MODELS_DIR, Model}}};
 
@@ -235,7 +235,10 @@ struct Preview {
   /// The see-through shape being swept out, and what it was last built from.
   ghost: Entity,
   ghost_materials: HashMap<(String, bool), Handle<StandardMaterial>>,
-  ghost_built: Option<(Option<Vec<Vec3>>, bool, String, u64)>
+  ghost_built: Option<(Option<Vec<Vec3>>, bool, String, u64)>,
+  /// What each vertex follows when posed, and the shapes and bones that was worked out
+  /// from, since posing changes neither.
+  weights: Option<((Vec<Shape>, Vec<Bone>), Vec<Vec<(usize, f32)>>)>
 }
 
 #[derive(Resource)]
@@ -403,7 +406,11 @@ impl ModelEditor {
   /// Saves the model, under a name of its own if it has none yet. Only a failure shows.
   fn save(&mut self, library: &mut Library) {
     if self.name.is_empty() {
-      self.name = free_model_name()
+      self.name = free_model_name();
+      // Unless a name is being typed, which renames it once typing ends.
+      if self.name_field.trim().is_empty() {
+        self.name_field.clone_from(&self.name)
+      }
     }
     let path = model_path(&self.name);
     match self.model.save(&path) {
@@ -525,10 +532,10 @@ impl ModelEditor {
       let field = ui
         .add(egui::TextEdit::singleline(&mut self.name_field).id_salt("model_name").desired_width(180.0).hint_text("unnamed"))
         .on_hover_text("Saves by itself · type to rename it");
-      if field.lost_focus() && self.name_field.trim() != self.name {
-        self.rename(library)
-      } else if !field.has_focus() {
-        self.name_field.clone_from(&self.name)
+      // The window and the VR tablet each show this field, so only the one typed in
+      // acts on it.
+      if field.lost_focus() {
+        if self.name_field.trim() != self.name { self.rename(library) } else { self.name_field.clone_from(&self.name) }
       }
       let label = if self.delete_asked {
         format!("Delete it and its {placed} in the world")
@@ -949,7 +956,8 @@ fn sync_preview(
         built: None,
         ghost,
         ghost_materials: default(),
-        ghost_built: None
+        ghost_built: None,
+        weights: None
       })
     }
     None => {}
@@ -1045,8 +1053,12 @@ fn build_preview(
     let (surface, from) = model.surface();
     let posed = match poses {
       Some(poses) => {
-        let weights = surface.vertices.iter().map(|&v| skeleton::weights(&model.bones, v)).collect::<Vec<_>>();
-        skeleton::posed(&surface.vertices, &weights, &skeleton::bone_transforms(&model.bones, poses))
+        let from = (model.shapes.clone(), model.bones.clone());
+        if preview.weights.as_ref().is_none_or(|(built_from, _)| *built_from != from) {
+          preview.weights = Some((from, skeleton::model_weights(model)))
+        }
+        let weights = preview.weights.as_ref().map_or(&[][..], |(_, weights)| weights);
+        skeleton::posed(&surface.vertices, weights, &skeleton::bone_transforms(&model.bones, poses))
       }
       None => surface.vertices.clone()
     };

@@ -1,8 +1,9 @@
 //! The Animation tab's tools in a VR headset. The right controller's tip touches bones
 //! up close, its laser picks them farther off, and the trigger uses the tool: Add bone
 //! draws a bone from where the trigger goes down to where it comes up, Move joint drags
-//! bone ends at rest, Delete bone takes bones away, and Pose turns bones of the open
-//! animation at the moment shown, keying it.
+//! bone ends, Delete bone takes bones away, and Pose turns bones of the open animation
+//! at the moment shown, keying it. Bones show posed at that moment for every tool, and
+//! adding or moving them changes the skeleton at rest to match what was done there.
 
 use {super::{ModelEditor,
              animation::{BonePart, BoneTool}},
@@ -31,8 +32,9 @@ const LASER_COLOR: Color = Color::srgba(0.4, 0.9, 1.0, 0.8);
 enum Drag {
   /// A new bone from `head`, joined to `parent`.
   Add { head: Vec3, parent: Option<usize> },
-  /// Bone ends at rest following the hand: bone, whether its head, and where it was.
-  Move { start: Vec<(usize, bool, Vec3)> },
+  /// Bone ends following the hand: bone, whether its head, where it was shown, and how
+  /// to take a point as shown back to rest for that bone.
+  Move { start: Vec<(usize, bool, Vec3, Affine3A)> },
   /// Bone `bone` of key `key` of animation `animation` turning around its head.
   Turn {
     animation: usize,
@@ -48,8 +50,8 @@ enum Drag {
     /// a clockwise twist rolls it.
     axis: Vec3,
     twist_sign: f32,
-    /// Degrees twisted since the press began.
-    twist: f32
+    /// The controller's twist when the press began, in degrees.
+    twist_start: f32
   },
   /// A bone without a parent moving everything.
   Shift { animation: usize, key: usize, bone: usize, start: Vec3 }
@@ -115,9 +117,10 @@ fn pick(bones: &[(Vec3, Vec3)], pointer: &VrPointer) -> Option<(usize, BonePart,
 }
 
 impl ModelEditor {
-  /// The ends of bones at rest at `at`, as bone and whether its head, so joints move
-  /// together.
-  fn ends_at(&self, at: Vec3) -> Vec<(usize, bool, Vec3)> {
+  /// The ends of bones at rest at `at`, as bone, whether its head, where it's shown and
+  /// how to take a point as shown back to rest for that bone, so joints move together.
+  fn ends_at(&self, at: Vec3) -> Vec<(usize, bool, Vec3, Affine3A)> {
+    let transforms = self.shown_transforms();
     self
       .model
       .bones
@@ -125,14 +128,21 @@ impl ModelEditor {
       .enumerate()
       .flat_map(|(b, bone)| [(b, true, bone.head), (b, false, bone.tail)])
       .filter(|&(_, _, p)| p.distance(at) < 1e-4)
+      .map(|(b, is_head, p)| (b, is_head, transforms[b].transform_point3(p), transforms[b].inverse()))
       .collect()
   }
 
-  /// Where a new bone starts at the tip, and what it joins: an end of a bone within
-  /// reach, joining that bone, or that bone's parent at its head, or else a point along
-  /// a bone, joining it.
+  /// Where a new bone starts at the tip, as shown, and what it joins: an end of a bone
+  /// within reach, joining that bone, or that bone's parent at its head, or else a point
+  /// along a bone, joining it.
   fn new_bone_start(&self, tip: Vec3, reach: f32) -> (Vec3, Option<usize>) {
-    let bones = &self.model.bones;
+    let bones = self
+      .model
+      .bones
+      .iter()
+      .zip(self.shown_bones())
+      .map(|(bone, (head, tail))| Bone { head, tail, ..*bone })
+      .collect::<Vec<_>>();
     let end = bones
       .iter()
       .enumerate()
@@ -158,7 +168,7 @@ impl ModelEditor {
     let hand = pointer.aim;
     let reach = TOUCH * pointer.scale;
     if self.animation.tool != BoneTool::Pose {
-      // Bones are placed at rest.
+      // Bones are placed on the moment shown, so it holds still.
       self.animation.playing = false
     }
     let drag = match (self.animation.tool, picked) {
@@ -208,7 +218,7 @@ impl ModelEditor {
             start: pose.turn,
             axis: (tail - head).normalize_or(Vec3::Y),
             twist_sign,
-            twist: 0.0
+            twist_start: pointer.twist
           }
         }
       }
@@ -227,15 +237,16 @@ impl ModelEditor {
     let offset = held - *grab;
     match drag {
       Drag::Add { head, .. } => self.animation.new_bone = Some((*head, pointer.tip)),
-      Drag::Move { start } => start.iter().for_each(|&(b, is_head, p)| {
+      Drag::Move { start } => start.iter().for_each(|&(b, is_head, p, to_rest)| {
+        let at = to_rest.transform_point3(p + offset);
         let bone = &mut self.model.bones[b];
-        if is_head { bone.head = p + offset } else { bone.tail = p + offset }
+        if is_head { bone.head = at } else { bone.tail = at }
       }),
       Drag::Shift { animation, key, bone, start } => {
         self.model.animations[*animation].keys[*key].poses[*bone].shift = *start + offset
       }
-      Drag::Turn { animation, key, bone, inverse_parent, lever, start, axis, twist_sign, twist } => {
-        *twist += pointer.twist;
+      Drag::Turn { animation, key, bone, inverse_parent, lever, start, axis, twist_sign, twist_start } => {
+        let twist = pointer.twist - *twist_start;
         let rest = self.model.bones[*bone];
         let pose = &mut self.model.animations[*animation].keys[*key].poses[*bone];
         // In the parent's frame, where the bone turns around its head.
@@ -266,8 +277,10 @@ impl ModelEditor {
       Drag::Add { head, parent } => {
         let tail = pointer.tip;
         if head.distance(tail) > SHORTEST * TOUCH * pointer.scale {
+          // Joined to its parent as shown, so at rest where the parent is at rest.
+          let to_rest = parent.map_or(Affine3A::IDENTITY, |p| self.shown_transforms()[p].inverse());
           self.model = press.before.clone();
-          self.add_bone(Bone { head, tail, parent })
+          self.add_bone(Bone { head: to_rest.transform_point3(head), tail: to_rest.transform_point3(tail), parent })
         }
       }
       _ => self.push_undo(press.before)

@@ -10,7 +10,7 @@
 //! looks fade into each other in a shader and the rising snow is one mesh moving up, both rebuilt
 //! only where the player digs.
 
-use {super::{PlayOnly, Player},
+use {super::{Digs, PlayOnly, Player},
      bevy::{asset::RenderAssetUsages,
             light::NotShadowCaster,
             math::Affine2,
@@ -126,7 +126,7 @@ struct ChunkMeshes {
 }
 
 impl Snow {
-  fn new(terrain: &Terrain) -> Self {
+  pub(super) fn new(terrain: &Terrain) -> Self {
     let (cells_x, cells_z) = terrain.cells();
     let size = UVec2::new(
       (cells_x * POINTS_PER_CELL + 1) as u32,
@@ -634,13 +634,13 @@ fn setup(
   }
 }
 
-/// Lets time pass for the snow, clears it around the player, lets it slump, holds it to
-/// its deepest, and rebuilds what changed.
+/// Lets time pass for the snow, clears it around the player when he digs, lets it
+/// slump, holds it to its deepest, and rebuilds what changed.
 fn advance(
   snow: Option<ResMut<Snow>>,
   looks: Option<Res<SnowLooks>>,
   time: Res<Time>,
-  players: Query<&Transform, With<Player>>,
+  players: Query<(&Transform, Has<Digs>), With<Player>>,
   mut bodies: Query<&mut Transform, (With<SnowBody>, Without<Player>)>,
   mut meshes: ResMut<Assets<Mesh>>,
   mut cover_materials: ResMut<Assets<CoverMaterial>>
@@ -648,9 +648,15 @@ fn advance(
   if let (Some(mut snow), Some(looks)) = (snow, looks) {
     let snow = &mut *snow;
     snow.clock += time.delta_secs();
-    if let Ok(player) = players.single() {
-      snow.dig(player.translation.xz());
-      snow.slump(player.translation.xz(), time.delta_secs())
+    if let Ok((player, digs)) = players.single() {
+      let xz = player.translation.xz();
+      if digs {
+        snow.dig(xz);
+        snow.slump(xz, time.delta_secs())
+      } else {
+        // Wading through it, as if it had only settled.
+        snow.dug = (snow.depth_at(xz) > 0.0).then_some(0.0)
+      }
     }
     std::mem::take(&mut snow.yards).into_iter().for_each(|(xz, radius)| {
       snow.clear(xz, radius);

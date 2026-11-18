@@ -93,6 +93,11 @@ pub struct Footsteps {
   digging: f32
 }
 
+impl Footsteps {
+  /// Whether the player counts as digging through deep snow.
+  pub fn digging(&self) -> bool { self.digging > 0.0 }
+}
+
 /// Starts the looping sounds, silent until they fade in.
 pub fn start(asset_server: Res<AssetServer>, mut commands: Commands) {
   commands.insert_resource(Footsteps::default());

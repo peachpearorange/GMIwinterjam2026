@@ -430,27 +430,43 @@ impl From<MeshData> for Mesh {
 /// The meshes of the low poly models in use, by path, one for each material.
 #[derive(Resource, Default)]
 pub struct ModelMeshes {
-  models: HashMap<String, Vec<(String, Handle<Mesh>)>>,
+  models: HashMap<String, Vec<ModelPart>>,
   /// Goes up whenever a model changes, so placed models know to show it again.
   pub generation: u64
 }
 
+/// The faces of a model made of one material: its name, their mesh, and the middle of
+/// the shapes they're on, where light they cast comes from.
+pub type ModelPart = (String, Handle<Mesh>, Vec3);
+
 impl ModelMeshes {
+  fn parts(model: &LowPoly, materials: &ModelMaterials, meshes: &mut Assets<Mesh>) -> Vec<ModelPart> {
+    model
+      .meshes(materials)
+      .into_iter()
+      .map(|(material, mesh)| {
+        let corners = model
+          .shapes
+          .iter()
+          .filter(|shape| shape.material == material)
+          .flat_map(|shape| &shape.corners)
+          .collect::<Vec<_>>();
+        let middle = corners.iter().copied().sum::<Vec3>() / corners.len().max(1) as f32;
+        (material, meshes.add(mesh), middle)
+      })
+      .collect()
+  }
+
   /// The parts of the model at `path`, loading it the first time.
   pub fn get(
     &mut self,
     path: &str,
     materials: &ModelMaterials,
     meshes: &mut Assets<Mesh>
-  ) -> &[(String, Handle<Mesh>)] {
+  ) -> &[ModelPart] {
     self.models.entry(path.to_string()).or_insert_with(|| {
-      LowPoly::load(path)
-        .inspect_err(|error| error!("{error}"))
-        .unwrap_or_default()
-        .meshes(materials)
-        .into_iter()
-        .map(|(material, mesh)| (material, meshes.add(mesh)))
-        .collect()
+      let model = LowPoly::load(path).inspect_err(|error| error!("{error}")).unwrap_or_default();
+      Self::parts(&model, materials, meshes)
     })
   }
 
@@ -462,12 +478,7 @@ impl ModelMeshes {
     materials: &ModelMaterials,
     meshes: &mut Assets<Mesh>
   ) {
-    let parts = model
-      .meshes(materials)
-      .into_iter()
-      .map(|(material, mesh)| (material, meshes.add(mesh)))
-      .collect();
-    self.models.insert(path.to_string(), parts);
+    self.models.insert(path.to_string(), Self::parts(model, materials, meshes));
     self.generation += 1
   }
 

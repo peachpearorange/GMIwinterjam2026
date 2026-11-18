@@ -1,0 +1,3 @@
+[env]
+# Use WiVRn (streaming to the Pico 4) rather than the system-wide OpenXR runtime (SteamVR).
+XR_RUNTIME_JSON = "/usr/share/openxr/1/openxr_wivrn.json"

@@ -295,6 +295,23 @@ impl MaterialEditor {
             );
           });
         }
+        ui.checkbox(&mut material.casts_light, "Casts light")
+          .on_hover_text("Models light up what's around them from faces of it, in its glow color");
+        if material.casts_light {
+          ui.add(
+            egui::Slider::new(&mut material.light_intensity, 100.0..=10_000_000.0)
+              .logarithmic(true)
+              .suffix(" lm")
+              .text("intensity")
+          );
+          ui.add(
+            egui::Slider::new(&mut material.light_range, 1.0..=200.0)
+              .logarithmic(true)
+              .suffix(" m")
+              .text("range")
+          )
+          .on_hover_text("How far its light reaches");
+        }
 
         ui.collapsing("Clear coat", |ui| {
           ui.add(egui::Slider::new(&mut material.clearcoat, 0.0..=1.0).text("coat"))

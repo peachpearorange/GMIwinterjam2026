@@ -11,14 +11,15 @@
 //! in play each is swapped for a copy that comes alive here. The shelter is at the
 //! marker named [`SHELTER_MARKER`], or where the guy starts without one.
 //!
-//! They play their models' animations called [`IDLE`] and [`WALK`], and bears [`EAT`]
-//! after catching a penguin.
+//! They play their models' animations called [`IDLE`] ([`PENGUIN_IDLE`] for penguins)
+//! and [`WALK`]. Snowed-in penguins wave for help with [`SNOWED_IN_WAVE`], and bears
+//! [`EAT`] after catching a penguin.
 //!
 //! Screens shown: [`RESCUE_SCREEN`] during it, then [`OVER_SCREEN`] or
 //! [`CAUGHT_SCREEN`]. Their texts can show `{penguins}`, `{penguins saved}`,
 //! `{penguins caught}` and `{penguins left}`.
 
-use {super::{PlayOnly, Player, Stage,
+use {super::{HiddenInPlay, PlayOnly, Player, Stage,
              nav::Field,
              snow::{MAX_DEPTH, Snow}},
      crate::{Mode, START_MARKER},
@@ -32,7 +33,11 @@ const PENGUIN_MODEL: &str = "models/penguin.model.ron";
 const BEAR_MODEL: &str = "models/polarbear.model.ron";
 /// The animations penguins and bears play, by name, when their models have them.
 const IDLE: &str = "idle";
+/// What the penguin model calls its idle animation, breathing.
+const PENGUIN_IDLE: &str = "animation 2";
 const WALK: &str = "walk";
+/// Snowed-in penguins, waving for help.
+const SNOWED_IN_WAVE: &str = "wave2";
 /// Bears, after catching a penguin.
 const EAT: &str = "eat";
 /// The marker the shelter is at.
@@ -59,17 +64,16 @@ const PENGUIN_SPACING: f32 = 1.5;
 const BEAR_SPEED: f32 = 7.0;
 /// The share of their speed bears keep in the deepest snow.
 const BEAR_WADING_SPEED: f32 = 0.25;
-/// How much costlier the deepest snow is to bears than bare ground, when choosing a way.
-const BEAR_DEEP_SNOW_COST: f32 = 6.0;
-/// How far bears notice prey from, as the cost of the way there: world units along bare
-/// ground, fewer through snow.
-const BEAR_SMELL: f32 = 60.0;
 /// How near bears have to get to catch something, in world units.
 const BEAR_REACH: f32 = 2.0;
 /// Seconds a bear stays put after catching a penguin.
 const BEAR_EAT_SECONDS: f32 = 4.0;
 /// How far apart bears keep from each other, in world units.
 const BEAR_SPACING: f32 = 3.5;
+/// Which way the models face at rest, along the ground's x and z: what's turned toward
+/// where they're going.
+const PENGUIN_FRONT: Vec2 = Vec2::Y;
+const BEAR_FRONT: Vec2 = Vec2::NEG_X;
 /// Radians per second animals turn toward where they're going.
 const TURN_SPEED: f32 = 8.0;
 /// Seconds between searches for the way, each one in turn.
@@ -95,10 +99,6 @@ struct Bear {
   /// Seconds left staying put after catching a penguin.
   eating: f32
 }
-
-/// A model placed in the world, hidden in play while a copy of it comes alive.
-#[derive(Component)]
-struct HiddenInPlay;
 
 #[derive(Resource)]
 struct Shelter {
@@ -129,6 +129,9 @@ struct Ways {
   wait: f32
 }
 
+/// The share of their speed bears keep in snow `depth` deep.
+fn bear_wading(depth: f32) -> f32 { 1.0.lerp(BEAR_WADING_SPEED, depth / MAX_DEPTH) }
+
 /// How costly snow `depth` deep is for penguins to cross, none when too deep.
 fn penguin_cost(depth: f32) -> Option<f32> {
   (depth <= PENGUIN_WADE_DEPTH).then(|| 1.0 + 3.0 * depth / PENGUIN_WADE_DEPTH)
@@ -156,15 +159,14 @@ fn setup(
         PlayOnly,
         Model { path: path.clone() },
         transform,
-        Visibility::default(),
-        Animate::new(IDLE)
+        Visibility::default()
       );
       match path.as_str() {
         PENGUIN_MODEL => {
           penguins += 1;
-          commands.spawn((copy, Penguin { saved: false }))
+          commands.spawn((copy, Animate::new(PENGUIN_IDLE), Penguin { saved: false }))
         }
-        BEAR_MODEL => commands.spawn((copy, Bear { eating: 0.0 })),
+        BEAR_MODEL => commands.spawn((copy, Animate::new(IDLE), Bear { eating: 0.0 })),
         _ => return
       };
       commands.entity(entity).insert((HiddenInPlay, Visibility::Hidden));
@@ -233,9 +235,10 @@ fn search_ways(
         extent,
         prey,
         |xz| {
-          (!safe(xz)).then(|| 1.0 + BEAR_DEEP_SNOW_COST * snow.depth_at(xz) / MAX_DEPTH)
+          // As long as it takes to cross.
+          (!safe(xz)).then(|| 1.0 / bear_wading(snow.depth_at(xz)))
         },
-        BEAR_SMELL
+        f32::INFINITY
       ))
     }
   }
@@ -243,9 +246,10 @@ fn search_ways(
 }
 
 /// Moves `transform` toward `target` at `speed` for `seconds`, standing on the ground and
-/// turning to face the way it goes. Never overshoots.
+/// turning its `front` to face the way it goes. Never overshoots.
 fn walk(
   transform: &mut Transform,
+  front: Vec2,
   target: Vec2,
   speed: f32,
   seconds: f32,
@@ -257,7 +261,7 @@ fn walk(
   if length > 1e-4 {
     let xz = from + offset * (speed * seconds / length).min(1.0);
     transform.translation = Vec3::new(xz.x, terrain.height(xz), xz.y);
-    let facing = Quat::from_rotation_y(offset.x.atan2(offset.y));
+    let facing = Quat::from_rotation_y(offset.x.atan2(offset.y) - front.x.atan2(front.y));
     transform.rotation = transform.rotation.slerp(facing, (TURN_SPEED * seconds).min(1.0))
   }
 }
@@ -285,7 +289,7 @@ fn spread(positions: &[Vec2], spacing: f32) -> Vec<Vec2> {
 }
 
 /// Walks the penguins: freed ones to the shelter along dug ways, or after the guy
-/// when no dug way leads there yet.
+/// when no dug way leads there yet. Snowed-in ones wave.
 fn move_penguins(
   time: Res<Time>,
   ways: Res<Ways>,
@@ -305,7 +309,7 @@ fn move_penguins(
       tally.saved += 1
     }
     if penguin.saved {
-      animate.play(IDLE);
+      animate.play(PENGUIN_IDLE);
       return;
     }
     let target = next_on(ways.to_shelter.as_ref(), xz, shelter.xz).or_else(|| {
@@ -316,9 +320,16 @@ fn move_penguins(
     if let Some(target) = target {
       let wading = (snow.depth_at(xz) / PENGUIN_WADE_DEPTH).min(1.0);
       let speed = PENGUIN_SPEED * 1.0.lerp(PENGUIN_WADING_SPEED, wading);
-      walk(&mut transform, target, speed, seconds, &terrain)
+      walk(&mut transform, PENGUIN_FRONT, target, speed, seconds, &terrain)
     }
-    animate.play(if target.is_some() { WALK } else { IDLE })
+    let snowed_in = penguin_cost(snow.depth_at(xz)).is_none();
+    animate.play(if target.is_some() {
+      WALK
+    } else if snowed_in {
+      SNOWED_IN_WAVE
+    } else {
+      PENGUIN_IDLE
+    })
   });
   let mut all = penguins.iter_mut().collect::<Vec<_>>();
   let positions =
@@ -379,11 +390,11 @@ fn move_bears(
         }
         prey.swap_remove(i);
       } else if let Some(target) = next_on(ways.to_prey.as_ref(), xz, at) {
-        let wading = snow.depth_at(xz) / MAX_DEPTH;
         walk(
           &mut transform,
+          BEAR_FRONT,
           target,
-          BEAR_SPEED * 1.0.lerp(BEAR_WADING_SPEED, wading),
+          BEAR_SPEED * bear_wading(snow.depth_at(xz)),
           seconds,
           &terrain
         );
@@ -428,19 +439,10 @@ fn tally_up(
   }
 }
 
-/// Shows the placed animals again and forgets the rescue, so the next play starts it
-/// afresh.
-fn finish(
-  mut hidden: Query<(Entity, &mut Visibility), With<HiddenInPlay>>,
-  mut values: ResMut<UiValues>,
-  mut commands: Commands
-) {
+/// Forgets the rescue, so the next play starts it afresh.
+fn finish(mut values: ResMut<UiValues>, mut commands: Commands) {
   COUNTS.iter().for_each(|name| {
     values.remove(*name);
-  });
-  hidden.iter_mut().for_each(|(entity, mut visibility)| {
-    *visibility = Visibility::default();
-    commands.entity(entity).remove::<HiddenInPlay>();
   });
   commands.remove_resource::<Shelter>();
   commands.remove_resource::<Tally>();
@@ -462,4 +464,35 @@ pub fn update() -> impl IntoScheduleConfigs<bevy::ecs::system::ScheduleSystem, (
 
 pub fn plugin(app: &mut App) {
   app.add_systems(OnEnter(Stage::Rescue), start).add_systems(OnExit(Mode::Play), finish);
+}
+
+#[cfg(test)]
+mod tests {
+  use {super::*,
+       bevy::ecs::system::RunSystemOnce,
+       std::time::Duration};
+
+  #[test]
+  fn bears_wade_through_deep_snow_to_snowed_in_penguins() {
+    let terrain = Terrain::flat(64, 64, 2.0, "snow");
+    let mut snow = Snow::new(&terrain);
+    snow.skip_to(STARTS_BURIED);
+    let mut world = World::new();
+    let mut time = Time::<()>::default();
+    time.advance_by(Duration::from_millis(100));
+    world.insert_resource(time);
+    world.insert_resource(snow);
+    world.insert_resource(terrain);
+    world.insert_resource(Shelter { xz: Vec2::splat(-40.0) });
+    world.insert_resource(Tally { penguins: 1, ..default() });
+    world.init_resource::<Ways>();
+    world.spawn((Transform::from_xyz(20.0, 0.0, 20.0), Penguin { saved: false }));
+    let bear = world.spawn((Transform::default(), Bear { eating: 0.0 }, Animate::new(IDLE))).id();
+    (0..30).for_each(|_| {
+      world.run_system_once(search_ways).unwrap();
+      world.run_system_once(move_bears).unwrap();
+    });
+    let at = world.get::<Transform>(bear).unwrap().translation.xz();
+    assert!(at.x > 1.0 && at.y > 1.0, "the bear went to {at}")
+  }
 }

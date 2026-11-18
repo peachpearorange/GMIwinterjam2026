@@ -1,6 +1,8 @@
 //! Playing: the guy walks the world, watched from behind, while snow settles over the
 //! ground and then rises to bury it. Wherever he goes, he clears the snow away.
 //!
+//! He digs once he's fetched the shovel; see [`shovel`].
+//!
 //! Play goes through [`Stage`]s, each its own little game, as the snow gets deeper.
 //!
 //! WASD or the arrow keys walk, relative to where the camera looks; Shift runs, and deep
@@ -13,6 +15,7 @@ mod audio;
 mod nav;
 mod rescue;
 mod shots;
+mod shovel;
 mod snow;
 mod snowfall;
 
@@ -71,9 +74,17 @@ pub enum Stage {
 #[derive(Component)]
 pub struct Player;
 
+/// Clears the snow wherever he goes: the player, once he has a shovel.
+#[derive(Component)]
+pub struct Digs;
+
 /// Exists only during play, and goes when play ends.
 #[derive(Component)]
 pub struct PlayOnly;
+
+/// A model placed in the world, hidden in play while a copy of it comes alive.
+#[derive(Component)]
+pub struct HiddenInPlay;
 
 /// Where the camera looks from and toward.
 #[derive(Resource)]
@@ -280,15 +291,21 @@ fn start(
   shown.0 = ui.shown_during_play()
 }
 
-/// Takes away everything play made, so the next play starts afresh.
+/// Takes away everything play made and shows the placed models it hid, so the next play
+/// starts afresh.
 fn finish(
   played: Query<Entity, With<PlayOnly>>,
+  mut hidden: Query<(Entity, &mut Visibility), With<HiddenInPlay>>,
   mut shown: ResMut<ShownScreens>,
   mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>,
   mut commands: Commands
 ) {
   cursors.iter_mut().for_each(|mut cursor| set_grab(&mut cursor, false));
   played.iter().for_each(|entity| commands.entity(entity).despawn());
+  hidden.iter_mut().for_each(|(entity, mut visibility)| {
+    *visibility = Visibility::default();
+    commands.entity(entity).remove::<HiddenInPlay>();
+  });
   shown.clear();
   commands.remove_resource::<audio::Footsteps>();
   snow::finish(&mut commands)
@@ -313,6 +330,7 @@ pub fn plugin(app: &mut App) {
         snow::update(),
         rescue::update(),
         audio::update,
+        shovel::update,
         follow_player,
         snowfall::update
       )

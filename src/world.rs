@@ -85,8 +85,9 @@ fn attach_model_scenes(
 #[derive(Component, PartialEq)]
 struct ShownModel(u64, u64);
 
-/// Gives each low poly model a child per material it uses, again whenever models or
-/// materials change. Animated ones show their own, bending, see [`skeleton`].
+/// Gives each low poly model a child per material it uses, plus a light amid the faces
+/// of each material that casts light, again whenever models or materials change.
+/// Animated ones show their own, bending, see [`skeleton`].
 fn show_low_poly_models(
   models: Query<(Entity, &Model, Option<&ShownModel>), Without<Animate>>,
   mut model_meshes: ResMut<ModelMeshes>,
@@ -108,8 +109,21 @@ fn show_low_poly_models(
       model
         .despawn_related::<Children>()
         .insert((ShownModel(version.0, version.1), Visibility::default()));
-      parts.into_iter().for_each(|(material, mesh)| {
-        let material = model_materials.handle(&material, &mut materials, &mut images);
+      parts.into_iter().for_each(|(name, mesh, middle)| {
+        if let Some(material) = model_materials.get(&name)
+          && material.casts_light
+        {
+          model.with_child((
+            PointLight {
+              color: material.light_color().color(),
+              intensity: material.light_intensity,
+              range: material.light_range,
+              ..default()
+            },
+            Transform::from_translation(middle)
+          ));
+        }
+        let material = model_materials.handle(&name, &mut materials, &mut images);
         model.with_child((Mesh3d(mesh), MeshMaterial3d(material)));
       })
     });

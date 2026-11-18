@@ -64,6 +64,13 @@ pub struct ModelMaterial {
   /// Light the surface gives off, times the texture when there is one. Black for none.
   pub glow: Rgb,
   pub glow_strength: f32,
+  /// Whether models give off light from where faces of it are, like a placed light, in
+  /// [`Self::light_color`].
+  pub casts_light: bool,
+  /// Lumens.
+  pub light_intensity: f32,
+  /// How far its light reaches, in world units.
+  pub light_range: f32,
   /// Leaves holes where the texture is under half opaque, for leaves, fences or grates.
   pub cutout: bool
 }
@@ -92,6 +99,9 @@ impl Default for ModelMaterial {
       fog: true,
       glow: Rgb([0; 3]),
       glow_strength: 1.0,
+      casts_light: false,
+      light_intensity: 100_000.0,
+      light_range: 20.0,
       cutout: false
     }
   }
@@ -129,6 +139,9 @@ impl ModelMaterial {
 
   /// Whether faces of it glow.
   pub fn glows(&self) -> bool { self.glow != Rgb([0; 3]) && self.glow_strength > 0.0 }
+
+  /// The color of the light it casts: its glow, or its own color when it doesn't glow.
+  pub fn light_color(&self) -> Rgb { if self.glows() { self.glow } else { self.color } }
 }
 
 /// The material library, with a Bevy material for each one in use.

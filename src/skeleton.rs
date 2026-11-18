@@ -1,13 +1,16 @@
 //! Skeletons bending low poly models. Each [`Bone`] turns around its head, carrying its
-//! children with it, and each corner of the model follows the bone it's nearest, blended
-//! with that bone's parent and children by how near it is to them. So shapes along one
-//! bone move whole, and corners around a joint bend between the bones meeting there.
-//! Weights come from where things are at rest, so they never need painting.
+//! children with it. Each shape follows the bones lying mostly inside it, or else the
+//! one reaching into it most, so a flipper's bone moves the flipper and not the body it
+//! starts in. Each corner of a shape follows the nearest of its bones, blended with that
+//! bone's parent and children among them by how near it is to them. So shapes along one
+//! bone move whole, and a shape with a joint inside bends there. Weights come from where
+//! things are at rest, so they never need painting.
 //!
 //! In the game a placed [`Model`] with an [`Animate`] plays its model's animation of that
 //! name, over and over.
 
-use {crate::{material::ModelMaterials,
+use {crate::{hull,
+             material::ModelMaterials,
              model::{Animation, Bone, LowPoly, ModelMeshes, Pose, Surface},
              world::Model},
      bevy::{math::Affine3A, platform::collections::HashMap, prelude::*},
@@ -63,23 +66,70 @@ pub fn bone_transforms(bones: &[Bone], poses: &[Pose]) -> Vec<Affine3A> {
   })
 }
 
-/// Which bones a point of the model at rest follows, and how much each: the nearest,
-/// and its parent and children, the nearer the more. None without bones.
-pub fn weights(bones: &[Bone], point: Vec3) -> Vec<(usize, f32)> {
+/// Which of the bones `among` a point of the model at rest follows, and how much each:
+/// the nearest, and its parent and children among them, the nearer the more. None
+/// without any.
+pub fn weights(bones: &[Bone], among: &[usize], point: Vec3) -> Vec<(usize, f32)> {
   let distance = |b: usize| point.distance(on_segment(point, bones[b].head, bones[b].tail));
-  let Some(nearest) = (0..bones.len()).min_by(|&a, &b| distance(a).total_cmp(&distance(b))) else {
+  let Some(&nearest) = among.iter().min_by(|&&a, &&b| distance(a).total_cmp(&distance(b))) else {
     return vec![];
   };
   let related =
     |b: usize| b == nearest || bones[nearest].parent == Some(b) || bones[b].parent == Some(nearest);
-  let raw = (0..bones.len())
-    .filter(|&b| related(b))
-    .map(|b| (b, 1.0 / distance(b).max(1e-4).powi(4)))
+  let raw = among
+    .iter()
+    .filter(|&&b| related(b))
+    .map(|&b| (b, 1.0 / distance(b).max(1e-4).powi(4)))
     .collect::<Vec<_>>();
   let total = raw.iter().map(|(_, w)| w).sum::<f32>();
   let kept = raw.into_iter().filter(|&(_, w)| w / total >= LEAST_WEIGHT).collect::<Vec<_>>();
   let total = kept.iter().map(|(_, w)| w).sum::<f32>();
   kept.into_iter().map(|(b, w)| (b, w / total)).collect()
+}
+
+/// How many points along a bone are checked for being inside a shape.
+const BONE_SAMPLES: usize = 16;
+/// How much of a bone has to be inside a shape for the shape to follow it.
+const INSIDE_SHARE: f32 = 0.5;
+
+/// The bones a shape with corners `corners` follows: those mostly inside it, or else the
+/// one reaching deepest into it, or nearest it. So a bone just poking into a shape, like
+/// an arm's from the shoulder into the body, leaves it be.
+fn shape_bones(bones: &[Bone], corners: &[Vec3], shape_hull: &hull::Hull) -> Vec<usize> {
+  let outside = bones
+    .iter()
+    .map(|bone| {
+      (0..=BONE_SAMPLES)
+        .map(|i| hull::outside_hull_by(corners, shape_hull, bone.head.lerp(bone.tail, i as f32 / BONE_SAMPLES as f32)))
+        .collect::<Vec<_>>()
+    })
+    .collect::<Vec<_>>();
+  let mostly_inside = (0..bones.len())
+    .filter(|&b| {
+      outside[b].iter().filter(|&&by| by <= hull::EPSILON).count() as f32
+        >= INSIDE_SHARE * (BONE_SAMPLES + 1) as f32
+    })
+    .collect::<Vec<_>>();
+  let deepest = |b: usize| outside[b].iter().copied().fold(f32::INFINITY, f32::min);
+  if mostly_inside.is_empty() {
+    (0..bones.len()).min_by(|&a, &b| deepest(a).total_cmp(&deepest(b))).into_iter().collect()
+  } else {
+    mostly_inside
+  }
+}
+
+/// What each vertex of `model`'s [`LowPoly::surface`] follows: each shape the bones it
+/// follows, by [`shape_bones`], and each corner of it those by [`weights`].
+pub fn model_weights(model: &LowPoly) -> Vec<Vec<(usize, f32)>> {
+  model
+    .shapes
+    .iter()
+    .filter_map(|shape| hull::hull(&shape.corners).map(|shape_hull| (shape, shape_hull)))
+    .flat_map(|(shape, shape_hull)| {
+      let among = shape_bones(&model.bones, &shape.corners, &shape_hull);
+      shape.corners.iter().map(move |&corner| weights(&model.bones, &among, corner)).collect::<Vec<_>>()
+    })
+    .collect()
 }
 
 /// Where `vertices` go, each following its `weights` through the bones' `transforms`.
@@ -110,7 +160,7 @@ pub struct Rig {
 impl Rig {
   pub fn new(model: LowPoly) -> Self {
     let surface = model.surface().0;
-    let weights = surface.vertices.iter().map(|&v| weights(&model.bones, v)).collect();
+    let weights = model_weights(&model);
     Self { model, surface, weights }
   }
 
@@ -247,10 +297,41 @@ mod tests {
     let transforms = bone_transforms(&bones, &[shoulder, Pose::default()]);
     assert!(transforms[1].transform_point3(Vec3::X * 2.0).abs_diff_eq(Vec3::X * -2.0, 1e-5));
     // A point mid forearm follows the forearm alone, one at the elbow both.
-    let mid = weights(&bones, Vec3::new(1.5, 0.1, 0.0));
+    let mid = weights(&bones, &[0, 1], Vec3::new(1.5, 0.1, 0.0));
     assert!(mid.iter().any(|&(b, w)| b == 1 && w > 0.9));
-    let elbow = weights(&bones, Vec3::new(1.0, 0.1, 0.0));
+    let elbow = weights(&bones, &[0, 1], Vec3::new(1.0, 0.1, 0.0));
     assert!(elbow.iter().all(|&(_, w)| (w - 0.5).abs() < 0.01), "{elbow:?}");
+  }
+
+  /// A box from `min` to `max`.
+  fn cuboid(min: Vec3, max: Vec3) -> crate::model::Shape {
+    crate::model::Shape {
+      corners: (0..8)
+        .map(|i| Vec3::new([min.x, max.x][i & 1], [min.y, max.y][(i >> 1) & 1], [min.z, max.z][i >> 2]))
+        .collect(),
+      ..default()
+    }
+  }
+
+  #[test]
+  fn an_arm_bone_starting_in_the_body_leaves_the_body_be() {
+    // A wide body with a spine up its middle, and a flipper on its side whose bone
+    // starts a little inside the body.
+    let model = LowPoly {
+      shapes: vec![
+        cuboid(Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 2.0, 1.0)),
+        cuboid(Vec3::new(1.0, 0.6, -0.2), Vec3::new(1.3, 1.6, 0.2)),
+      ],
+      bones: vec![
+        Bone { head: Vec3::ZERO, tail: Vec3::Y * 2.0, parent: None },
+        Bone { head: Vec3::new(0.9, 1.5, 0.0), tail: Vec3::new(1.2, 0.7, 0.0), parent: Some(0) },
+      ],
+      animations: vec![]
+    };
+    let weights = model_weights(&model);
+    let follows_only = |b: usize, ws: &[(usize, f32)]| ws.len() == 1 && ws[0].0 == b;
+    assert!(weights[..8].iter().all(|ws| follows_only(0, ws)), "{weights:?}");
+    assert!(weights[8..].iter().all(|ws| follows_only(1, ws)), "{weights:?}");
   }
 
   #[test]
