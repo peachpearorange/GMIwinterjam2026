@@ -137,6 +137,12 @@ impl Field {
       .min_by(|a, b| a.1.total_cmp(&b.1))
       .map(|(next, _)| self.xz(next))
   }
+
+  /// Where a walker at world `xz` heads, looking `steps` points ahead downhill, so it
+  /// doesn't zigzag between neighboring points. None at a goal, or with no way to one.
+  pub fn ahead(&self, xz: Vec2, steps: usize) -> Option<Vec2> {
+    std::iter::successors(self.downhill(xz), |&at| self.downhill(at)).take(steps).last()
+  }
 }
 
 #[cfg(test)]

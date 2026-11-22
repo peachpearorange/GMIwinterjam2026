@@ -10,7 +10,8 @@
 //! looks fade into each other in a shader and the rising snow is one mesh moving up, both rebuilt
 //! only where the player digs.
 
-use {super::{Digs, PlayOnly, Player},
+use {super::{Digs, PlayOnly, Player, Stage,
+             collide::{self, Collider}},
      bevy::{asset::RenderAssetUsages,
             light::NotShadowCaster,
             math::Affine2,
@@ -21,7 +22,8 @@ use {super::{Digs, PlayOnly, Player},
             render::render_resource::{AsBindGroup, PrimitiveTopology},
             shader::ShaderRef},
      winterjam2026::{material::{ModelMaterial, ModelMaterials},
-                     terrain::Terrain}};
+                     terrain::Terrain,
+                     world::Model}};
 
 /// Snow grid points per terrain cell along each side.
 const POINTS_PER_CELL: usize = 4;
@@ -48,13 +50,18 @@ const CHUNKS_CAPPED_PER_FRAME: u32 = 4;
 const COVER_LIFT: f32 = 0.03;
 /// How far under the ground the rising snow's surface starts, out of sight.
 const SINK: f32 = 0.05;
-/// How far around the player snow gets cleared, in world units.
+/// How far around where the player digs snow gets cleared, in world units, and how far
+/// ahead of him that is, the way he looks, where the shovel is.
 const DIG_RADIUS: f32 = 1.2;
+const DIG_AHEAD: f32 = 0.5;
 /// The steepest snow stays, as height per distance. Steeper snow slides down.
 const STEEPEST_SLOPE: f32 = 0.6;
 /// How quickly snow steeper than [`STEEPEST_SLOPE`] slides, as the share of the way to
 /// resting it goes per second.
 const SLUMP_PER_SECOND: f32 = 6.0;
+/// Seconds of snowfall that have already gone by when play starts, so the earliest
+/// patches already have a little snow.
+const START_SECONDS: f32 = 14.0;
 /// How far past where the player digs snow slides, in world units.
 const SLUMP_REACH: f32 = 4.0;
 /// The library material settled and rising snow is made of.
@@ -110,6 +117,8 @@ pub struct Snow {
   pub dug: Option<f32>,
   /// Places kept clear of snow all the time, as world xz and radius.
   pub yards: Vec<(Vec2, f32)>,
+  /// Points kept clear of snow all the time, being indoors, like inside igloos.
+  indoors: Vec<UVec2>,
   /// How many chunks have had their turn at being held to [`MAX_DEPTH`].
   capped: u32,
   /// Chunks whose meshes need building again, as the snow there changed.
@@ -148,6 +157,7 @@ impl Snow {
       clock: 0.0,
       dug: None,
       yards: vec![],
+      indoors: vec![],
       capped: 0,
       dirty: default(),
       chunks: default()
@@ -350,15 +360,23 @@ impl Snow {
   /// deep the deepest snow cleared was, when any was, zero for snow that had only settled.
   fn clear(&mut self, xz: Vec2, radius: f32) -> Option<f32> {
     let (min, max) = self.around(xz, radius);
+    let points = (min.y..=max.y)
+      .flat_map(|z| (min.x..=max.x).map(move |x| UVec2::new(x, z)))
+      .filter(|&p| self.xz(p).distance(xz) <= radius)
+      .collect::<Vec<_>>();
+    self.clear_points(&points)
+  }
+
+  /// Clears the snow at `points`, marking the chunks it changes. Gives how deep the
+  /// deepest snow cleared was, when any was, zero for snow that had only settled.
+  fn clear_points(&mut self, points: &[UVec2]) -> Option<f32> {
     let clock = self.clock;
     // Points cleared a moment ago are left alone, so standing still doesn't rebuild
     // the snow every frame. Half a stage on, they still look bare.
-    let cleared = (min.y..=max.y)
-      .flat_map(|z| (min.x..=max.x).map(move |x| UVec2::new(x, z)))
-      .filter(|&p| {
-        self.xz(p).distance(xz) <= radius
-          && clock - self.start[self.index(p)] > STAGE_SECONDS / 2.0
-      })
+    let cleared = points
+      .iter()
+      .copied()
+      .filter(|&p| clock - self.start[self.index(p)] > STAGE_SECONDS / 2.0)
       .collect::<Vec<_>>();
     let deepest = cleared
       .iter()
@@ -371,9 +389,24 @@ impl Snow {
         let i = self.index(p);
         self.start[i] = clock
       });
+      let (min, max) = cleared
+        .iter()
+        .fold((UVec2::MAX, UVec2::ZERO), |(min, max), &p| (min.min(p), max.max(p)));
       self.mark_dirty(min, max)
     }
     deepest
+  }
+
+  /// Keeps the points under `roofs` clear of snow from now on.
+  fn shelter(&mut self, roofs: &[Collider]) {
+    let points = (0..self.size.y).flat_map(|z| (0..self.size.x).map(move |x| UVec2::new(x, z)));
+    self.indoors = points
+      .filter(|&p| {
+        let xz = self.xz(p);
+        let floor = Vec3::new(xz.x, self.ground[self.index(p)] + 0.01, xz.y);
+        roofs.iter().any(|roof| roof.covers(floor))
+      })
+      .collect()
   }
 
   /// Clears the snow around the player at `xz`.
@@ -587,6 +620,7 @@ struct SnowBody;
 fn setup(
   snow: Option<Res<Snow>>,
   terrain: Option<Res<Terrain>>,
+  placed: Query<(&Model, &Transform), Without<PlayOnly>>,
   mut model_materials: ResMut<ModelMaterials>,
   mut materials: ResMut<Assets<StandardMaterial>>,
   mut cover_materials: ResMut<Assets<CoverMaterial>>,
@@ -598,6 +632,8 @@ fn setup(
     && let Some(terrain) = terrain
   {
     let mut snow = Snow::new(&terrain);
+    snow.clock = START_SECONDS;
+    snow.shelter(&collide::placed_shapes(placed.iter(), &[collide::IGLOO_MODEL]));
     let looks = SnowLooks::new(
       &mut model_materials,
       &mut materials,
@@ -640,19 +676,27 @@ fn advance(
   snow: Option<ResMut<Snow>>,
   looks: Option<Res<SnowLooks>>,
   time: Res<Time>,
-  players: Query<(&Transform, Has<Digs>), With<Player>>,
+  stage: Res<State<Stage>>,
+  follow: Res<super::FollowCamera>,
+  players: Query<(&Transform, &Player, Has<Digs>)>,
   mut bodies: Query<&mut Transform, (With<SnowBody>, Without<Player>)>,
   mut meshes: ResMut<Assets<Mesh>>,
   mut cover_materials: ResMut<Assets<CoverMaterial>>
 ) {
   if let (Some(mut snow), Some(looks)) = (snow, looks) {
     let snow = &mut *snow;
-    snow.clock += time.delta_secs();
-    if let Ok((player, digs)) = players.single() {
+    // Once it stops snowing, nothing more settles, rises or covers what was cleared.
+    if stage.snowing() {
+      snow.clock += time.delta_secs()
+    }
+    if let Ok((player, &Player { walking, .. }, digs)) = players.single() {
       let xz = player.translation.xz();
-      if digs {
-        snow.dig(xz);
-        snow.slump(xz, time.delta_secs())
+      // Standing still, he doesn't dig.
+      if digs && walking.length() > super::STEPPING_SPEED {
+        let ahead = (Quat::from_rotation_y(follow.yaw) * Vec3::NEG_Z).xz();
+        let shovel = xz + ahead * DIG_AHEAD;
+        snow.dig(shovel);
+        snow.slump(shovel, time.delta_secs())
       } else {
         // Wading through it, as if it had only settled.
         snow.dug = (snow.depth_at(xz) > 0.0).then_some(0.0)
@@ -662,6 +706,9 @@ fn advance(
       snow.clear(xz, radius);
       snow.yards.push((xz, radius))
     });
+    let indoors = std::mem::take(&mut snow.indoors);
+    snow.clear_points(&indoors);
+    snow.indoors = indoors;
     (0..CHUNKS_CAPPED_PER_FRAME).for_each(|_| snow.cap_next_chunk());
     std::mem::take(&mut snow.dirty).into_iter().for_each(|chunk| {
       if let Some(ChunkMeshes { body, cover }) = snow.chunks.get(&chunk) {

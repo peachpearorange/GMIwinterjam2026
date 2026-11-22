@@ -9,7 +9,8 @@ use {bevy::{camera_controller::free_camera::{run_freecamera_controller,
                      billboard::WorldCamera,
                      scene::SceneSettings,
                      ui,
-                     world::{Markers, WorldPlugin}}};
+                     world::{Markers, WorldPlugin},
+                     world_ui}};
 
 /// Marker the camera starts at, when the world has one.
 const START_MARKER: &str = "start";
@@ -96,6 +97,7 @@ fn main() {
       FreeCameraPlugin,
       WorldPlugin,
       ui::plugin,
+      world_ui::plugin,
       play::plugin
     ))
     .insert_state(Mode::START)

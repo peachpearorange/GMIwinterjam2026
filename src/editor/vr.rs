@@ -14,6 +14,8 @@
 //! - The left stick flies through the world, the right stick up and down. The right stick
 //!   scrolls the tablet when pointing at it.
 //! - The left trigger held is Shift, for picking several things.
+//! - In the world editor, dragging the laser with Select draws a lasso around several
+//!   things.
 //! - X undoes, Y redoes. In the model editor, A leaves a copy of a shape held behind.
 //!
 //! While the headset shows the world, the window shows what it sees.
@@ -22,7 +24,7 @@ use {super::{Editor, enable_camera,
              material_editor::MaterialEditorUi,
              model_editor::{BACKGROUND, LAYER, ModelEditor, ModelEditorUi},
              pixel_editor::PixelEditorUi,
-             world_editor::{ReadPointer, WorldEditorUi, WorldPointer, read_mouse}},
+             world_editor::{ReadPointer, WorldEditor, WorldEditorUi, WorldPointer, read_mouse}},
      crate::Mode,
      bevy::{anti_alias::{fxaa::Fxaa, smaa::Smaa},
             app::PluginGroupBuilder,
@@ -603,6 +605,8 @@ pub(super) struct VrPointer {
   pub ray: Ray3d,
   /// Where the controller touches things.
   pub tip: Vec3,
+  /// Where the eyes are and which way they look, in the same space as the rest.
+  pub head: Transform,
   /// World units per meter.
   pub scale: f32,
   /// The right trigger, for the tools: never down for a press the tablet took.
@@ -627,6 +631,7 @@ impl Default for VrPointer {
       aim: default(),
       ray: Ray3d::new(Vec3::ZERO, Dir3::NEG_Z),
       tip: default(),
+      head: default(),
       scale: 1.0,
       trigger: default(),
       shift: false,
@@ -683,6 +688,7 @@ fn update_pointer(
     aim,
     ray: Ray3d::new(aim.translation, Dir3::new(forward).unwrap_or(Dir3::NEG_Z)),
     tip: aim.translation + forward * TIP_REACH * scale,
+    head: root.mul_transform(input.head),
     scale,
     trigger,
     shift: hands[LEFT].trigger.down,
@@ -695,9 +701,26 @@ fn update_pointer(
   }
 }
 
-/// The world editor's tools follow the controller while the headset shows them.
-fn point_into_world(vr: Res<VrPointer>, mut pointer: ResMut<WorldPointer>) {
+/// Where the laser ends: on the ground, or far off over the sky.
+fn laser_end(pointer: &VrPointer, terrain: Option<&Terrain>) -> Vec3 {
+  terrain
+    .and_then(|terrain| terrain.raycast(pointer.ray))
+    .unwrap_or(pointer.ray.get_point(30.0 * pointer.scale))
+}
+
+/// The world editor's tools follow the controller while the headset shows them. The
+/// lasso is drawn where the window, looking through the headset, sees the laser end.
+fn point_into_world(
+  vr: Res<VrPointer>,
+  terrain: Option<Res<Terrain>>,
+  camera: Single<(&Camera, &GlobalTransform), With<FreeCamera>>,
+  mut pointer: ResMut<WorldPointer>
+) {
   if vr.active && vr.space == Some(Space::World) {
+    let (camera, camera_transform) = *camera;
+    let screen = (!vr.on_tablet)
+      .then(|| camera.world_to_viewport(camera_transform, laser_end(&vr, terrain.as_deref())).ok())
+      .flatten();
     *pointer = WorldPointer {
       ray: Some(vr.ray),
       in_view: !vr.on_tablet,
@@ -706,7 +729,8 @@ fn point_into_world(vr: Res<VrPointer>, mut pointer: ResMut<WorldPointer>) {
       just_released: vr.trigger.just_released(),
       cancel: false,
       shift: vr.shift,
-      screen: None,
+      screen,
+      lasso_min: LASSO_MIN,
       // Twisting clockwise turns what's being placed clockwise, seen from above.
       turn: -vr.twist,
       undo: vr.undo,
@@ -748,15 +772,45 @@ fn draw_hands(
     return;
   }
   let end = if let Some(point) = tablet.point {
-    Some(point)
+    point
   } else if pointer.space == Some(Space::World) {
-    terrain.and_then(|terrain| terrain.raycast(pointer.ray))
+    laser_end(&pointer, terrain.as_deref())
   } else {
     // The model editor draws its own.
     return;
   };
-  let end = end.unwrap_or(pointer.ray.get_point(30.0 * pointer.scale));
   gizmos.line(pointer.aim.translation, end, LASER_COLOR)
+}
+
+/// How far, in window pixels, a select drag with the laser must go to be a lasso, not a
+/// click, as hands shake.
+const LASSO_MIN: f32 = 40.0;
+/// How far in front of the eyes the world editor's lasso is drawn, in meters.
+const LASSO_DISTANCE: f32 = 2.0;
+
+/// The world editor's lasso, drawn in front of the eyes where the window, looking
+/// through the headset, has it.
+fn draw_lasso(
+  pointer: Res<VrPointer>,
+  editor: Res<WorldEditor>,
+  camera: Single<(&Camera, &GlobalTransform), With<FreeCamera>>,
+  mut gizmos: Gizmos<VrGizmos>
+) {
+  if pointer.active
+    && pointer.space == Some(Space::World)
+    && let Some(lasso) = &editor.lasso
+  {
+    let (camera, camera_transform) = *camera;
+    gizmos.linestrip(
+      lasso.iter().filter_map(|&point| {
+        camera
+          .viewport_to_world(camera_transform, point)
+          .ok()
+          .map(|ray| ray.get_point(LASSO_DISTANCE * pointer.scale))
+      }),
+      LASER_COLOR
+    )
+  }
 }
 
 /// The window's camera looks through the headset while it shows the world, so the
@@ -1376,6 +1430,7 @@ pub fn plugin(app: &mut App) {
         (navigate, update_pointer).chain().in_set(PointerSet),
         point_into_world.in_set(ReadPointer).after(read_mouse).after(PointerSet),
         draw_hands.after(PointerSet),
+        draw_lasso.after(PointerSet),
         hold_desktop_camera.after(enable_camera)
       )
     )

@@ -42,11 +42,14 @@ enum Tool {
   PlaceBillboard,
   PlaceLight,
   Select,
+  /// Drags whatever is under the pointer across the ground, or the whole selection when
+  /// that's part of it.
+  Move,
   PaintSky
 }
 
 impl Tool {
-  const ALL: [Self; 11] = [
+  const ALL: [Self; 12] = [
     Self::Sculpt(Sculpt::Raise),
     Self::Sculpt(Sculpt::Lower),
     Self::Sculpt(Sculpt::Smooth),
@@ -57,6 +60,7 @@ impl Tool {
     Self::PlaceBillboard,
     Self::PlaceLight,
     Self::Select,
+    Self::Move,
     Self::PaintSky
   ];
 
@@ -72,13 +76,14 @@ impl Tool {
       Self::PlaceBillboard => "Place billboard",
       Self::PlaceLight => "Place light",
       Self::Select => "Select",
+      Self::Move => "Move",
       Self::PaintSky => "Paint sky"
     }
   }
 }
 
 /// The keys that pick each tool in [`Tool::ALL`], in order, and what the buttons show.
-const TOOL_KEYS: [(KeyCode, &str); 11] = [
+const TOOL_KEYS: [(KeyCode, &str); 12] = [
   (KeyCode::Digit1, "1"),
   (KeyCode::Digit2, "2"),
   (KeyCode::Digit3, "3"),
@@ -89,6 +94,7 @@ const TOOL_KEYS: [(KeyCode, &str); 11] = [
   (KeyCode::Digit8, "8"),
   (KeyCode::KeyL, "L"),
   (KeyCode::Digit9, "9"),
+  (KeyCode::KeyM, "M"),
   (KeyCode::Digit0, "0")
 ];
 
@@ -278,7 +284,12 @@ pub(super) struct WorldPointer {
   /// Adds to the selection rather than replacing it.
   pub shift: bool,
   /// Where it is in the window, for drawing a lasso. `None` when it isn't on the window.
+  /// In VR, where what the laser points at is seen in the window, which looks through
+  /// the headset; it can be past the window's edges.
   pub screen: Option<Vec2>,
+  /// How far, in window pixels, a select drag must go to be a lasso, not a click. Hands
+  /// shake more than mice.
+  pub lasso_min: f32,
   /// Degrees a model being placed turns, counted from anywhere: only the change since
   /// the press matters.
   pub turn: f32,
@@ -312,6 +323,7 @@ pub(super) fn read_mouse(
     cancel: mouse.pressed(MouseButton::Right),
     shift: keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
     screen,
+    lasso_min: LASSO_MIN,
     turn,
     undo: false,
     redo: false
@@ -335,6 +347,13 @@ struct Stroke {
   start_height: f32,
   /// Where the cursor pointed at the terrain on the previous frame.
   previous: Vec2
+}
+
+/// A drag with the move tool: where the pointer met the ground when it was pressed, and
+/// each thing being moved with where it was then.
+struct Moving {
+  grab: Vec2,
+  things: Vec<(Entity, Vec3)>
 }
 
 /// The state of the world editor: the active tool and every tool's settings.
@@ -361,8 +380,10 @@ pub(super) struct WorldEditor {
   /// How far above the clicked ground a light gets placed, in world units.
   light_height: f32,
   selected: Vec<Entity>,
+  /// While the move tool's button is held after pressing it on something.
+  moving: Option<Moving>,
   /// The outline being dragged with the select tool, in window coordinates.
-  lasso: Option<Vec<Vec2>>,
+  pub(super) lasso: Option<Vec<Vec2>>,
   new_world: NewWorld,
   /// Cells to add on each side along x and z when resizing, fewer where negative.
   grow: IVec2,
@@ -415,6 +436,7 @@ impl Default for WorldEditor {
       },
       light_height: 3.0,
       selected: default(),
+      moving: None,
       lasso: None,
       new_world: NewWorld::DEFAULT,
       grow: IVec2::splat(16),
@@ -444,7 +466,8 @@ const SKY_SIZES: [u32; 4] = [128, 256, 512, 1024];
 
 /// How far from the clicked point the select tool looks for markers and models.
 const SELECT_RADIUS: f32 = 4.0;
-/// How far, in window pixels, the select tool's drag must go to be a lasso, not a click.
+/// How far, in window pixels, the select tool's drag with the mouse must go to be a
+/// lasso, not a click.
 const LASSO_MIN: f32 = 6.0;
 /// Height of the editor-only pole drawn at every marker.
 const MARKER_POLE: f32 = 3.0;
@@ -726,7 +749,7 @@ impl WorldEditorUi<'_, '_> {
           )
           .on_hover_text("Above the ground clicked");
         }
-        Tool::Select => {
+        Tool::Select | Tool::Move => {
           if let [entity] = editor.selected[..]
             && let Ok((_, marker, model, mut transform, billboard, light)) =
               placed.get_mut(entity)
@@ -773,8 +796,10 @@ impl WorldEditorUi<'_, '_> {
             {
               transform.translation.y = height;
             }
-          } else if editor.selected.is_empty() {
+          } else if editor.selected.is_empty() && editor.tool == Tool::Select {
             ui.label("Click or drag around markers, models, billboards and lights.");
+          } else if editor.selected.is_empty() {
+            ui.label("Drag markers, models, billboards and lights.");
           } else {
             ui.label(format!("{} selected", editor.selected.len()));
           }
@@ -970,7 +995,7 @@ fn use_tool(
   camera: Single<(&Camera, &GlobalTransform), With<FreeCamera>>,
   pointer: Res<WorldPointer>,
   time: Res<Time>,
-  placed: Query<(Entity, &Transform), Placed>,
+  mut placed: Query<(Entity, &mut Transform), Placed>,
   mut preview: Query<
     (
       Entity,
@@ -990,6 +1015,17 @@ fn use_tool(
     .filter(|_| pointer.in_view && !pointer.cancel)
     .and_then(|ray| terrain.raycast(ray));
   let clicked = pointer.just_pressed;
+  // The nearest thing to where the pointer meets the ground, for clicking on.
+  let under_pointer = hit.and_then(|hit| {
+    placed
+      .iter()
+      .map(|(entity, &Transform { translation, .. })| {
+        (entity, translation.xz().distance(hit.xz()))
+      })
+      .filter(|&(_, distance)| distance < SELECT_RADIUS)
+      .min_by(|(_, a), (_, b)| a.total_cmp(b))
+      .map(|(entity, _)| entity)
+  });
   if clicked {
     editor.stroke = hit.map(|hit| Stroke { start_height: hit.y, previous: hit.xz() });
   } else if !pointer.pressed {
@@ -1100,8 +1136,9 @@ fn use_tool(
         }
       }
       // Picked below, wherever the cursor is, as a lasso can go over the sky.
+      // Moved below, as letting go or cancelling needn't be over the terrain.
       // Painted by `paint_sky`, wherever the cursor points rather than on the terrain.
-      Tool::Select | Tool::PaintSky => {}
+      Tool::Select | Tool::Move | Tool::PaintSky => {}
     }
     editor.stroke.iter_mut().for_each(|stroke| stroke.previous = hit.xz());
   }
@@ -1133,10 +1170,50 @@ fn use_tool(
     }
   }
 
+  // Moving: pressing on something picks it, or adds it with Shift, and drags the
+  // selection across the ground, each thing keeping its height above it. Cancelling puts
+  // everything back.
+  if editor.tool != Tool::Move || !pointer.pressed {
+    editor.moving = None
+  } else if clicked
+    && pointer.in_view
+    && let Some(hit) = hit
+    && let Some(entity) = under_pointer
+  {
+    if pointer.shift && !editor.selected.contains(&entity) {
+      editor.selected.push(entity)
+    } else if !editor.selected.contains(&entity) {
+      editor.selected = vec![entity]
+    }
+    let things = editor
+      .selected
+      .iter()
+      .filter_map(|&entity| {
+        placed
+          .get(entity)
+          .ok()
+          .map(|(_, &Transform { translation, .. })| (entity, translation))
+      })
+      .collect();
+    editor.moving = Some(Moving { grab: hit.xz(), things })
+  } else if let Some(Moving { grab, things }) = &editor.moving {
+    let shift = if pointer.cancel { None } else { hit.map(|hit| hit.xz() - grab) };
+    things.iter().for_each(|&(entity, start)| {
+      if let Ok((_, mut transform)) = placed.get_mut(entity) {
+        transform.translation = shift.map_or(start, |shift| {
+          let xz = start.xz() + shift;
+          let above = start.y - terrain.height(start.xz());
+          Vec3::new(xz.x, terrain.height(xz) + above, xz.y)
+        })
+      }
+    });
+    if pointer.cancel {
+      editor.moving = None
+    }
+  }
+
   // Selecting: a click picks the nearest thing, a drag draws a lasso around several.
   // Shift adds to the selection, and Shift-clicking something picked lets go of it.
-  // Without a place on the window to draw it, as in VR, the lasso stays empty and a
-  // press picks what it's let go over.
   let cursor = pointer.screen;
   if editor.tool != Tool::Select {
     editor.lasso = None
@@ -1155,7 +1232,7 @@ fn use_tool(
     let (min, max) = lasso
       .iter()
       .fold((Vec2::MAX, Vec2::MIN), |(min, max), &point| (min.min(point), max.max(point)));
-    let dragged = (max - min).max_element() > LASSO_MIN;
+    let dragged = (max - min).max_element() > pointer.lasso_min;
     let picked = if dragged {
       placed
         .iter()
@@ -1167,19 +1244,7 @@ fn use_tool(
         .map(|(entity, _)| entity)
         .collect()
     } else {
-      hit
-        .and_then(|hit| {
-          placed
-            .iter()
-            .map(|(entity, &Transform { translation, .. })| {
-              (entity, translation.xz().distance(hit.xz()))
-            })
-            .filter(|&(_, distance)| distance < SELECT_RADIUS)
-            .min_by(|(_, a), (_, b)| a.total_cmp(b))
-        })
-        .map(|(entity, _)| entity)
-        .into_iter()
-        .collect::<Vec<_>>()
+      under_pointer.into_iter().collect::<Vec<_>>()
     };
     if !shift {
       editor.selected = picked

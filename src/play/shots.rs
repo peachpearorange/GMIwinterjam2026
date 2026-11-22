@@ -1,7 +1,6 @@
 //! A tour of camera shots for looking over the game without playing it: run with
-//! `WINTERJAM_SHOTS=<folder>` and play stands the player at a few places, saves what the
-//! camera sees from behind and through his eyes, first early on and then in deep
-//! snow, and quits.
+//! `WINTERJAM_SHOTS=<folder>` and play stands the player at a few places, saves what he
+//! sees, first early on and then in deep snow, and quits.
 
 use {super::{FollowCamera, Player, snow::Snow},
      crate::Mode,
@@ -35,13 +34,13 @@ const SPOTS: [Spot; 5] = [
 #[derive(Resource)]
 struct Tour {
   folder: PathBuf,
-  /// The shot under way: spot, first person or not, deep snow or not, in that order.
+  /// The shot under way: spot, then deep snow or not.
   shot: usize,
   wait: u32
 }
 
 impl Tour {
-  const SHOTS: usize = SPOTS.len() * 4;
+  const SHOTS: usize = SPOTS.len() * 2;
 }
 
 fn tour(
@@ -62,30 +61,23 @@ fn tour(
     tour.wait = tour.wait.saturating_sub(1);
     return;
   }
-  let spot = &SPOTS[tour.shot / 2 % SPOTS.len()];
-  let first_person = tour.shot % 2 == 1;
-  let deep = tour.shot >= SPOTS.len() * 2;
+  let spot = &SPOTS[tour.shot % SPOTS.len()];
+  let deep = tour.shot >= SPOTS.len();
   if deep && let Some(mut snow) = snow {
     snow.skip_to(DEEP)
   }
   let xz = spot.xz * terrain.size() / 2.0;
   player.translation = Vec3::new(xz.x, terrain.height(xz), xz.y);
-  *follow = FollowCamera {
-    distance: 9.0,
-    yaw: spot.yaw,
-    pitch: if first_person { 0.05 } else { 0.45 },
-    first_person
-  };
+  *follow = FollowCamera { yaw: spot.yaw, pitch: 0.05, swing: None };
   if tour.wait > 0 {
     tour.wait -= 1;
     return;
   }
   let name = format!(
-    "{:02}-{}-{}-{}.png",
+    "{:02}-{}-{}.png",
     tour.shot,
     spot.name,
-    if deep { "deep" } else { "early" },
-    if first_person { "first" } else { "third" }
+    if deep { "deep" } else { "early" }
   );
   commands.spawn(Screenshot::primary_window()).observe(save_to_disk(tour.folder.join(name)));
   tour.shot += 1;

@@ -108,7 +108,9 @@ fn show_low_poly_models(
       let mut model = commands.entity(entity);
       model
         .despawn_related::<Children>()
-        .insert((ShownModel(version.0, version.1), Visibility::default()));
+        .insert(ShownModel(version.0, version.1))
+        // Keeps any visibility it was given, such as hidden.
+        .insert_if_new(Visibility::default());
       parts.into_iter().for_each(|(name, mesh, middle)| {
         if let Some(material) = model_materials.get(&name)
           && material.casts_light

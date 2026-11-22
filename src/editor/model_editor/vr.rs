@@ -9,6 +9,11 @@
 //! Either grip with its tip on or in a shape picks the shape up: held in one hand it
 //! moves and turns with it, held in both it stretches between them, and A leaves a copy
 //! behind where it is.
+//!
+//! Move also carries several parts at once. With the left trigger held as Shift, the
+//! trigger on a part adds it to the selection, or takes it out again, and a press on
+//! empty space sweeps a lasso around corners to select them. Pressing on any selected
+//! part carries the whole selection; pressing on another part carries just that one.
 
 use {super::{ModelEditor, Tool},
      crate::{Mode,
@@ -31,6 +36,9 @@ const SHOW_CORNERS: f32 = 0.15;
 /// How far the tip goes outside the shape swept so far, not going on outward, before it
 /// puts down another corner, in meters.
 const SWEEP_STEP: f32 = 0.004;
+/// How far a lasso has to reach across, seen from the eyes, as the tangent of the angle,
+/// to select what's in it rather than count as a press on nothing.
+const LASSO_MIN: f32 = 0.03;
 /// Most corners an eraser keeps: each of its faces can split what it cuts in two.
 const ERASER_CORNERS: usize = 12;
 /// Shapes with less inside than this, in cubic world units, are flat: a block pulled out
@@ -44,6 +52,7 @@ const CORNER_COLOR: Color = Color::srgba(1.0, 1.0, 1.0, 0.5);
 const HOVER_COLOR: Color = Color::WHITE;
 const HELD_COLOR: Color = Color::srgb(1.0, 0.6, 0.12);
 const SWEEP_COLOR: Color = Color::srgb(1.0, 0.85, 0.2);
+const SELECTED_COLOR: Color = Color::srgb(0.3, 1.0, 0.45);
 const ERASE_COLOR: Color = Color::srgb(1.0, 0.3, 0.35);
 
 /// Some corners of a shape: one, an edge's two or a face's.
@@ -78,8 +87,12 @@ type Joined = (usize, usize, Vec3);
 
 /// What a press with the trigger is doing until it's let go.
 enum Drag {
-  /// Corners following the hand, from where they were.
-  Move { start: Vec<Joined> },
+  /// Corners following the hand, from where they were, and where the selected corners
+  /// carried along were, if it's the selection that moves.
+  Move { start: Vec<Joined>, carried: Vec<Vec3> },
+  /// A lasso swept with the laser from where the eyes were when it started, `adding` to
+  /// the selection or replacing it.
+  Lasso { head: Transform, points: Vec<Vec3>, adding: bool },
   /// A block growing out of a face: the new shape, the face's corners and the way it
   /// faces.
   Pull { shape: usize, face: Vec<Vec3>, normal: Vec3 },
@@ -127,8 +140,20 @@ pub(in crate::editor) struct VrTool {
   /// What each hand's tip touches or is inside, as of last frame.
   touching: [Option<Grabbable>; 2],
   /// Whether the last corner swept still follows the tip, going on outward.
-  pending: bool
+  pending: bool,
+  /// Corners selected to move together, by where they are: every corner there moves.
+  selected: Vec<Vec3>
 }
+
+/// Where `p` is seen from the eyes at `head`, as tangents of the angles right and up of
+/// straight ahead, when it's in front.
+fn seen_from(head: &Transform, p: Vec3) -> Option<Vec2> {
+  let d = head.rotation.inverse() * (p - head.translation);
+  (d.z < 0.0).then(|| Vec2::new(d.x, d.y) / -d.z)
+}
+
+/// Whether there's a corner at `p` among `at`.
+fn among(at: &[Vec3], p: Vec3) -> bool { at.iter().any(|q| q.distance(p) < hull::EPSILON) }
 
 /// The point nearest `p` on the segment from `a` to `b`.
 fn on_segment(p: Vec3, a: Vec3, b: Vec3) -> Vec3 {
@@ -395,24 +420,24 @@ impl ModelEditor {
     }
   }
 
+  /// Every shape's corners at the places `at`.
+  fn corners_at(&self, at: &[Vec3]) -> Vec<Joined> {
+    self
+      .model
+      .shapes
+      .iter()
+      .enumerate()
+      .flat_map(|(s, shape)| {
+        shape.corners.iter().enumerate().filter(|&(_, &p)| among(at, p)).map(move |(c, &p)| (s, c, p))
+      })
+      .collect()
+  }
+
   /// Corners `corners` of shape `shape`, with every other shape's corner at the same
   /// place, so shapes sharing corners stay joined.
   fn with_joined(&self, shape: usize, corners: &[usize]) -> Vec<Joined> {
-    let shapes = &self.model.shapes;
-    corners
-      .iter()
-      .map(|&c| shapes[shape].corners[c])
-      .flat_map(|at| {
-        shapes.iter().enumerate().flat_map(move |(s, other)| {
-          other.corners.iter().enumerate().filter(move |(_, p)| p.distance(at) < hull::EPSILON).map(move |(c, &p)| (s, c, p))
-        })
-      })
-      .fold(Vec::new(), |mut joined, corner| {
-        if !joined.iter().any(|&(s, c, _)| (s, c) == (corner.0, corner.1)) {
-          joined.push(corner)
-        }
-        joined
-      })
+    let at = corners.iter().map(|&c| self.model.shapes[shape].corners[c]).collect::<Vec<_>>();
+    self.corners_at(&at)
   }
 
   /// Shape `shape` and every shape joined to it through corners they share, and theirs.
@@ -458,8 +483,27 @@ impl ModelEditor {
         press(Drag::Paint, point, before)
       }
       (Tool::Move, Some(Picked { shape, part, point })) => {
-        let start = self.with_joined(shape, &Self::part_corners(hulls, shape, part));
-        press(Drag::Move { start }, point, before)
+        let corners = &self.model.shapes[shape].corners;
+        let part = Self::part_corners(hulls, shape, part).into_iter().map(|c| corners[c]).collect::<Vec<_>>();
+        let in_selection = part.iter().all(|&p| among(&self.vr.selected, p));
+        let selected = &mut self.vr.selected;
+        if pointer.shift && in_selection {
+          selected.retain(|&p| !among(&part, p));
+          None
+        } else {
+          if pointer.shift {
+            part.iter().for_each(|&p| if !among(selected, p) { selected.push(p) })
+          } else if !in_selection {
+            selected.clear()
+          }
+          let carried = selected.clone();
+          let start = self.corners_at(if carried.is_empty() { &part } else { &carried });
+          press(Drag::Move { start, carried }, point, before)
+        }
+      }
+      (Tool::Move, None) => {
+        let lasso = Drag::Lasso { head: pointer.head, points: vec![], adding: pointer.shift };
+        press(lasso, pointer.tip, before)
       }
       (Tool::PullOutBlock, Some(Picked { shape, part: Part::Face(f), point })) => {
         let normal = hulls[shape].as_ref().map_or(Vec3::Y, |hull| hull.planes[f].0);
@@ -479,16 +523,31 @@ impl ModelEditor {
   }
 
   /// Follows the hand while the trigger stays down.
-  fn vr_drag(&mut self, pointer: &VrPointer, picked: Option<Picked>, press: &Press) {
+  fn vr_drag(&mut self, pointer: &VrPointer, picked: Option<Picked>, press: &mut Press) {
     let Press { drag, hand, grab, .. } = press;
     // The point taken hold of, carried as if fixed to the hand.
     let held =
       pointer.aim.translation + pointer.aim.rotation * (hand.rotation.inverse() * (*grab - hand.translation));
     let shapes = &mut self.model.shapes;
     match drag {
-      Drag::Move { start } => {
+      Drag::Move { start, carried } => {
         let offset = held - *grab;
-        start.iter().for_each(|&(s, c, p)| shapes[s].corners[c] = p + offset)
+        start.iter().for_each(|&(s, c, p)| shapes[s].corners[c] = p + offset);
+        if !carried.is_empty() {
+          self.vr.selected = carried.iter().map(|&p| p + offset).collect()
+        }
+      }
+      Drag::Lasso { points, .. } => {
+        // Along the laser as far off as the middle of the model, or the tip if that's
+        // farther: what the laser seems to go around.
+        let corners = shapes.iter().flat_map(|shape| shape.corners.iter().copied()).collect::<Vec<_>>();
+        let middle = corners.iter().sum::<Vec3>() / corners.len().max(1) as f32;
+        let tip = (pointer.tip - pointer.ray.origin).length();
+        let depth = (middle - pointer.ray.origin).dot(*pointer.ray.direction).max(tip);
+        let point = pointer.ray.get_point(depth);
+        if points.last().is_none_or(|last| last.distance(point) > SWEEP_STEP * pointer.scale) {
+          points.push(point)
+        }
       }
       Drag::Pull { shape, face, normal } => {
         let length = (held - *grab).dot(*normal).max(0.0);
@@ -513,6 +572,26 @@ impl ModelEditor {
   fn vr_release(&mut self, press: Press) {
     match press.drag {
       Drag::Sweep => self.vr_finish_sweep(),
+      Drag::Lasso { head, points, adding } => {
+        let lasso = points.iter().filter_map(|&p| seen_from(&head, p)).collect::<Vec<_>>();
+        let (min, max) = lasso.iter().fold((Vec2::MAX, Vec2::MIN), |(min, max), &p| (min.min(p), max.max(p)));
+        let inside = if lasso.len() > 2 && (max - min).max_element() > LASSO_MIN {
+          self
+            .model
+            .shapes
+            .iter()
+            .flat_map(|shape| shape.corners.iter().copied())
+            .filter(|&p| seen_from(&head, p).is_some_and(|seen| crate::editor::in_lasso(&lasso, seen)))
+            .collect()
+        } else {
+          vec![]
+        };
+        let selected = &mut self.vr.selected;
+        if !adding {
+          selected.clear()
+        }
+        inside.into_iter().for_each(|p| if !among(selected, p) { selected.push(p) })
+      }
       drag => {
         if let Drag::Pull { shape, .. } = drag
           && hull::volume(&self.model.shapes[shape].corners) < NO_VOLUME
@@ -662,6 +741,10 @@ impl ModelEditor {
     if let Some(held) = self.vr.held.as_ref().filter(|held| held.corner.is_none()) {
       held.shapes.iter().for_each(|&s| outline(gizmos, s, HELD_COLOR))
     }
+    self.vr.selected.iter().for_each(|&p| ball(gizmos, p, dot * 2.0, SELECTED_COLOR));
+    if let Some(Press { drag: Drag::Lasso { points, .. }, .. }) = &self.vr.press {
+      gizmos.linestrip(points.iter().copied(), SELECTED_COLOR)
+    }
     (0..2).for_each(|h| match held {
       Some((grabbed, hands)) if hands[h] => show(gizmos, grabbed, HELD_COLOR),
       _ => {
@@ -724,6 +807,12 @@ pub(in crate::editor) fn use_vr_tools(
     if (pointer.undo || pointer.redo) && editor.vr.press.is_none() && editor.vr.held.is_none() {
       if pointer.undo { editor.undo() } else { editor.redo() }
     }
+    // Only Move uses the selection, and it keeps only places some corner still is.
+    if editor.tool != Tool::Move {
+      editor.vr.selected.clear()
+    }
+    let corners = editor.model.shapes.iter().flat_map(|shape| shape.corners.iter().copied()).collect::<Vec<_>>();
+    editor.vr.selected.retain(|&p| among(&corners, p));
     editor.vr_hold(&pointer);
     let hulls = editor.vr_hulls();
     let holding = editor.vr.held.is_some();
@@ -737,9 +826,9 @@ pub(in crate::editor) fn use_vr_tools(
       (!pointer.on_tablet && !holding && !dragging).then(|| editor.vr_pick(&hulls, &pointer)).flatten();
     if pointer.trigger.just_pressed() && !pointer.on_tablet && !holding {
       editor.vr.press = editor.vr_press(&hulls, &pointer, picked)
-    } else if let Some(press) = editor.vr.press.take() {
+    } else if let Some(mut press) = editor.vr.press.take() {
       if pointer.trigger.down {
-        editor.vr_drag(&pointer, picked, &press);
+        editor.vr_drag(&pointer, picked, &mut press);
         editor.vr.press = Some(press)
       } else {
         editor.vr_release(press)
@@ -759,4 +848,69 @@ pub(in crate::editor) fn use_vr_tools(
   // A hand holding a shape, or that would pick one up, doesn't hold the model.
   let held = editor.vr.held.as_ref().map(|held| held.hands).unwrap_or_default();
   shapes.hands = [0, 1].map(|h| held[h] || editor.vr.touching[h].is_some() && !pointer.hands[h].squeeze.down)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn cube(middle: Vec3) -> Shape {
+    let corners = (0..8)
+      .map(|i| middle + Vec3::new((i & 1) as f32, (i >> 1 & 1) as f32, (i >> 2) as f32) * 0.2 - 0.1)
+      .collect();
+    Shape { corners, material: String::new() }
+  }
+
+  /// Pointing from the eyes at `at`.
+  fn pointing(at: Vec3, shift: bool) -> VrPointer {
+    let direction = Dir3::new(at).unwrap();
+    VrPointer {
+      aim: Transform::default().looking_to(*direction, Vec3::Y),
+      ray: Ray3d::new(Vec3::ZERO, direction),
+      tip: *direction * 0.05,
+      shift,
+      ..default()
+    }
+  }
+
+  #[test]
+  fn a_lasso_selects_corners_and_moving_one_carries_them_all() {
+    let (a, b) = (Vec3::new(-1.0, 0.0, -3.0), Vec3::new(1.0, 0.0, -3.0));
+    let mut editor = ModelEditor { tool: Tool::Move, ..default() };
+    editor.model.shapes = vec![cube(a), cube(b)];
+    let hulls = editor.vr_hulls();
+    let mut press = editor.vr_press(&hulls, &pointing(a + Vec3::X * 0.4, false), None).unwrap();
+    (0..=32).for_each(|i| {
+      let around = a + (Vec2::from_angle(i as f32 / 32.0 * std::f32::consts::TAU) * 0.4).extend(0.0);
+      editor.vr_drag(&pointing(around, false), None, &mut press)
+    });
+    editor.vr_release(press);
+    assert_eq!(editor.vr.selected.len(), 8, "{:?}", editor.vr.selected);
+    assert!(editor.vr.selected.iter().all(|p| p.distance(a) < 0.2));
+
+    let corner = editor.model.shapes[0].corners[0];
+    let picked = Picked { shape: 0, part: Part::Corner(0), point: corner };
+    let mut press = editor.vr_press(&hulls, &pointing(corner, false), Some(picked)).unwrap();
+    let mut moved = pointing(corner, false);
+    moved.aim.translation += Vec3::Y;
+    editor.vr_drag(&moved, None, &mut press);
+    editor.vr_release(press);
+    assert!(editor.model.shapes[0].corners.iter().all(|p| (p.y - 1.0).abs() < 0.11), "{:?}", editor.model.shapes[0]);
+    assert!(editor.model.shapes[1].corners.iter().all(|p| p.y.abs() < 0.11));
+    assert_eq!(editor.vr.selected.len(), 8)
+  }
+
+  #[test]
+  fn shift_takes_a_selected_part_out_of_the_selection() {
+    let mut editor = ModelEditor { tool: Tool::Move, ..default() };
+    editor.model.shapes = vec![cube(Vec3::new(0.0, 0.0, -3.0))];
+    let hulls = editor.vr_hulls();
+    let corner = editor.model.shapes[0].corners[0];
+    let picked = Some(Picked { shape: 0, part: Part::Corner(0), point: corner });
+    let press = editor.vr_press(&hulls, &pointing(corner, true), picked).unwrap();
+    editor.vr_release(press);
+    assert_eq!(editor.vr.selected, vec![corner]);
+    assert!(editor.vr_press(&hulls, &pointing(corner, true), picked).is_none());
+    assert!(editor.vr.selected.is_empty())
+  }
 }

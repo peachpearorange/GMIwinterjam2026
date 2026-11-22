@@ -3,7 +3,7 @@
 //! each stays put in the world: one that leaves the box, by falling out of the bottom or
 //! by the camera moving away, comes back in on the far side.
 
-use {super::PlayOnly,
+use {super::{PlayOnly, Stage},
      bevy::{light::{NotShadowCaster, NotShadowReceiver},
             prelude::*},
      winterjam2026::{billboard::WorldCamera,
@@ -125,16 +125,24 @@ pub fn start(
 
 /// Lets each flake fall, drift, sway and tumble, bringing back in on the far side any
 /// that left the box around the camera.
+/// Once it stops snowing, flakes that fall out of the bottom are gone rather than
+/// coming back in at the top.
 pub fn update(
   time: Res<Time>,
+  stage: Res<State<Stage>>,
   camera: Single<&Transform, (With<WorldCamera>, Without<Flake>)>,
-  mut flakes: Query<(&mut Flake, &mut Transform)>
+  mut flakes: Query<(Entity, &mut Flake, &mut Transform)>,
+  mut commands: Commands
 ) {
   let (dt, seconds) = (time.delta_secs(), time.elapsed_secs_wrapped());
   let size = Vec3::new(REACH * 2.0, BELOW + ABOVE, REACH * 2.0);
   let corner = camera.translation - Vec3::new(REACH, BELOW, REACH);
-  flakes.iter_mut().for_each(|(mut flake, mut transform)| {
+  let snowing = stage.snowing();
+  flakes.iter_mut().for_each(|(entity, mut flake, mut transform)| {
     let moved = flake.at + Vec3::new(DRIFT_SPEED, -flake.fall, 0.0) * dt;
+    if !snowing && moved.y < corner.y {
+      commands.entity(entity).despawn()
+    }
     flake.at = corner + (moved - corner).rem_euclid(size);
     let sway = (seconds * SWAY_RATE * std::f32::consts::TAU + flake.phase).sin_cos();
     transform.translation = flake.at + Vec3::new(sway.0, 0.0, sway.1) * SWAY;

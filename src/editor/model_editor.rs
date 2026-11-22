@@ -71,6 +71,15 @@ fn free_model_name() -> String {
     .unwrap_or_default()
 }
 
+/// The name for a copy of model `name`: `name copy`, or `name copy 2` and on if that's
+/// taken.
+fn copy_model_name(name: &str) -> String {
+  (1..)
+    .map(|i| if i == 1 { format!("{name} copy") } else { format!("{name} copy {i}") })
+    .find(|copy| !Path::new(ASSETS_DIR).join(model_path(copy)).exists())
+    .unwrap_or_default()
+}
+
 /// Names of the models in `dir` and its subfolders, relative to [`MODELS_DIR`], like
 /// `props/barrel` for `assets/models/props/barrel.model.ron`.
 fn model_names(dir: &Path) -> Vec<String> {
@@ -465,6 +474,17 @@ impl ModelEditor {
     self.name_field.clone_from(&self.name)
   }
 
+  /// Saves the model, then opens a copy of it saved under a name of its own.
+  fn clone_model(&mut self, library: &mut Library) {
+    if self.save_first(library) {
+      let original = self.name.clone();
+      let copy = copy_model_name(&original);
+      self.open(copy.clone(), self.model.clone(), false);
+      self.save(library);
+      self.status = format!("Cloned {original} as {copy}")
+    }
+  }
+
   /// Moves the model's file into [`DELETED_DIR`], taking the copies placed in the world
   /// with it, and starts a new model.
   fn delete(&mut self) {
@@ -512,7 +532,7 @@ impl ModelEditor {
   }
 
   /// New, undo and redo, the name the model saves as, which stays in view above the
-  /// tablet's keyboard while it's typed, and Delete. `placed` is how many copies of it
+  /// tablet's keyboard while it's typed, Clone and Delete. `placed` is how many copies of it
   /// are in the world.
   fn top_bar(&mut self, ui: &mut egui::Ui, library: &mut Library, placed: usize) {
     // In the headset, the controller's buttons rather than the keyboard's.
@@ -536,6 +556,9 @@ impl ModelEditor {
       // acts on it.
       if field.lost_focus() {
         if self.name_field.trim() != self.name { self.rename(library) } else { self.name_field.clone_from(&self.name) }
+      }
+      if ui.button("Clone").on_hover_text("Makes a copy of it to change").clicked() {
+        self.clone_model(library)
       }
       let label = if self.delete_asked {
         format!("Delete it and its {placed} in the world")

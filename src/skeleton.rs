@@ -96,11 +96,19 @@ const INSIDE_SHARE: f32 = 0.5;
 /// one reaching deepest into it, or nearest it. So a bone just poking into a shape, like
 /// an arm's from the shoulder into the body, leaves it be.
 fn shape_bones(bones: &[Bone], corners: &[Vec3], shape_hull: &hull::Hull) -> Vec<usize> {
+  // How far outside each point along each bone is, or how deep inside when negative.
+  // Outside it's the true distance to the shape: how far past its faces' planes says
+  // little for thin shapes, as far off in line with a spike, like a tooth, every plane is
+  // near.
   let outside = bones
     .iter()
     .map(|bone| {
       (0..=BONE_SAMPLES)
-        .map(|i| hull::outside_hull_by(corners, shape_hull, bone.head.lerp(bone.tail, i as f32 / BONE_SAMPLES as f32)))
+        .map(|i| {
+          let p = bone.head.lerp(bone.tail, i as f32 / BONE_SAMPLES as f32);
+          let by = hull::outside_hull_by(corners, shape_hull, p);
+          if by > hull::EPSILON { hull::nearest_on_surface(corners, shape_hull, p).0.distance(p) } else { by }
+        })
         .collect::<Vec<_>>()
     })
     .collect::<Vec<_>>();
@@ -185,11 +193,13 @@ impl Rig {
 #[derive(Component, Clone, Debug)]
 pub struct Animate {
   pub name: String,
-  pub time: f32
+  pub time: f32,
+  /// Whether it stays still where it's got to rather than playing on.
+  pub held: bool
 }
 
 impl Animate {
-  pub fn new(name: &str) -> Self { Self { name: name.into(), time: 0.0 } }
+  pub fn new(name: &str) -> Self { Self { name: name.into(), time: 0.0, held: false } }
 
   /// Switches to the animation called `name`, from its start, unless it's playing.
   pub fn play(&mut self, name: &str) {
@@ -228,7 +238,9 @@ fn animate(
 ) {
   let generation = model_meshes.generation;
   models.iter_mut().for_each(|(entity, Model { path }, mut animate, posed)| {
-    animate.time += time.delta_secs();
+    if !animate.held {
+      animate.time += time.delta_secs()
+    }
     let rig = match rigs.0.get(path) {
       Some((loaded, rig)) if *loaded == generation => rig.clone(),
       _ => {
@@ -265,7 +277,8 @@ fn animate(
           let material = model_materials.handle(name, &mut materials, &mut images);
           model.with_child((Mesh3d(mesh.clone()), MeshMaterial3d(material)));
         });
-        model.insert((Posed { parts, made_for, shown: poses }, Visibility::default()));
+        // Keeps any visibility it was given, such as hidden.
+        model.insert(Posed { parts, made_for, shown: poses }).insert_if_new(Visibility::default());
       }
     }
   })
@@ -276,6 +289,23 @@ pub fn plugin(app: &mut App) { app.init_resource::<Rigs>().add_systems(Update, a
 #[cfg(test)]
 mod tests {
   use {super::*, crate::model::Key};
+
+  #[test]
+  fn a_thin_spike_follows_the_bone_truly_nearest_it_not_one_far_off_in_line() {
+    // A needle along +x, like a tooth: its point at x = 1.
+    let corners = vec![
+      Vec3::new(0.0, 0.02, 0.0),
+      Vec3::new(0.0, -0.01, 0.017),
+      Vec3::new(0.0, -0.01, -0.017),
+      Vec3::X
+    ];
+    let bones = [
+      Bone { head: Vec3::new(5.0, 0.0, 0.0), tail: Vec3::new(6.0, 0.0, 0.0), parent: None },
+      Bone { head: Vec3::new(-0.3, 0.0, 0.0), tail: Vec3::new(-0.2, 0.0, 0.0), parent: None }
+    ];
+    let shape_hull = hull::hull(&corners).unwrap();
+    assert_eq!(shape_bones(&bones, &corners, &shape_hull), vec![1])
+  }
 
   /// An arm along +x: an upper bone from the origin and a lower one from its end.
   fn arm() -> Vec<Bone> {
