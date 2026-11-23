@@ -7,19 +7,22 @@
 //!
 //! Every point of a grid finer than the terrain's remembers when snow started settling
 //! there. Its look and depth follow from how long ago that was, so the settled snow's
-//! looks fade into each other in a shader and the rising snow is one mesh moving up, both rebuilt
-//! only where the player digs.
+//! looks fade into each other in a shader and the rising snow is one mesh moved up and
+//! held at its deepest in a shader, both rebuilt only where the player digs.
 
 use {super::{Digs, PlayOnly, Player, Stage,
              collide::{self, Collider}},
      bevy::{asset::RenderAssetUsages,
+            camera::{primitives::Aabb, visibility::NoAutoAabb},
             light::NotShadowCaster,
             math::Affine2,
-            mesh::Indices,
-            pbr::{ExtendedMaterial, MaterialExtension},
+            mesh::{Indices, MeshVertexAttribute, MeshVertexBufferLayoutRef},
+            pbr::{ExtendedMaterial, MaterialExtension, MaterialExtensionKey,
+                  MaterialExtensionPipeline},
             platform::collections::{HashMap, HashSet},
             prelude::*,
-            render::render_resource::{AsBindGroup, PrimitiveTopology},
+            render::render_resource::{AsBindGroup, PrimitiveTopology, RenderPipelineDescriptor,
+                                      SpecializedMeshPipelineError, VertexFormat},
             shader::ShaderRef},
      winterjam2026::{material::{ModelMaterial, ModelMaterials},
                      terrain::Terrain,
@@ -44,8 +47,6 @@ const RISE_DELAY: f32 = (FULL_STAGE as f32 + 1.0) * STAGE_SECONDS;
 const RISE_PER_SECOND: f32 = 0.01;
 /// How deep the snow gets at most, in world units.
 pub const MAX_DEPTH: f32 = 0.9;
-/// How many chunks a frame have their snow held to [`MAX_DEPTH`], each in turn.
-const CHUNKS_CAPPED_PER_FRAME: u32 = 4;
 /// How far settled snow lies above the ground, so it doesn't flicker into it.
 const COVER_LIFT: f32 = 0.03;
 /// How far under the ground the rising snow's surface starts, out of sight.
@@ -68,6 +69,16 @@ const SLUMP_REACH: f32 = 4.0;
 const SNOW_MATERIAL: &str = "snow";
 /// The shader showing each look of settled snow.
 const COVER_SHADER: &str = "shaders/snow_cover.wesl";
+/// The shaders moving the rising snow up and holding it at its deepest.
+const RISE_SHADER: &str = "shaders/snow_rise.wesl";
+const RISE_PREPASS_SHADER: &str = "shaders/snow_rise_prepass.wesl";
+/// The ground's direction at each point of the rising snow, and how high the snow gets
+/// at most there.
+const ATTRIBUTE_DEEPEST: MeshVertexAttribute =
+  MeshVertexAttribute::new("SnowDeepest", 3_517_402_891, VertexFormat::Float32x4);
+/// Seconds into play snow starts settling at points it never comes to: so late they
+/// always look bare and the rising snow stays far under them.
+const NEVER: f32 = 1e5;
 
 /// A pseudo random number in 0..1 for each integer point.
 pub fn hash(x: i32, z: i32) -> f32 {
@@ -117,10 +128,8 @@ pub struct Snow {
   pub dug: Option<f32>,
   /// Places kept clear of snow all the time, as world xz and radius.
   pub yards: Vec<(Vec2, f32)>,
-  /// Points kept clear of snow all the time, being indoors, like inside igloos.
-  indoors: Vec<UVec2>,
-  /// How many chunks have had their turn at being held to [`MAX_DEPTH`].
-  capped: u32,
+  /// Whether each point is indoors, like inside igloos, where snow never comes.
+  indoors: Vec<bool>,
   /// Chunks whose meshes need building again, as the snow there changed.
   dirty: HashSet<UVec2>,
   chunks: HashMap<UVec2, ChunkMeshes>
@@ -157,8 +166,7 @@ impl Snow {
       clock: 0.0,
       dug: None,
       yards: vec![],
-      indoors: vec![],
-      capped: 0,
+      indoors: vec![false; (size.x * size.y) as usize],
       dirty: default(),
       chunks: default()
     };
@@ -185,8 +193,8 @@ impl Snow {
   }
 
   /// How high all the rising snow has come, which its chunks are moved up by. It never
-  /// stops, so cleared ground always snows over again, and [`Self::cap_next_chunk`]
-  /// holds back what has got deep enough.
+  /// stops, so cleared ground always snows over again, and snow that has got deep
+  /// enough is held at [`MAX_DEPTH`].
   fn level(&self) -> f32 { self.clock * RISE_PER_SECOND }
 
   /// Seconds into play the world is as buried as it gets.
@@ -198,18 +206,14 @@ impl Snow {
   /// Lets time pass for the snow until the world is `buried` that far, when it isn't
   /// yet. For trying out what comes later without waiting.
   pub fn skip_to(&mut self, buried: f32) {
-    let clock = buried * Self::BURIED_SECONDS;
-    if clock > self.clock {
-      self.clock = clock;
-      self.mark_dirty(UVec2::ZERO, self.size - UVec2::ONE)
-    }
+    self.clock = self.clock.max(buried * Self::BURIED_SECONDS)
   }
 
   /// How deep the snow is at world `xz`, in world units, from the nearest grid point.
   pub fn depth_at(&self, xz: Vec2) -> f32 {
     let last = (self.size - UVec2::ONE).as_vec2();
     let p = ((xz - self.origin) / self.step).round().clamp(Vec2::ZERO, last).as_uvec2();
-    self.depth(self.index(p)).clamp(0.0, MAX_DEPTH)
+    self.depth(self.index(p)).max(0.0)
   }
 
   /// The rising snow's height at point `i` before being moved up by [`Self::level`]: so
@@ -220,7 +224,9 @@ impl Snow {
   }
 
   /// How deep the snow at point `i` is, negative while it's still to come up.
-  fn depth(&self, i: usize) -> f32 { self.body_height(i) + self.level() - self.ground[i] }
+  fn depth(&self, i: usize) -> f32 {
+    (self.body_height(i) + self.level() - self.ground[i]).min(MAX_DEPTH)
+  }
 
   /// How deep the snow the player is about to wade into is, heading along `direction`
   /// from `xz`, as a share of the deepest it gets. Looks past what he clears around
@@ -285,12 +291,38 @@ impl Snow {
       .with_inserted_indices(Indices::U32(indices))
   }
 
-  /// The rising snow over a chunk.
+  /// The rising snow over a chunk, before being moved up, with the ground's direction
+  /// and how high it gets at most for holding it there.
   fn body_mesh(&self, chunk: UVec2) -> Mesh {
-    self.grid_mesh(
-      chunk,
-      |i| self.body_height(i),
-      |p| self.normal(p, |p| self.body_height(self.index(p)))
+    let deepest = self
+      .chunk_points(chunk)
+      .iter()
+      .map(|&p| {
+        let i = self.index(p);
+        self.ground_normals[i].extend(self.ground[i] + MAX_DEPTH).to_array()
+      })
+      .collect::<Vec<_>>();
+    self
+      .grid_mesh(
+        chunk,
+        |i| self.body_height(i),
+        |p| self.normal(p, |p| self.body_height(self.index(p)))
+      )
+      .with_inserted_attribute(ATTRIBUTE_DEEPEST, deepest)
+  }
+
+  /// Bounds of where the rising snow over a chunk can be seen: from the ground up to its
+  /// deepest. Its mesh lies lower than it shows, so its own bounds won't do.
+  fn body_bounds(&self, chunk: UVec2) -> Aabb {
+    let points = self.chunk_points(chunk);
+    let (low, high) = points.iter().fold((f32::MAX, f32::MIN), |(low, high), &p| {
+      let ground = self.ground[self.index(p)];
+      (low.min(ground), high.max(ground))
+    });
+    let (first, last) = (self.xz(points[0]), self.xz(points[points.len() - 1]));
+    Aabb::from_min_max(
+      Vec3::new(first.x, low - SINK, first.y),
+      Vec3::new(last.x, high + MAX_DEPTH, last.y)
     )
   }
 
@@ -308,27 +340,6 @@ impl Snow {
         |p| self.ground_normals[self.index(p)]
       )
       .with_inserted_attribute(Mesh::ATTRIBUTE_UV_1, starts)
-  }
-
-  /// Holds the snow of the next chunk in turn to [`MAX_DEPTH`], by making snow deeper
-  /// than that start as late as leaves it that deep. Chunks take turns so only a few
-  /// get built again each frame, and snow rises so slowly that it's never noticeably
-  /// too deep by a chunk's next turn.
-  fn cap_next_chunk(&mut self) {
-    let count = self.chunk_count();
-    let chunk = UVec2::new(self.capped % count.x, self.capped / count.x % count.y);
-    self.capped = (self.capped + 1) % (count.x * count.y);
-    let earliest = self.clock - RISE_DELAY - (MAX_DEPTH + SINK) / RISE_PER_SECOND;
-    let too_deep = self
-      .chunk_points(chunk)
-      .into_iter()
-      .map(|p| self.index(p))
-      .filter(|&i| self.start[i] < earliest)
-      .collect::<Vec<_>>();
-    if !too_deep.is_empty() {
-      too_deep.into_iter().for_each(|i| self.start[i] = earliest);
-      self.dirty.insert(chunk);
-    }
   }
 
   /// Marks the chunks showing points from `min` to `max` for building again. The
@@ -376,7 +387,10 @@ impl Snow {
     let cleared = points
       .iter()
       .copied()
-      .filter(|&p| clock - self.start[self.index(p)] > STAGE_SECONDS / 2.0)
+      .filter(|&p| {
+        let i = self.index(p);
+        !self.indoors[i] && clock - self.start[i] > STAGE_SECONDS / 2.0
+      })
       .collect::<Vec<_>>();
     let deepest = cleared
       .iter()
@@ -401,12 +415,16 @@ impl Snow {
   fn shelter(&mut self, roofs: &[Collider]) {
     let points = (0..self.size.y).flat_map(|z| (0..self.size.x).map(move |x| UVec2::new(x, z)));
     self.indoors = points
-      .filter(|&p| {
+      .map(|p| {
         let xz = self.xz(p);
         let floor = Vec3::new(xz.x, self.ground[self.index(p)] + 0.01, xz.y);
         roofs.iter().any(|roof| roof.covers(floor))
       })
-      .collect()
+      .collect();
+    self.start.iter_mut().zip(&self.indoors).filter(|(_, indoors)| **indoors).for_each(
+      |(start, _)| *start = NEVER
+    );
+    self.mark_dirty(UVec2::ZERO, self.size - UVec2::ONE)
   }
 
   /// Clears the snow around the player at `xz`.
@@ -423,13 +441,7 @@ impl Snow {
       .collect::<Vec<_>>();
     let level = self.level();
     // How deep the snow is at each point, and how high its top or the bare ground is.
-    let depths = points
-      .iter()
-      .map(|&p| {
-        let i = self.index(p);
-        (self.body_height(i) + level - self.ground[i]).max(0.0)
-      })
-      .collect::<Vec<_>>();
+    let depths = points.iter().map(|&p| self.depth(self.index(p)).max(0.0)).collect::<Vec<_>>();
     let tops =
       points.iter().zip(&depths).map(|(&p, depth)| self.ground[self.index(p)] + depth);
     let tops = tops.collect::<Vec<_>>();
@@ -449,11 +461,13 @@ impl Snow {
     };
     let share = (SLUMP_PER_SECOND * seconds).min(1.0);
     // Each point with snow sends some to the neighbors it's too steep above, more to
-    // the steeper ones, at most half the way to resting so it never overshoots.
+    // the steeper ones, at most half the way to resting so it never overshoots. None
+    // slides indoors.
     let changes = (0..points.len()).filter(|&k| depths[k] > 0.0).fold(
       vec![0.0; points.len()],
       |mut changes, k| {
         let drops = neighbors(k)
+          .filter(|&(n, _)| !self.indoors[self.index(points[n])])
           .map(|(n, far)| (n, tops[k] - tops[n] - STEEPEST_SLOPE * far))
           .filter(|&(_, drop)| drop > 0.0)
           .collect::<Vec<_>>();
@@ -523,10 +537,42 @@ impl MaterialExtension for CoverLook {
 
 type CoverMaterial = ExtendedMaterial<StandardMaterial, CoverLook>;
 
+/// The rising snow: moved up by how high it has come, and held where it's as deep as it
+/// gets.
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
+struct RisingSnow {
+  /// How high all the rising snow has come, kept up to date.
+  #[uniform(100)]
+  level: f32
+}
+
+impl MaterialExtension for RisingSnow {
+  fn vertex_shader() -> ShaderRef { RISE_SHADER.into() }
+
+  fn prepass_vertex_shader() -> ShaderRef { RISE_PREPASS_SHADER.into() }
+
+  fn specialize(
+    _pipeline: &MaterialExtensionPipeline,
+    descriptor: &mut RenderPipelineDescriptor,
+    layout: &MeshVertexBufferLayoutRef,
+    _key: MaterialExtensionKey<Self>
+  ) -> Result<(), SpecializedMeshPipelineError> {
+    descriptor.vertex.buffers = vec![layout.0.get_layout(&[
+      Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
+      Mesh::ATTRIBUTE_NORMAL.at_shader_location(1),
+      Mesh::ATTRIBUTE_UV_0.at_shader_location(2),
+      ATTRIBUTE_DEEPEST.at_shader_location(8)
+    ])?];
+    Ok(())
+  }
+}
+
+type RiseMaterial = ExtendedMaterial<StandardMaterial, RisingSnow>;
+
 /// The materials of the rising snow and of each look of settled snow.
 #[derive(Resource)]
 struct SnowLooks {
-  body: Handle<StandardMaterial>,
+  body: Handle<RiseMaterial>,
   /// Each look after bare, in order.
   cover: [CoverLookMaterials; FULL_STAGE as usize]
 }
@@ -545,7 +591,7 @@ impl SnowLooks {
   /// and otherwise the snow material with their texture, holes left where it's clear.
   fn new(
     model_materials: &mut ModelMaterials,
-    materials: &mut Assets<StandardMaterial>,
+    rise_materials: &mut Assets<RiseMaterial>,
     cover_materials: &mut Assets<CoverMaterial>,
     images: &mut Assets<Image>
   ) -> Self {
@@ -571,7 +617,10 @@ impl SnowLooks {
         texel
       )
     };
-    let body = materials.add(standard(&snow, model_materials).0);
+    let body = rise_materials.add(RiseMaterial {
+      base: standard(&snow, model_materials).0,
+      extension: RisingSnow { level: 0.0 }
+    });
     let cover = std::array::from_fn(|i| {
       let stage = i as u8 + 1;
       let name = if stage == FULL_STAGE {
@@ -612,17 +661,13 @@ impl SnowLooks {
   }
 }
 
-/// The rising snow of a chunk.
-#[derive(Component)]
-struct SnowBody;
-
 /// Starts the snow over the terrain once it has loaded, with nothing settled yet.
 fn setup(
   snow: Option<Res<Snow>>,
   terrain: Option<Res<Terrain>>,
   placed: Query<(&Model, &Transform), Without<PlayOnly>>,
   mut model_materials: ResMut<ModelMaterials>,
-  mut materials: ResMut<Assets<StandardMaterial>>,
+  mut rise_materials: ResMut<Assets<RiseMaterial>>,
   mut cover_materials: ResMut<Assets<CoverMaterial>>,
   mut images: ResMut<Assets<Image>>,
   mut meshes: ResMut<Assets<Mesh>>,
@@ -636,7 +681,7 @@ fn setup(
     snow.shelter(&collide::placed_shapes(placed.iter(), &[collide::IGLOO_MODEL]));
     let looks = SnowLooks::new(
       &mut model_materials,
-      &mut materials,
+      &mut rise_materials,
       &mut cover_materials,
       &mut images
     );
@@ -647,10 +692,11 @@ fn setup(
         let body = meshes.add(snow.body_mesh(chunk));
         let cover = meshes.add(snow.cover_mesh(chunk));
         commands.spawn((
-          SnowBody,
           PlayOnly,
           Mesh3d(body.clone()),
-          MeshMaterial3d(looks.body.clone())
+          MeshMaterial3d(looks.body.clone()),
+          snow.body_bounds(chunk),
+          NoAutoAabb
         ));
         looks.cover.iter().for_each(|CoverLookMaterials { shown, fading_in }| {
           [shown, fading_in].into_iter().for_each(|material| {
@@ -671,7 +717,7 @@ fn setup(
 }
 
 /// Lets time pass for the snow, clears it around the player when he digs, lets it
-/// slump, holds it to its deepest, and rebuilds what changed.
+/// slump, and rebuilds what changed.
 fn advance(
   snow: Option<ResMut<Snow>>,
   looks: Option<Res<SnowLooks>>,
@@ -679,8 +725,8 @@ fn advance(
   stage: Res<State<Stage>>,
   follow: Res<super::FollowCamera>,
   players: Query<(&Transform, &Player, Has<Digs>)>,
-  mut bodies: Query<&mut Transform, (With<SnowBody>, Without<Player>)>,
   mut meshes: ResMut<Assets<Mesh>>,
+  mut rise_materials: ResMut<Assets<RiseMaterial>>,
   mut cover_materials: ResMut<Assets<CoverMaterial>>
 ) {
   if let (Some(mut snow), Some(looks)) = (snow, looks) {
@@ -706,10 +752,6 @@ fn advance(
       snow.clear(xz, radius);
       snow.yards.push((xz, radius))
     });
-    let indoors = std::mem::take(&mut snow.indoors);
-    snow.clear_points(&indoors);
-    snow.indoors = indoors;
-    (0..CHUNKS_CAPPED_PER_FRAME).for_each(|_| snow.cap_next_chunk());
     std::mem::take(&mut snow.dirty).into_iter().for_each(|chunk| {
       if let Some(ChunkMeshes { body, cover }) = snow.chunks.get(&chunk) {
         meshes.insert(body, snow.body_mesh(chunk)).ok();
@@ -725,8 +767,9 @@ fn advance(
           material.extension.clock = snow.clock
         }
       });
-    let level = snow.level();
-    bodies.iter_mut().for_each(|mut transform| transform.translation.y = level)
+    if let Some(mut body) = rise_materials.get_mut(&looks.body) {
+      body.extension.level = snow.level()
+    }
   }
 }
 
@@ -741,7 +784,12 @@ pub fn finish(commands: &mut Commands) {
   commands.remove_resource::<SnowLooks>()
 }
 
-pub fn plugin(app: &mut App) { app.add_plugins(MaterialPlugin::<CoverMaterial>::default()); }
+pub fn plugin(app: &mut App) {
+  app.add_plugins((
+    MaterialPlugin::<CoverMaterial>::default(),
+    MaterialPlugin::<RiseMaterial>::default()
+  ));
+}
 
 #[cfg(test)]
 mod tests {
@@ -788,26 +836,21 @@ mod tests {
   fn snow_stops_at_its_deepest_and_cleared_ground_still_snows_over() {
     let mut snow = Snow::new(&Terrain::flat(8, 8, 2.0, "snow"));
     let middle = snow.size / 2;
-    let chunks = snow.chunk_count().element_product();
-    let cap = |snow: &mut Snow| (0..chunks).for_each(|_| snow.cap_next_chunk());
     snow.clock = SPREAD_SECONDS + RISE_DELAY + rising(MAX_DEPTH * 3.0);
-    assert!(depth(&snow, middle) > MAX_DEPTH * 2.0);
-    cap(&mut snow);
     let deepest = (0..snow.start.len()).map(|i| snow.depth(i)).fold(0.0, f32::max);
     assert!((deepest - MAX_DEPTH).abs() < 1e-3, "{deepest}");
-    assert!(snow.ahead(snow.xz(middle), Vec2::X) > 0.99 && !snow.dirty.is_empty());
+    assert!(snow.ahead(snow.xz(middle), Vec2::X) > 0.99);
 
     snow.dig(snow.xz(middle));
     assert!(depth(&snow, middle) < 0.0);
     snow.clock += RISE_DELAY + rising(MAX_DEPTH * 2.0);
-    cap(&mut snow);
     assert!((depth(&snow, middle) - MAX_DEPTH).abs() < 1e-3);
   }
 
   #[test]
   fn dug_walls_slump_to_a_resting_slope_keeping_the_snow() {
     let mut snow = Snow::new(&Terrain::flat(16, 16, 2.0, "snow"));
-    snow.clock = SPREAD_SECONDS + RISE_DELAY + rising(1.8);
+    snow.clock = SPREAD_SECONDS + RISE_DELAY + rising(MAX_DEPTH);
     let middle = snow.size / 2;
     let xz = snow.xz(middle);
     snow.dig(xz);
@@ -820,7 +863,11 @@ mod tests {
     (0..400).for_each(|_| snow.slump(xz, 1.0 / 60.0));
     assert!((total(&snow) - before).abs() < 1e-2 * before, "{before} {}", total(&snow));
     // Snow has slid into the hole, and no neighbors are much steeper than resting.
-    assert!(depth(&snow, middle) > 0.0);
+    assert!(
+      points
+        .iter()
+        .any(|&p| snow.xz(p).distance(xz) < DIG_RADIUS && depth(&snow, p) > 0.0)
+    );
     let steepest = points
       .iter()
       .filter(|&&p| p.x < max.x)

@@ -11,11 +11,17 @@ pub const S2: &'static str = "Wield the shovel and \n rescue those penguins!";
 pub const S3: &'static str = "Oh no! Polar bears! \n Get those penguins to safety!";
 pub const S4: &'static str = "Rawr!";
 pub const S5: &'static str = "A penguin was killed";
-pub const S6: &'static str =
-  "I think it's gonna be snowing. \n I think there's gonna be snow.";
 pub const S7: &'static str = "Attack polar bears with the left mouse button.";
-pub const S8: &'static str =
-  "Hey you! Those penguins are trapped in their igloos! They're snowed in!";
+pub const S8: &'static str = "Hello! Welcome to Penguinland!";
+
+// rando penguin sayings
+pub const SAYINGS: &'static [&'static str] = &[
+  "I love Penguinland.",
+  "Penguinland is the best.",
+  "I hope we don't get polar bears today",
+  // "I think it's gonna be snowing. \n I think there's gonna be snow.",
+  "We've got snow. That's great" // "It's snowing. That's great."
+];
 
 fn button_scene() -> impl Scene {
   // ui_widgets::Dialog
@@ -34,8 +40,36 @@ fn button_scene() -> impl Scene {
     ]
   }
 }
-pub fn make_speech_bubble(c: &mut Commands, e: Entity, msg: &'static str) {
+#[derive(Component, Default, Clone)]
+pub struct TimedDespawn {
+  origin_secs: f32,
+  timer_secs: f32
+}
+impl TimedDespawn {
+  fn new(origin_secs: f32, timer_secs: f32) -> Self {
+    TimedDespawn { origin_secs, timer_secs }
+  }
+}
+pub fn timed_despawn(
+  time: Res<Time>,
+  timeds: Query<(Entity, &TimedDespawn)>,
+  mut c: Commands
+) {
+  for (e, &TimedDespawn { origin_secs, timer_secs }) in timeds {
+    if origin_secs + timer_secs < time.elapsed_secs() {
+      c.entity(e).despawn();
+    }
+  }
+}
+pub fn make_speech_bubble(
+  time: &Res<Time>,
+  c: &mut Commands,
+  e: Entity,
+  msg: &'static str
+) {
+  let time_secs = time.elapsed_secs();
   let ui = bsn! {
+    TimedDespawn::new(time_secs,5.0)
     ui_widgets::Dialog
     Node {
       display: Display::Flex,

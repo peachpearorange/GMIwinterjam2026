@@ -13,7 +13,9 @@
 //!
 //! The penguins and bears are the penguin and polar bear models placed in the world:
 //! in play each is swapped for a copy that comes alive here. The shelter is at the
-//! marker named [`SHELTER_MARKER`], or where the guy starts without one.
+//! marker named [`SHELTER_MARKER`], the helipad the penguins want to go to, or where
+//! the guy starts without one. Some penguins say one of the [`SAYINGS`] the first
+//! time the guy comes up to them.
 //!
 //! They play their models' animations called [`IDLE`] ([`PENGUIN_IDLE`] for penguins)
 //! and [`WALK`]. Snowed-in penguins wave for help with [`SNOWED_IN_WAVE`]. Bears
@@ -27,10 +29,10 @@ use {super::{Cutscene, Digs, Framing, HiddenInPlay, LookAt, PlayOnly, Player, St
              happenings::Happened,
              nav::Field,
              shovel::{Shovel, ShovelHit},
-             snow::{MAX_DEPTH, Snow}},
+             snow::{self, MAX_DEPTH, Snow}},
      crate::{Mode, START_MARKER},
      bevy::prelude::*,
-     winterjam2026::{human_written_code::{S1, S2, S3, make_speech_bubble},
+     winterjam2026::{human_written_code::{S1, S2, S3, SAYINGS, make_speech_bubble},
                      model::LowPoly,
                      terrain::Terrain,
                      skeleton::Animate,
@@ -60,8 +62,8 @@ const EAT: &str = "chew";
 const ATTACK: &str = "attack";
 /// Bears, while stunned by the shovel.
 const STUNNED: &str = "stunned";
-/// The marker the shelter is at.
-const SHELTER_MARKER: &str = "shelter";
+/// The marker the shelter is at: the helipad, where the penguins want to go.
+const SHELTER_MARKER: &str = "helipad";
 /// How far around the shelter its yard reaches, in world units. Kept clear of snow, and
 /// bears never come in.
 const SHELTER_RADIUS: f32 = 5.0;
@@ -91,7 +93,7 @@ const BEAR_REACH: f32 = 2.0;
 const BEAR_KILL_SECONDS: f32 = 1.0;
 const BEAR_EAT_SECONDS: f32 = 8.0;
 /// Seconds a killed penguin takes to fade away once it's been eaten.
-const FADE_SECONDS: f32 = 5.0;
+const FADE_SECONDS: f32 = 10.0;
 /// How far apart bears keep from each other, in world units.
 const BEAR_SPACING: f32 = 3.5;
 /// Seconds between a bear's swipes at the guy.
@@ -150,6 +152,12 @@ const BRIEFING: [Step; 10] = [
   Step::Say(S3),
   Step::ShowBears
 ];
+
+/// The chance a penguin says one of the [`SAYINGS`], picked at random, the first time
+/// the guy comes up to it.
+const SAYING_CHANCE: f32 = 0.5;
+/// How near the guy comes to a penguin for it to count as him coming up to it.
+const APPROACH_REACH: f32 = 4.0;
 
 /// Seconds between logging the snow at the spots of penguins near the guy.
 const REPORT_SECONDS: f32 = 1.0;
@@ -269,6 +277,8 @@ fn fade_remains(
 #[derive(Component)]
 struct Penguin {
   saved: bool,
+  /// Whether the guy has come up to it yet.
+  approached: bool,
   doing: PenguinDoing
 }
 
@@ -394,6 +404,7 @@ fn setup(
           penguins += 1;
           let penguin = commands.spawn((copy, Animate::new(PENGUIN_IDLE), Penguin {
             saved: false,
+            approached: false,
             doing: PenguinDoing::SnowedIn
           }));
           (penguin.id(), RESCUE_BEACON)
@@ -448,17 +459,19 @@ struct Messenger {
   seconds: f32
 }
 
-/// Picks the penguin nearest the guy to tell him.
+/// Picks the penguin nearest the guy to tell him. Having talked to him, it doesn't
+/// say anything more when he comes up to it.
 fn choose_messenger(
   players: Query<&Transform, With<Player>>,
-  penguins: Query<(Entity, &Transform), With<Penguin>>,
+  mut penguins: Query<(Entity, &Transform, &mut Penguin)>,
   mut commands: Commands
 ) {
   if let Ok(guy) = players.single()
-    && let Some((penguin, at)) = penguins.iter().min_by(|a, b| {
+    && let Some((penguin, at, mut chosen)) = penguins.iter_mut().min_by(|a, b| {
       a.1.translation.distance(guy.translation).total_cmp(&b.1.translation.distance(guy.translation))
     })
   {
+    chosen.approached = true;
     commands.entity(penguin).insert(Messenger {
       home: at.translation.xz(),
       step: 0,
@@ -510,7 +523,7 @@ fn brief(
       Some(&Step::Say(line)) => {
         if messenger.seconds == 0.0 {
           happened.write(Happened(format!("Penguin: {line}")));
-          make_speech_bubble(&mut commands, entity, line);
+          make_speech_bubble(&time, &mut commands, entity, line);
           commands.insert_resource(LookAt(entity))
         }
         messenger.seconds
@@ -638,12 +651,49 @@ fn walk(
 /// How many points ahead on their way walkers head for.
 const LOOK_AHEAD: usize = 3;
 
-/// Where a walker at `xz` heads on `way`: [`LOOK_AHEAD`] points downhill, or straight to
-/// `goal` once there's nothing lower, as long as `xz` has a way at all.
-fn next_on(way: Option<&Field>, xz: Vec2, goal: Vec2) -> Option<Vec2> {
-  way
-    .filter(|way| way.at(xz).is_finite())
-    .map(|way| way.ahead(xz, LOOK_AHEAD).unwrap_or(goal))
+/// Where a walker at `xz` heads on `way`: the farthest of the next [`LOOK_AHEAD`] points
+/// downhill that `clear` says it can go straight to, so it doesn't cut corners through
+/// what blocks it, or straight to `goal` once there's nothing lower. Off the way, it
+/// heads onto it from a neighboring point.
+fn next_on(
+  way: Option<&Field>,
+  xz: Vec2,
+  goal: Vec2,
+  clear: impl Fn(Vec2) -> bool
+) -> Option<Vec2> {
+  way.and_then(|way| {
+    let ahead = way.way(xz).take(LOOK_AHEAD).collect::<Vec<_>>();
+    ahead
+      .iter()
+      .rev()
+      .copied()
+      .find(|&to| clear(to))
+      .or(ahead.first().copied())
+      .or_else(|| way.at(xz).is_finite().then_some(goal))
+  })
+}
+
+/// World units apart the snow is looked at along a straight line, finer than its grid.
+const LINE_SAMPLE: f32 = 0.25;
+
+/// Whether a penguin can waddle through the snow at `xz`.
+fn waddleable(snow: &Snow, xz: Vec2) -> bool { penguin_cost(snow.depth_at(xz)).is_some() }
+
+/// Whether a penguin can waddle straight from `from` to `to` without crossing snow too
+/// deep.
+fn waddleable_line(snow: &Snow, from: Vec2, to: Vec2) -> bool {
+  let samples = (from.distance(to) / LINE_SAMPLE).ceil().max(1.0) as u32;
+  (1..=samples).all(|k| waddleable(snow, from.lerp(to, k as f32 / samples as f32)))
+}
+
+/// Moves a penguin to `xz` when it can waddle there, or else as far along x or z alone as
+/// it can, sliding along the deep snow, or leaves it where it is.
+fn waddle_to(transform: &mut Transform, from: Vec2, xz: Vec2, snow: &Snow, terrain: &Terrain) {
+  let xz = [xz, Vec2::new(xz.x, from.y), Vec2::new(from.x, xz.y)]
+    .into_iter()
+    .find(|&to| waddleable(snow, to))
+    .unwrap_or(from);
+  transform.translation = Vec3::new(xz.x, terrain.height(xz), xz.y)
 }
 
 /// Pushes the animals of one kind at `positions` apart to at least `spacing`, as offsets
@@ -662,8 +712,40 @@ fn spread(positions: &[Vec2], spacing: f32) -> Vec<Vec2> {
     .collect()
 }
 
+/// Has each penguin maybe say one of the [`SAYINGS`] the first time the guy comes up
+/// to it, whatever is going on.
+fn greet(
+  time: Res<Time>,
+  players: Query<&Transform, With<Player>>,
+  mut penguins: Query<(Entity, &Transform, &mut Penguin), Without<Player>>,
+  mut happened: MessageWriter<Happened>,
+  mut commands: Commands
+) {
+  // Differs from play to play, and from penguin to penguin.
+  let seed = (time.elapsed_secs() * 1000.0) as i32;
+  if let Ok(guy) = players.single() {
+    penguins.iter_mut().for_each(|(entity, transform, mut penguin)| {
+      if !penguin.approached
+        && penguin.doing != PenguinDoing::Dead
+        && guy.translation.xz().distance(transform.translation.xz()) <= APPROACH_REACH
+      {
+        penguin.approached = true;
+        let index = entity.to_bits() as i32;
+        let pick = (snow::hash(seed, index) * SAYINGS.len() as f32) as usize;
+        let says = snow::hash(index, seed) < SAYING_CHANCE;
+        info!("penguin {entity} approached, says something: {says}");
+        if says && let Some(&line) = SAYINGS.get(pick.min(SAYINGS.len().saturating_sub(1))) {
+          happened.write(Happened(format!("Penguin: {line}")));
+          make_speech_bubble(&time, &mut commands, entity, line)
+        }
+      }
+    })
+  }
+}
+
 /// Walks the penguins: freed ones to the shelter along dug ways, or after the guy
-/// when no dug way leads there yet. Snowed-in ones wave.
+/// when no dug way leads there yet, never into snow too deep to get out of. Snowed-in
+/// ones wave.
 fn move_penguins(
   time: Res<Time>,
   mut report_wait: Local<f32>,
@@ -701,16 +783,19 @@ fn move_penguins(
       note("penguin", entity, xz, &mut penguin.doing, PenguinDoing::Saved);
       animate.play(PENGUIN_IDLE)
     } else {
-      let to_shelter = next_on(ways.to_shelter.as_ref(), xz, shelter.xz);
+      let clear = |to: Vec2| waddleable_line(&snow, xz, to);
+      let to_shelter = next_on(ways.to_shelter.as_ref(), xz, shelter.xz, clear);
       let by_guy = guy.is_some_and(|guy| guy.distance(xz) <= FOLLOW_DISTANCE);
       let to_guy = guy
         .filter(|_| to_shelter.is_none() && !by_guy)
-        .and_then(|guy| next_on(ways.to_guy.as_ref(), xz, guy));
+        .and_then(|guy| next_on(ways.to_guy.as_ref(), xz, guy, clear));
       let target = to_shelter.or(to_guy);
       if let Some(target) = target {
         let wading = (snow.depth_at(xz) / PENGUIN_WADE_DEPTH).min(1.0);
         let speed = PENGUIN_SPEED * 1.0.lerp(PENGUIN_WADING_SPEED, wading);
-        walk(&mut transform, PENGUIN_FRONT, target, speed, seconds, &terrain)
+        walk(&mut transform, PENGUIN_FRONT, target, speed, seconds, &terrain);
+        let to = transform.translation.xz();
+        waddle_to(&mut transform, xz, to, &snow, &terrain)
       }
       let snowed_in = penguin_cost(snow.depth_at(xz)).is_none();
       let doing = if to_shelter.is_some() {
@@ -755,10 +840,10 @@ fn move_penguins(
     all.iter().map(|(_, transform, ..)| transform.translation.xz()).collect::<Vec<_>>();
   all.iter_mut().zip(spread(&positions, PENGUIN_SPACING)).for_each(
     |((_, transform, penguin, _), push)| {
-      // Held by a bear or lying dead, it stays put.
+      // Held by a bear or lying dead, it stays put, and none is pushed into deep snow.
       if !matches!(penguin.doing, PenguinDoing::Attacked | PenguinDoing::Dead) {
-        let xz = transform.translation.xz() + push;
-        transform.translation = Vec3::new(xz.x, terrain.height(xz), xz.y)
+        let from = transform.translation.xz();
+        waddle_to(transform, from, from + push, &snow, &terrain)
       }
     }
   )
@@ -884,7 +969,7 @@ fn move_bears(
         bear.killing = Some((penguin, BEAR_KILL_SECONDS));
         prey.swap_remove(i);
         (BearDoing::Killing(penguin), ATTACK)
-      } else if let Some(target) = next_on(ways.to_prey.as_ref(), xz, at) {
+      } else if let Some(target) = next_on(ways.to_prey.as_ref(), xz, at, |_| true) {
         walk(&mut transform, BEAR_FRONT, target, speed, seconds, &terrain);
         (BearDoing::Hunting(penguin), WALK)
       } else {
@@ -951,6 +1036,7 @@ fn finish(mut values: ResMut<UiValues>, mut commands: Commands) {
 pub fn update() -> impl IntoScheduleConfigs<bevy::ecs::system::ScheduleSystem, ()> {
   (
     setup,
+    greet,
     start_when_deep.run_if(in_state(Stage::Snowfall)),
     (
       search_ways,
@@ -998,6 +1084,7 @@ mod tests {
     world.init_resource::<Messages<Happened>>();
     world.spawn((Transform::from_xyz(20.0, 0.0, 20.0), Penguin {
       saved: false,
+      approached: true,
       doing: PenguinDoing::SnowedIn
     }));
     let bear = world
@@ -1032,6 +1119,7 @@ mod tests {
     let penguin = world
       .spawn((Transform::from_xyz(1.0, 0.0, 0.0), Penguin {
         saved: false,
+        approached: true,
         doing: PenguinDoing::SnowedIn
       }))
       .id();

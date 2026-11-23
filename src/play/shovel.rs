@@ -6,7 +6,8 @@
 //! A left click, while the cursor is held, swings it at whatever is near, playing
 //! [`HIT`]: see [`ShovelHit`].
 
-use {super::{Digs, FollowCamera, HiddenInPlay, PlayOnly, Player, audio::Footsteps},
+use {super::{Digs, FollowCamera, HiddenInPlay, PlayOnly, Player, audio::Footsteps,
+             snow::MAX_DEPTH},
      bevy::{prelude::*,
             window::{CursorGrabMode, CursorOptions, PrimaryWindow}},
      winterjam2026::{skeleton::Animate, world::Model}};
@@ -18,6 +19,9 @@ const DIG: &str = "dig";
 const HIT: &str = "attack";
 /// Seconds a swing takes, as long as [`HIT`] is; he can't swing again before it's done.
 const SWING_SECONDS: f32 = 0.85;
+/// How far above where it was placed the shovel waits to be fetched, in world units, so
+/// the deepest snow doesn't bury it.
+const WAITING_LIFT: f32 = MAX_DEPTH;
 /// How near the guy has to come to the shovel to fetch it, along the ground, in world
 /// units.
 const FETCH_REACH: f32 = 1.5;
@@ -74,7 +78,7 @@ pub(super) fn update(
         commands.spawn((
           PlayOnly,
           Model { path: path.clone() },
-          transform,
+          transform.with_translation(transform.translation + Vec3::Y * WAITING_LIFT),
           Visibility::default(),
           Animate::new(HOVER),
           Shovel { carried: false }
