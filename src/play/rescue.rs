@@ -1,4 +1,5 @@
-//! The rescue, once the snow is deep. First the [`BRIEFING`]: the penguin nearest the
+//! The rescue, once the snow is deep. When play starts, the penguin nearest the guy
+//! comes over to [`WELCOME`] him and goes home again. Once the snow is deep, the [`BRIEFING`]: the penguin nearest the
 //! guy wades over to tell him what's going on, goes home to give him time to start
 //! digging, and comes back to warn him of the bears. Then the bears come. Penguins are snowed in where they stand and can
 //! only waddle through snow the guy has dug down, so he digs ways for them to the
@@ -32,7 +33,8 @@ use {super::{Cutscene, Digs, Framing, HiddenInPlay, LookAt, PlayOnly, Player, St
              snow::{self, MAX_DEPTH, Snow}},
      crate::{Mode, START_MARKER},
      bevy::prelude::*,
-     winterjam2026::{human_written_code::{S1, S2, S3, SAYINGS, make_speech_bubble},
+     winterjam2026::{human_written_code::{S1, S2, S3, S8, SAYINGS, make_speech_bubble,
+                                          popup_penguin_killed, popup_penguin_rescued},
                      model::LowPoly,
                      terrain::Terrain,
                      skeleton::Animate,
@@ -121,7 +123,7 @@ const READ_SECONDS_PER_LETTER: f32 = 0.07;
 /// Seconds the guy has to start digging before the bears come.
 const DIGGING_SECONDS: f32 = 30.0;
 
-/// A step of the briefing.
+/// A step of what the messenger does.
 enum Step {
   /// The messenger walks up to the guy.
   ComeToGuy,
@@ -136,11 +138,17 @@ enum Step {
   /// The messenger walks back to where it was.
   GoHome,
   /// Nothing happens for this many seconds.
-  Wait(f32)
+  Wait(f32),
+  /// The rescue starts.
+  StartRescue
 }
 
-/// What the messenger penguin does in the briefing, in order. The rescue starts after.
-const BRIEFING: [Step; 10] = [
+/// What the messenger penguin does when play starts, in order.
+const WELCOME: [Step; 3] = [Step::ComeToGuy, Step::Say(S8), Step::GoHome];
+
+/// What the messenger penguin does in the briefing, in order, ending with the rescue
+/// starting.
+const BRIEFING: [Step; 11] = [
   Step::ComeToGuy,
   Step::Say(S1),
   Step::ShowPenguins,
@@ -150,7 +158,8 @@ const BRIEFING: [Step; 10] = [
   Step::Wait(DIGGING_SECONDS),
   Step::ComeToGuy,
   Step::Say(S3),
-  Step::ShowBears
+  Step::ShowBears,
+  Step::StartRescue
 ];
 
 /// The chance a penguin says one of the [`SAYINGS`], picked at random, the first time
@@ -352,6 +361,26 @@ struct Tally {
   caught: usize
 }
 
+impl Tally {
+  /// How many penguins are still to be saved or caught.
+  fn left(&self) -> usize { self.penguins - self.saved - self.caught }
+}
+
+/// A penguin was saved or killed, with this many still left, to pop up on the screen.
+#[derive(Message)]
+enum Popup {
+  Rescued(usize),
+  Killed(usize)
+}
+
+/// Pops up each [`Popup`] on the screen.
+fn show_popups(time: Res<Time>, mut popups: MessageReader<Popup>, mut commands: Commands) {
+  popups.read().for_each(|popup| match *popup {
+    Popup::Rescued(left) => popup_penguin_rescued(&mut commands, left as u32, &time),
+    Popup::Killed(left) => popup_penguin_killed(&mut commands, left as u32, &time)
+  })
+}
+
 /// The ways animals find, each searched again in turn as the snow changes.
 #[derive(Resource, Default)]
 struct Ways {
@@ -450,38 +479,75 @@ fn start_when_deep(
   }
 }
 
-/// The penguin telling the guy what's going on, at step `step` of the [`BRIEFING`] and
+/// The penguin telling the guy what's going on, at step `step` of `script` and
 /// `seconds` into it. Walks through any snow while it is one. Goes back to `home`.
 #[derive(Component)]
 struct Messenger {
   home: Vec2,
+  script: &'static [Step],
   step: usize,
   seconds: f32
 }
 
-/// Picks the penguin nearest the guy to tell him. Having talked to him, it doesn't
-/// say anything more when he comes up to it.
-fn choose_messenger(
-  players: Query<&Transform, With<Player>>,
-  mut penguins: Query<(Entity, &Transform, &mut Penguin)>,
-  mut commands: Commands
-) {
-  if let Ok(guy) = players.single()
-    && let Some((penguin, at, mut chosen)) = penguins.iter_mut().min_by(|a, b| {
+/// Has the penguin nearest the guy go through `script`, instead of any messenger still
+/// going through another, and gives whether there was one. Having talked to him, it
+/// doesn't say anything more when he comes up to it.
+fn appoint_messenger(
+  script: &'static [Step],
+  players: &Query<&Transform, With<Player>>,
+  penguins: &mut Query<(Entity, &Transform, &mut Penguin, Option<&Messenger>)>,
+  commands: &mut Commands
+) -> bool {
+  let chosen = players.single().ok().and_then(|guy| {
+    penguins.iter_mut().min_by(|a, b| {
       a.1.translation.distance(guy.translation).total_cmp(&b.1.translation.distance(guy.translation))
     })
-  {
+  });
+  let found = chosen.is_some();
+  if let Some((penguin, at, mut chosen, messenger)) = chosen {
     chosen.approached = true;
-    commands.entity(penguin).insert(Messenger {
-      home: at.translation.xz(),
-      step: 0,
-      seconds: 0.0
-    });
+    // Going back where it came from, if it was on its way somewhere already.
+    let home = messenger.map_or(at.translation.xz(), |messenger| messenger.home);
+    commands.entity(penguin).insert(Messenger { home, script, step: 0, seconds: 0.0 });
+    penguins
+      .iter()
+      .filter(|(other, .., messenger)| *other != penguin && messenger.is_some())
+      .for_each(|(other, ..)| {
+        commands.entity(other).remove::<Messenger>();
+      })
+  }
+  found
+}
+
+/// Done welcoming the guy this play.
+#[derive(Resource)]
+struct Welcomed;
+
+/// Has a penguin come to [`WELCOME`] the guy once he and the penguins are there.
+fn welcome(
+  players: Query<&Transform, With<Player>>,
+  mut penguins: Query<(Entity, &Transform, &mut Penguin, Option<&Messenger>)>,
+  mut commands: Commands
+) {
+  if appoint_messenger(&WELCOME, &players, &mut penguins, &mut commands) {
+    commands.insert_resource(Welcomed)
   }
 }
 
-/// Walks the messenger through the [`BRIEFING`], and starts the rescue after it, or
-/// straight away without a messenger.
+/// Has a penguin come to give the [`BRIEFING`], or starts the rescue straight away
+/// without one.
+fn choose_messenger(
+  players: Query<&Transform, With<Player>>,
+  mut penguins: Query<(Entity, &Transform, &mut Penguin, Option<&Messenger>)>,
+  mut next: ResMut<NextState<Stage>>,
+  mut commands: Commands
+) {
+  if !appoint_messenger(&BRIEFING, &players, &mut penguins, &mut commands) {
+    next.set(Stage::Rescue)
+  }
+}
+
+/// Walks the messenger through its script, and lets it go after.
 fn brief(
   time: Res<Time>,
   terrain: Res<Terrain>,
@@ -517,7 +583,7 @@ fn brief(
       animate.play(if there { PENGUIN_IDLE } else { WALK });
       there
     };
-    let done = match BRIEFING.get(messenger.step) {
+    let done = match messenger.script.get(messenger.step) {
       Some(Step::ComeToGuy) => walk_to(guy.translation.xz(), FOLLOW_DISTANCE),
       Some(Step::GoHome) => walk_to(messenger.home, 0.1),
       Some(&Step::Say(line)) => {
@@ -554,9 +620,12 @@ fn brief(
         show(tour, messenger.seconds)
       }
       Some(&Step::Wait(seconds)) => messenger.seconds >= seconds,
+      Some(Step::StartRescue) => {
+        next.set(Stage::Rescue);
+        true
+      }
       None => {
         commands.entity(entity).remove::<Messenger>();
-        next.set(Stage::Rescue);
         false
       }
     };
@@ -567,8 +636,6 @@ fn brief(
     } else {
       messenger.seconds += time.delta_secs()
     }
-  } else if messengers.is_empty() {
-    next.set(Stage::Rescue)
   }
 }
 
@@ -759,7 +826,8 @@ fn move_penguins(
   mut penguins: Query<
     (Entity, &mut Transform, &mut Penguin, &mut Animate),
     (Without<Player>, Without<Messenger>)
-  >
+  >,
+  mut popups: MessageWriter<Popup>
 ) {
   let seconds = time.delta_secs();
   let guy = players.single().ok().map(|player| player.translation.xz());
@@ -774,6 +842,7 @@ fn move_penguins(
       penguin.saved = true;
       tally.saved += 1;
       happened.write(Happened(format!("Penguin saved ({} of {})", tally.saved, tally.penguins)));
+      popups.write(Popup::Rescued(tally.left()));
     }
     if penguin.doing == PenguinDoing::Dead {
       animate.play(DEAD)
@@ -862,6 +931,7 @@ fn move_bears(
   mut tally: ResMut<Tally>,
   mut hits: MessageReader<ShovelHit>,
   mut happened: MessageWriter<Happened>,
+  mut popups: MessageWriter<Popup>,
   mut players: Query<(&Transform, &mut Player), Without<Bear>>,
   mut penguins: Query<(Entity, &Transform, &mut Penguin), Without<Bear>>,
   mut bears: Query<(Entity, &mut Transform, &mut Bear, &mut Animate)>,
@@ -944,6 +1014,7 @@ fn move_bears(
           note("penguin", penguin, at.translation.xz(), &mut caught.doing, PenguinDoing::Dead);
           tally.caught += 1;
           happened.write(Happened("A polar bear killed a penguin".into()));
+          popups.write(Popup::Killed(tally.left()));
           commands.entity(penguin).insert(Remains { seconds: 0.0 });
           bear.killing = None;
           bear.eating = BEAR_EAT_SECONDS
@@ -1006,7 +1077,7 @@ fn tally_up(
   mut next: ResMut<NextState<Stage>>
 ) {
   let Tally { penguins, saved, caught } = *tally;
-  COUNTS.iter().zip([penguins, saved, caught, penguins - saved - caught]).for_each(
+  COUNTS.iter().zip([penguins, saved, caught, tally.left()]).for_each(
     |(name, count)| {
       values.insert(name.to_string(), count.to_string());
     }
@@ -1029,7 +1100,8 @@ fn finish(mut values: ResMut<UiValues>, mut commands: Commands) {
   });
   commands.remove_resource::<Shelter>();
   commands.remove_resource::<Tally>();
-  commands.remove_resource::<Ways>()
+  commands.remove_resource::<Ways>();
+  commands.remove_resource::<Welcomed>()
 }
 
 /// The rescue's systems during play, in order, to run after the snow's.
@@ -1037,18 +1109,29 @@ pub fn update() -> impl IntoScheduleConfigs<bevy::ecs::system::ScheduleSystem, (
   (
     setup,
     greet,
+    (welcome.run_if(not(resource_exists::<Welcomed>)), brief)
+      .chain()
+      .run_if(in_state(Stage::Snowfall))
+      .run_if(resource_exists::<Shelter>),
     start_when_deep.run_if(in_state(Stage::Snowfall)),
     (
       search_ways,
       brief.run_if(in_state(Stage::Briefing)),
       move_penguins,
-      move_bears.run_if(in_state(Stage::Rescue)),
+      move_bears.run_if(in_state(Stage::Rescue).or_else(in_state(Stage::AfterRescue))),
       follow_beacons,
       fade_remains,
-      tally_up
+      tally_up.run_if(in_state(Stage::Rescue)),
+      show_popups
     )
       .chain()
-      .run_if(in_state(Stage::Briefing).or_else(in_state(Stage::Rescue)))
+      // Going on once it's over, so a bear finishes what it was doing and can still be
+      // hit.
+      .run_if(
+        in_state(Stage::Briefing)
+          .or_else(in_state(Stage::Rescue))
+          .or_else(in_state(Stage::AfterRescue))
+      )
       .run_if(resource_exists::<Shelter>)
   )
     .chain()
@@ -1056,6 +1139,7 @@ pub fn update() -> impl IntoScheduleConfigs<bevy::ecs::system::ScheduleSystem, (
 
 pub fn plugin(app: &mut App) {
   app
+    .add_message::<Popup>()
     .add_systems(OnEnter(Stage::Briefing), choose_messenger)
     .add_systems(OnEnter(Stage::Rescue), start).add_systems(OnExit(Mode::Play), finish);
 }
@@ -1082,6 +1166,7 @@ mod tests {
     world.init_resource::<Ways>();
     world.init_resource::<Messages<ShovelHit>>();
     world.init_resource::<Messages<Happened>>();
+    world.init_resource::<Messages<Popup>>();
     world.spawn((Transform::from_xyz(20.0, 0.0, 20.0), Penguin {
       saved: false,
       approached: true,
@@ -1116,6 +1201,7 @@ mod tests {
     world.init_resource::<Ways>();
     world.init_resource::<Messages<ShovelHit>>();
     world.init_resource::<Messages<Happened>>();
+    world.init_resource::<Messages<Popup>>();
     let penguin = world
       .spawn((Transform::from_xyz(1.0, 0.0, 0.0), Penguin {
         saved: false,
@@ -1152,6 +1238,7 @@ mod tests {
     world.init_resource::<Ways>();
     world.init_resource::<Messages<ShovelHit>>();
     world.init_resource::<Messages<Happened>>();
+    world.init_resource::<Messages<Popup>>();
     let guy = world.spawn((Player::STANDING, Transform::from_xyz(20.0, 0.0, 0.0))).id();
     let bear = world.spawn((Transform::default(), Bear::FRESH, Animate::new(IDLE))).id();
     let doing = |world: &World| world.get::<Bear>(bear).unwrap().doing;
