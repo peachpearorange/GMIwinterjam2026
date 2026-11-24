@@ -1,7 +1,8 @@
 //! The rescue, once the snow is deep. When play starts, the penguin nearest the guy
 //! comes over to [`WELCOME`] him and goes home again. Once the snow is deep, the [`BRIEFING`]: the penguin nearest the
 //! guy wades over to tell him what's going on, goes home to give him time to start
-//! digging, and comes back to warn him of the bears. Then the bears come. Penguins are snowed in where they stand and can
+//! digging, and comes back to warn him of the bears [`BEARS_AFTER_FIRST_RESCUE`]
+//! seconds after the first penguin is saved. Then the bears come. Penguins are snowed in where they stand and can
 //! only waddle through snow the guy has dug down, so he digs ways for them to the
 //! shelter, whose yard is always kept clear. Freed penguins head for the shelter when a
 //! dug way leads there, and otherwise follow the guy along his trenches. Polar bears
@@ -120,8 +121,8 @@ const SEARCH_SECONDS: f32 = 0.1;
 const READ_SECONDS: f32 = 2.0;
 /// And how many more for each of its letters.
 const READ_SECONDS_PER_LETTER: f32 = 0.07;
-/// Seconds the guy has to start digging before the bears come.
-const DIGGING_SECONDS: f32 = 30.0;
+/// Seconds after the first penguin is saved that the bears come.
+const BEARS_AFTER_FIRST_RESCUE: f32 = 20.0;
 
 /// A step of what the messenger does.
 enum Step {
@@ -137,8 +138,8 @@ enum Step {
   ShowBears,
   /// The messenger walks back to where it was.
   GoHome,
-  /// Nothing happens for this many seconds.
-  Wait(f32),
+  /// Nothing happens until this many seconds after the first penguin is saved.
+  AfterFirstRescue(f32),
   /// The rescue starts.
   StartRescue
 }
@@ -155,7 +156,7 @@ const BRIEFING: [Step; 11] = [
   Step::Say(S2),
   Step::ShowShovel,
   Step::GoHome,
-  Step::Wait(DIGGING_SECONDS),
+  Step::AfterFirstRescue(BEARS_AFTER_FIRST_RESCUE),
   Step::ComeToGuy,
   Step::Say(S3),
   Step::ShowBears,
@@ -358,7 +359,9 @@ struct Shelter {
 struct Tally {
   penguins: usize,
   saved: usize,
-  caught: usize
+  caught: usize,
+  /// Seconds into play the first penguin was saved, once one has been.
+  first_saved: Option<f32>
 }
 
 impl Tally {
@@ -557,6 +560,7 @@ fn brief(
   penguins: Query<(&Transform, &Penguin), Without<Messenger>>,
   mut bears: Query<(&Transform, &mut Visibility), (With<Bear>, Without<Messenger>)>,
   cutscene: Option<Res<Cutscene>>,
+  tally: Res<Tally>,
   mut happened: MessageWriter<Happened>,
   mut next: ResMut<NextState<Stage>>,
   mut commands: Commands
@@ -619,7 +623,9 @@ fn brief(
         animate.play(PENGUIN_IDLE);
         show(tour, messenger.seconds)
       }
-      Some(&Step::Wait(seconds)) => messenger.seconds >= seconds,
+      Some(&Step::AfterFirstRescue(seconds)) => {
+        tally.first_saved.is_some_and(|at| time.elapsed_secs() - at >= seconds)
+      }
       Some(Step::StartRescue) => {
         next.set(Stage::Rescue);
         true
@@ -841,6 +847,7 @@ fn move_penguins(
     if !penguin.saved && xz.distance(shelter.xz) <= SAVED_RADIUS {
       penguin.saved = true;
       tally.saved += 1;
+      tally.first_saved.get_or_insert(time.elapsed_secs());
       happened.write(Happened(format!("Penguin saved ({} of {})", tally.saved, tally.penguins)));
       popups.write(Popup::Rescued(tally.left()));
     }
@@ -1076,7 +1083,7 @@ fn tally_up(
   mut happened: MessageWriter<Happened>,
   mut next: ResMut<NextState<Stage>>
 ) {
-  let Tally { penguins, saved, caught } = *tally;
+  let Tally { penguins, saved, caught, .. } = *tally;
   COUNTS.iter().zip([penguins, saved, caught, tally.left()]).for_each(
     |(name, count)| {
       values.insert(name.to_string(), count.to_string());
