@@ -11,6 +11,10 @@ import bevy_pbr::render::{
 struct RisingSnow {
     /// How high all the rising snow has come.
     level: f32,
+    /// Unused: rounds the struct up to a multiple of 16 bytes, which WebGL2 needs.
+    padding_1: f32,
+    padding_2: f32,
+    padding_3: f32,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(100) var<uniform> rising: RisingSnow;

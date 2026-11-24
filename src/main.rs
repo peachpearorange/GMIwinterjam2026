@@ -93,7 +93,12 @@ fn main() {
     .add_plugins(assets::plugin)
     .add_plugins((
       plugins.set(WindowPlugin {
-        primary_window: Some(Window { title: "Winter Jam 2026".into(), ..default() }),
+        primary_window: Some(Window {
+          title: "Winter Jam 2026".into(),
+          // On the web, fill the page (itch.io's frame, or the whole screen in fullscreen).
+          fit_canvas_to_parent: true,
+          ..default()
+        }),
         ..default()
       }),
       FreeCameraPlugin,

@@ -30,3 +30,11 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# The web build for itch.io: `cargo build --profile web --no-default-features
+# --target wasm32-unknown-unknown`. Smaller than release, for a quicker download.
+[profile.web]
+inherits = "release"
+opt-level = "s"
+lto = "thin"
+strip = true

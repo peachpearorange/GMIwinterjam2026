@@ -532,7 +532,10 @@ struct CoverLook {
   /// 1 when this draws the look fading in over the one before it, 0 when it draws the
   /// look once it has fully come in.
   #[uniform(100)]
-  fading_in: f32
+  fading_in: f32,
+  /// Unused: rounds the uniform up to a multiple of 16 bytes, which WebGL2 needs.
+  #[uniform(100)]
+  padding: f32
 }
 
 impl MaterialExtension for CoverLook {
@@ -551,7 +554,14 @@ type CoverMaterial = ExtendedMaterial<StandardMaterial, CoverLook>;
 struct RisingSnow {
   /// How high all the rising snow has come, kept up to date.
   #[uniform(100)]
-  level: f32
+  level: f32,
+  /// Unused: rounds the uniform up to a multiple of 16 bytes, which WebGL2 needs.
+  #[uniform(100)]
+  padding_1: f32,
+  #[uniform(100)]
+  padding_2: f32,
+  #[uniform(100)]
+  padding_3: f32
 }
 
 impl MaterialExtension for RisingSnow {
@@ -627,7 +637,7 @@ impl SnowLooks {
     };
     let body = rise_materials.add(RiseMaterial {
       base: standard(&snow, model_materials).0,
-      extension: RisingSnow { level: 0.0 }
+      extension: RisingSnow { level: 0.0, ..default() }
     });
     let cover = std::array::from_fn(|i| {
       let stage = i as u8 + 1;
@@ -655,7 +665,8 @@ impl SnowLooks {
             clock: 0.0,
             stage_seconds: STAGE_SECONDS,
             full_look: FULL_STAGE as f32,
-            fading_in: fading_in as u8 as f32
+            fading_in: fading_in as u8 as f32,
+            padding: 0.0
           }
         })
       };

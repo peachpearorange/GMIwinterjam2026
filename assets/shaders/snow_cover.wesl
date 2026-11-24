@@ -24,6 +24,8 @@ struct SnowLook {
     full_look: f32,
     /// 1 when this draws the look fading in over the one before it.
     fading_in: f32,
+    /// Unused: rounds the struct up to a multiple of 16 bytes, which WebGL2 needs.
+    padding: f32,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(100) var<uniform> snow_look: SnowLook;
