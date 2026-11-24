@@ -1,13 +1,16 @@
-//! Sound during play: music and wind that loop, a digging loop while the player pushes
+//! Sound during play: music, wind that loops, a digging loop while the player pushes
 //! through deep snow, and footsteps by what's underfoot. The wind picks up as the world
 //! gets buried.
 //!
 //! Sounds are files in [`SOUNDS_DIR`], found by name, `.ogg` or `.wav`. Any that's
 //! missing is silent:
-//! - `music`, `wind` and `digging` loop.
+//! - `wind` and `digging` loop.
+//! - `music welcome` and `music bears` are the [`Tune`]s, each looping from its start
+//!   while it's the [`Music`] playing.
 //! - `step snow` plays for steps on fallen snow, `step <material>` for steps on ground
 //!   painted with that material, and `step` when there's neither.
 //! - Footsteps can have variants, `step snow 1`, `step snow 2` and on, picked between.
+//! - `bear` is the polar bears' growl, now and then while they hunt.
 //!
 //! How loud each is comes from the scene settings.
 
@@ -34,11 +37,13 @@ const DIGGING_DEPTH: f32 = 0.15;
 const LINGER_SECONDS: f32 = 0.3;
 /// Seconds looping sounds take to fade all the way in or out.
 const FADE_SECONDS: f32 = 0.4;
+/// Seconds a tune takes to fade out once it's not the one playing any more.
+const MUSIC_FADE_SECONDS: f32 = 2.0;
 /// How loud the wind is before any snow has risen, as a share of its loudest.
 const CALM_WIND: f32 = 0.25;
 
 /// The asset path of the sound called `name`, if there's a file for it.
-fn file(name: &str) -> Option<String> {
+pub fn file(name: &str) -> Option<String> {
   EXTENSIONS
     .iter()
     .map(|extension| format!("{SOUNDS_DIR}/{name}.{extension}"))
@@ -52,17 +57,15 @@ fn variants(name: &str) -> Vec<String> {
 
 #[derive(Clone, Copy)]
 pub enum LoopingSound {
-  Music,
   Wind,
   Digging
 }
 
 impl LoopingSound {
-  const ALL: [Self; 3] = [Self::Music, Self::Wind, Self::Digging];
+  const ALL: [Self; 2] = [Self::Wind, Self::Digging];
 
   const fn name(self) -> &'static str {
     match self {
-      Self::Music => "music",
       Self::Wind => "wind",
       Self::Digging => "digging"
     }
@@ -74,6 +77,45 @@ impl LoopingSound {
 pub struct FadingLoop {
   sound: LoopingSound,
   /// How far it has faded in, 0..1.
+  level: f32
+}
+
+/// A piece of music played during play.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Tune {
+  /// From the guy's welcome until he's warned of the bears.
+  Welcome,
+  /// Once the bears show up.
+  Bears
+}
+
+impl Tune {
+  const fn name(self) -> &'static str {
+    match self {
+      Self::Welcome => "music welcome",
+      Self::Bears => "music bears"
+    }
+  }
+
+  /// How loud it plays next to the other tunes, 1 being as loud as its file.
+  const fn loudness(self) -> f32 {
+    match self {
+      Self::Welcome => 1.0,
+      Self::Bears => 0.5
+    }
+  }
+}
+
+/// The tune playing now, if any.
+#[derive(Resource, Default)]
+pub struct Music(pub Option<Tune>);
+
+/// Plays a tune from its start, looping, and fades it out once it's not the [`Music`]
+/// any more.
+#[derive(Component)]
+pub struct PlayingTune {
+  tune: Tune,
+  /// How loud it still is, 0..1.
   level: f32
 }
 
@@ -101,6 +143,7 @@ impl Footsteps {
 /// Starts the looping sounds, silent until they fade in.
 pub fn start(asset_server: Res<AssetServer>, mut commands: Commands) {
   commands.insert_resource(Footsteps::default());
+  commands.insert_resource(Music::default());
   LoopingSound::ALL.into_iter().for_each(|sound| {
     file(sound.name()).into_iter().for_each(|path| {
       commands.spawn((
@@ -126,7 +169,7 @@ pub fn update(
   mut loops: Query<(&mut FadingLoop, Option<&mut AudioSink>)>,
   mut commands: Commands
 ) {
-  let SoundSettings { master, music, wind, steps, digging } = settings.sound;
+  let SoundSettings { master, wind, steps, digging, .. } = settings.sound;
   let seconds = time.delta_secs();
   let footsteps = &mut *footsteps;
   let xz = players.single().ok().map(|player| player.translation.xz());
@@ -178,7 +221,6 @@ pub fn update(
   let buried = snow.as_ref().map_or(0.0, |snow| snow.buried());
   loops.iter_mut().for_each(|(mut fading, sink)| {
     let (target, volume) = match fading.sound {
-      LoopingSound::Music => (1.0, music),
       LoopingSound::Wind => (CALM_WIND.lerp(1.0, buried), wind),
       LoopingSound::Digging => ((footsteps.digging > 0.0) as u8 as f32, digging)
     };
@@ -186,6 +228,43 @@ pub fn update(
     fading.level += (target - fading.level).clamp(-fade, fade);
     if let Some(mut sink) = sink {
       sink.set_volume(Volume::Linear(fading.level * volume * master))
+    }
+  })
+}
+
+/// Starts the [`Music`] from its start when it isn't playing yet, and fades out any
+/// other tune still playing.
+pub fn play_music(
+  time: Res<Time>,
+  settings: Res<SceneSettings>,
+  music: Res<Music>,
+  asset_server: Res<AssetServer>,
+  mut playing: Query<(Entity, &mut PlayingTune, Option<&mut AudioSink>)>,
+  mut commands: Commands
+) {
+  let SoundSettings { master, music: volume, .. } = settings.sound;
+  let &Music(wanted) = &*music;
+  if let Some(tune) = wanted
+    && !playing.iter().any(|(_, playing, _)| playing.tune == tune)
+    && let Some(path) = file(tune.name())
+  {
+    commands.spawn((
+      PlayingTune { tune, level: 1.0 },
+      PlayOnly,
+      AudioPlayer::new(asset_server.load(path)),
+      PlaybackSettings::LOOP.with_volume(Volume::Linear(master * volume * tune.loudness()))
+    ));
+  }
+  playing.iter_mut().for_each(|(entity, mut playing, sink)| {
+    playing.level = if wanted == Some(playing.tune) {
+      1.0
+    } else {
+      playing.level - time.delta_secs() / MUSIC_FADE_SECONDS
+    };
+    if playing.level <= 0.0 {
+      commands.entity(entity).despawn()
+    } else if let Some(mut sink) = sink {
+      sink.set_volume(Volume::Linear(playing.level * volume * master * playing.tune.loudness()))
     }
   })
 }

@@ -126,10 +126,9 @@ pub struct Snow {
   /// How deep the deepest snow the player cleared this frame was, when any was.
   /// Zero for snow that had only settled.
   pub dug: Option<f32>,
-  /// Places kept clear of snow all the time, as world xz and radius.
-  pub yards: Vec<(Vec2, f32)>,
-  /// Whether each point is indoors, like inside igloos, where snow never comes.
-  indoors: Vec<bool>,
+  /// Whether each point is kept clear, like inside igloos or in a yard, where snow
+  /// never comes.
+  kept_clear: Vec<bool>,
   /// Chunks whose meshes need building again, as the snow there changed.
   dirty: HashSet<UVec2>,
   chunks: HashMap<UVec2, ChunkMeshes>
@@ -165,8 +164,7 @@ impl Snow {
       start,
       clock: 0.0,
       dug: None,
-      yards: vec![],
-      indoors: vec![false; (size.x * size.y) as usize],
+      kept_clear: vec![false; (size.x * size.y) as usize],
       dirty: default(),
       chunks: default()
     };
@@ -389,7 +387,7 @@ impl Snow {
       .copied()
       .filter(|&p| {
         let i = self.index(p);
-        !self.indoors[i] && clock - self.start[i] > STAGE_SECONDS / 2.0
+        !self.kept_clear[i] && clock - self.start[i] > STAGE_SECONDS / 2.0
       })
       .collect::<Vec<_>>();
     let deepest = cleared
@@ -411,20 +409,30 @@ impl Snow {
     deepest
   }
 
-  /// Keeps the points under `roofs` clear of snow from now on.
-  fn shelter(&mut self, roofs: &[Collider]) {
+  /// Keeps the points `kept` picks clear of snow from now on, along with those kept
+  /// clear already, so snow never even starts there.
+  fn keep_clear_where(&mut self, kept: impl Fn(&Self, UVec2) -> bool) {
     let points = (0..self.size.y).flat_map(|z| (0..self.size.x).map(move |x| UVec2::new(x, z)));
-    self.indoors = points
-      .map(|p| {
-        let xz = self.xz(p);
-        let floor = Vec3::new(xz.x, self.ground[self.index(p)] + 0.01, xz.y);
-        roofs.iter().any(|roof| roof.covers(floor))
-      })
-      .collect();
-    self.start.iter_mut().zip(&self.indoors).filter(|(_, indoors)| **indoors).for_each(
+    self.kept_clear =
+      points.map(|p| self.kept_clear[self.index(p)] || kept(self, p)).collect();
+    self.start.iter_mut().zip(&self.kept_clear).filter(|(_, kept)| **kept).for_each(
       |(start, _)| *start = NEVER
     );
     self.mark_dirty(UVec2::ZERO, self.size - UVec2::ONE)
+  }
+
+  /// Keeps the points under `roofs` clear of snow from now on.
+  fn shelter(&mut self, roofs: &[Collider]) {
+    self.keep_clear_where(|snow, p| {
+      let xz = snow.xz(p);
+      let floor = Vec3::new(xz.x, snow.ground[snow.index(p)] + 0.01, xz.y);
+      roofs.iter().any(|roof| roof.covers(floor))
+    })
+  }
+
+  /// Keeps the yard within `radius` of `xz` clear of snow from now on.
+  pub fn keep_clear(&mut self, xz: Vec2, radius: f32) {
+    self.keep_clear_where(|snow, p| snow.xz(p).distance(xz) <= radius)
   }
 
   /// Clears the snow around the player at `xz`.
@@ -462,12 +470,12 @@ impl Snow {
     let share = (SLUMP_PER_SECOND * seconds).min(1.0);
     // Each point with snow sends some to the neighbors it's too steep above, more to
     // the steeper ones, at most half the way to resting so it never overshoots. None
-    // slides indoors.
+    // slides where it's kept clear.
     let changes = (0..points.len()).filter(|&k| depths[k] > 0.0).fold(
       vec![0.0; points.len()],
       |mut changes, k| {
         let drops = neighbors(k)
-          .filter(|&(n, _)| !self.indoors[self.index(points[n])])
+          .filter(|&(n, _)| !self.kept_clear[self.index(points[n])])
           .map(|(n, far)| (n, tops[k] - tops[n] - STEEPEST_SLOPE * far))
           .filter(|&(_, drop)| drop > 0.0)
           .collect::<Vec<_>>();
@@ -748,10 +756,6 @@ fn advance(
         snow.dug = (snow.depth_at(xz) > 0.0).then_some(0.0)
       }
     }
-    std::mem::take(&mut snow.yards).into_iter().for_each(|(xz, radius)| {
-      snow.clear(xz, radius);
-      snow.yards.push((xz, radius))
-    });
     std::mem::take(&mut snow.dirty).into_iter().for_each(|chunk| {
       if let Some(ChunkMeshes { body, cover }) = snow.chunks.get(&chunk) {
         meshes.insert(body, snow.body_mesh(chunk)).ok();

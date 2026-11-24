@@ -349,12 +349,13 @@ impl SceneEditorUi<'_> {
         ui.weak("Paint the sky with Paint sky in the World tab");
         ui.separator();
         ui.heading("Sound");
-        let SoundSettings { master, music, wind, steps, digging } = &mut edited.sound;
+        let SoundSettings { master, music, wind, steps, digging, growls } = &mut edited.sound;
         slider(ui, master, 0.0..=2.0, "master");
         slider(ui, music, 0.0..=2.0, "music");
         slider(ui, wind, 0.0..=2.0, "wind");
         slider(ui, steps, 0.0..=2.0, "footsteps");
         slider(ui, digging, 0.0..=2.0, "digging");
+        slider(ui, growls, 0.0..=2.0, "bear growls");
       });
     });
     // Only written when something changed, so the settings aren't reapplied every frame.

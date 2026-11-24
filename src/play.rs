@@ -24,6 +24,7 @@ use {crate::{Mode, START_MARKER},
      bevy::{camera_controller::free_camera::FreeCameraState,
             input::mouse::AccumulatedMouseMotion,
             prelude::*,
+            ui_widgets::Dialog,
             window::{CursorGrabMode, CursorOptions, PrimaryWindow}},
      winterjam2026::{billboard::{Billboard, BillboardMode, WorldCamera},
                      human_written_code::timed_despawn,
@@ -437,6 +438,16 @@ fn spawn_player(
   }
 }
 
+/// Has dialogs shown during play, like the end screen, go when play ends.
+fn dialogs_play_only(
+  dialogs: Query<Entity, (Added<Dialog>, Without<ChildOf>)>,
+  mut commands: Commands
+) {
+  dialogs.iter().for_each(|dialog| {
+    commands.entity(dialog).insert(PlayOnly);
+  })
+}
+
 /// Keeps the free flying camera still, as the camera follows the player in play.
 fn stop_free_camera(mut cameras: Query<&mut FreeCameraState>) {
   cameras
@@ -745,6 +756,7 @@ fn finish(
   });
   shown.clear();
   commands.remove_resource::<audio::Footsteps>();
+  commands.remove_resource::<audio::Music>();
   commands.remove_resource::<Cutscene>();
   commands.remove_resource::<LookAt>();
   commands.remove_resource::<Overview>();
@@ -777,7 +789,9 @@ pub fn plugin(app: &mut App) {
         snow::update(),
         rescue::update(),
         timed_despawn,
+        dialogs_play_only,
         audio::update,
+        audio::play_music,
         shovel::update,
         follow_player,
         letterbox,

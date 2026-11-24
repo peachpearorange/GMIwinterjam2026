@@ -698,12 +698,14 @@ pub struct SoundSettings {
   pub music: f32,
   pub wind: f32,
   pub steps: f32,
-  pub digging: f32
+  pub digging: f32,
+  /// The polar bears' growls.
+  pub growls: f32
 }
 
 impl Default for SoundSettings {
   fn default() -> Self {
-    Self { master: 1.0, music: 1.0, wind: 1.0, steps: 1.0, digging: 1.0 }
+    Self { master: 1.0, music: 1.0, wind: 1.0, steps: 1.0, digging: 1.0, growls: 1.0 }
   }
 }
 

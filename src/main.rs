@@ -77,6 +77,8 @@ fn spawn_camera(mut commands: Commands, markers: Markers, settings: Res<SceneSet
     settings.camera.fly.free_camera(),
     FlyLevel::default(),
     WorldCamera,
+    // Hears sounds from where they are, its ears this far apart in world units.
+    SpatialListener::new(0.3),
     start_transform(&markers)
   ));
 }

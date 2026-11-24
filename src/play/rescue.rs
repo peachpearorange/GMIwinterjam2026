@@ -24,17 +24,20 @@
 //! [`ATTACK`] a penguin they catch, which then lies [`DEAD`] while they [`EAT`] it, and
 //! [`ATTACK`] the guy within reach, and play [`STUNNED`] while stunned.
 //!
-//! Screens shown: [`RESCUE_SCREEN`] during it, then [`OVER_SCREEN`]. Their texts can
-//! show `{penguins}`, `{penguins saved}`, `{penguins caught}` and `{penguins left}`.
+//! Screens shown: [`RESCUE_SCREEN`] during it, whose texts can show `{penguins}`,
+//! `{penguins saved}`, `{penguins caught}` and `{penguins left}`, then the end screen
+//! with how many were saved and caught.
 
-use {super::{Cutscene, Digs, Framing, HiddenInPlay, LookAt, PlayOnly, Player, Stage,
+use {super::{Cutscene, Digs, Framing, HiddenInPlay, LookAt, PlayOnly, Player, RUN_SPEED, Stage,
+             audio::{self, Music, Tune},
              happenings::Happened,
              nav::Field,
              shovel::{Shovel, ShovelHit},
              snow::{self, MAX_DEPTH, Snow}},
      crate::{Mode, START_MARKER},
-     bevy::prelude::*,
-     winterjam2026::{human_written_code::{S1, S2, S3, S8, SAYINGS, make_speech_bubble,
+     bevy::{audio::{SpatialScale, Volume}, prelude::*},
+     winterjam2026::{scene::{SceneSettings, SoundSettings},
+                     human_written_code::{S1, S2, S3, S8, SAYINGS, end_screen, make_controls_popup, make_speech_bubble, safe_zone_popup,
                                           popup_penguin_killed, popup_penguin_rescued},
                      model::LowPoly,
                      terrain::Terrain,
@@ -79,6 +82,9 @@ const STARTS_BURIED: f32 = 0.85;
 const PENGUIN_WADE_DEPTH: f32 = 0.35;
 /// World units per second on bare ground.
 const PENGUIN_SPEED: f32 = 3.0;
+/// World units per second the messenger goes, faster than the guy sprints so it
+/// keeps up with him.
+const MESSENGER_SPEED: f32 = RUN_SPEED * 1.25;
 /// The share of their speed penguins keep in the deepest snow they get through.
 const PENGUIN_WADING_SPEED: f32 = 0.5;
 /// How close penguins following the guy come up to him, in world units.
@@ -99,6 +105,9 @@ const BEAR_EAT_SECONDS: f32 = 8.0;
 const FADE_SECONDS: f32 = 10.0;
 /// How far apart bears keep from each other, in world units.
 const BEAR_SPACING: f32 = 3.5;
+/// How far from the shelter bears' middles are kept, in world units: out of its yard
+/// with their bodies too, but still near enough to catch a penguin just outside.
+const BEAR_KEEP_OUT: f32 = SHELTER_RADIUS + 1.5;
 /// Seconds between a bear's swipes at the guy.
 const SWIPE_SECONDS: f32 = 1.5;
 /// How near a bear has to be to the guy for his shovel to hit it, in world units.
@@ -108,6 +117,14 @@ const SHOVEL_REACH: f32 = 3.5;
 const BEAR_HEALTH: f32 = 100.0;
 const SHOVEL_DAMAGE: f32 = BEAR_HEALTH;
 const STUN_SECONDS: f32 = 12.0;
+/// The sound a hunting bear growls now and then, and the seconds between its growls:
+/// at least [`GROWL_SECONDS`], and up to [`GROWL_SPREAD`] more.
+const GROWL_SOUND: &str = "bear";
+const GROWL_SECONDS: f32 = 15.0;
+const GROWL_SPREAD: f32 = 15.0;
+/// How near a growl is heard at its loudest, in world units. Farther off it gets
+/// quieter with the square of the distance.
+const GROWL_LOUD_WITHIN: f32 = 12.0;
 /// Which way the models face at rest, along the ground's x and z: what's turned toward
 /// where they're going.
 const PENGUIN_FRONT: Vec2 = Vec2::Y;
@@ -128,6 +145,8 @@ const BEARS_AFTER_FIRST_RESCUE: f32 = 20.0;
 enum Step {
   /// The messenger walks up to the guy.
   ComeToGuy,
+  /// The safe zone's sign goes up over the shelter, for the rest of play.
+  ShowSafeZone,
   /// The messenger says this, the camera turned to look at it meanwhile.
   Say(&'static str),
   /// The camera swings over to each of the penguins still to be saved in turn, then back.
@@ -138,19 +157,25 @@ enum Step {
   ShowBears,
   /// The messenger walks back to where it was.
   GoHome,
+  /// This music starts playing, from its start.
+  PlayMusic(Tune),
+  /// The music fades out.
+  StopMusic,
   /// Nothing happens until this many seconds after the first penguin is saved.
   AfterFirstRescue(f32),
-  /// The rescue starts.
+  /// The rescue starts, and how to fight the bears is shown.
   StartRescue
 }
 
 /// What the messenger penguin does when play starts, in order.
-const WELCOME: [Step; 3] = [Step::ComeToGuy, Step::Say(S8), Step::GoHome];
+const WELCOME: [Step; 4] =
+  [Step::ComeToGuy, Step::PlayMusic(Tune::Welcome), Step::Say(S8), Step::GoHome];
 
 /// What the messenger penguin does in the briefing, in order, ending with the rescue
 /// starting.
-const BRIEFING: [Step; 11] = [
+const BRIEFING: [Step; 14] = [
   Step::ComeToGuy,
+  Step::ShowSafeZone,
   Step::Say(S1),
   Step::ShowPenguins,
   Step::Say(S2),
@@ -158,7 +183,9 @@ const BRIEFING: [Step; 11] = [
   Step::GoHome,
   Step::AfterFirstRescue(BEARS_AFTER_FIRST_RESCUE),
   Step::ComeToGuy,
+  Step::StopMusic,
   Step::Say(S3),
+  Step::PlayMusic(Tune::Bears),
   Step::ShowBears,
   Step::StartRescue
 ];
@@ -178,7 +205,6 @@ const REPORT_REACH: f32 = 4.0;
 const SKIP_KEY: KeyCode = KeyCode::F2;
 
 const RESCUE_SCREEN: &str = "rescue";
-const OVER_SCREEN: &str = "rescue over";
 /// The counts screens can show, as `{name}`.
 const COUNTS: [&str; 4] = ["penguins", "penguins saved", "penguins caught", "penguins left"];
 
@@ -319,6 +345,8 @@ struct Bear {
   stunned: f32,
   /// Seconds until it can swipe at the guy again.
   swipe: f32,
+  /// Seconds of hunting until it growls next.
+  growl: f32,
   doing: BearDoing
 }
 
@@ -330,6 +358,7 @@ impl Bear {
     health: BEAR_HEALTH,
     stunned: 0.0,
     swipe: 0.0,
+    growl: 0.0,
     doing: BearDoing::Waiting
   };
 }
@@ -421,7 +450,7 @@ fn setup(
       .position(SHELTER_MARKER)
       .or_else(|| markers.position(START_MARKER))
       .map_or(Vec2::ZERO, |position| position.xz());
-    snow.yards.push((xz, SHELTER_RADIUS));
+    snow.keep_clear(xz, SHELTER_RADIUS);
     commands.insert_resource(Shelter { xz });
     let mut penguins = 0;
     placed.iter().for_each(|(entity, Model { path }, &transform)| {
@@ -441,11 +470,14 @@ fn setup(
           }));
           (penguin.id(), RESCUE_BEACON)
         }
-        // Hidden until the briefing shows them, beacon and all.
-        BEAR_MODEL => (
-          commands.spawn((copy, Animate::new(IDLE), Bear::FRESH)).insert(Visibility::Hidden).id(),
-          BEAR_BEACON
-        ),
+        // Hidden until the briefing shows them, beacon and all. Each first growls a
+        // different while into the hunt, so they don't all growl at once.
+        BEAR_MODEL => {
+          let first_growl =
+            snow::hash(transform.translation.x as i32, transform.translation.z as i32);
+          let bear = Bear { growl: first_growl * GROWL_SPREAD, ..Bear::FRESH };
+          (commands.spawn((copy, Animate::new(IDLE), bear)).insert(Visibility::Hidden).id(), BEAR_BEACON)
+        }
         _ => return
       };
       let height = model_top(path) + BEACON_GAP;
@@ -561,6 +593,7 @@ fn brief(
   mut bears: Query<(&Transform, &mut Visibility), (With<Bear>, Without<Messenger>)>,
   cutscene: Option<Res<Cutscene>>,
   tally: Res<Tally>,
+  shelter: Res<Shelter>,
   mut happened: MessageWriter<Happened>,
   mut next: ResMut<NextState<Stage>>,
   mut commands: Commands
@@ -582,7 +615,7 @@ fn brief(
     let mut walk_to = |goal: Vec2, near: f32| {
       let there = xz.distance(goal) <= near;
       if !there {
-        walk(&mut transform, PENGUIN_FRONT, goal, PENGUIN_SPEED, time.delta_secs(), &terrain)
+        walk(&mut transform, PENGUIN_FRONT, goal, MESSENGER_SPEED, time.delta_secs(), &terrain)
       }
       animate.play(if there { PENGUIN_IDLE } else { WALK });
       there
@@ -593,7 +626,7 @@ fn brief(
       Some(&Step::Say(line)) => {
         if messenger.seconds == 0.0 {
           happened.write(Happened(format!("Penguin: {line}")));
-          make_speech_bubble(&time, &mut commands, entity, line);
+          make_speech_bubble(&time, &mut commands, entity, line, false);
           commands.insert_resource(LookAt(entity))
         }
         messenger.seconds
@@ -623,10 +656,27 @@ fn brief(
         animate.play(PENGUIN_IDLE);
         show(tour, messenger.seconds)
       }
+      Some(Step::ShowSafeZone) => {
+        // Hung from an empty spot on the ground there.
+        let &Shelter { xz } = &*shelter;
+        let ground = Vec3::new(xz.x, terrain.height(xz), xz.y);
+        let spot = commands.spawn((PlayOnly, Transform::from_translation(ground))).id();
+        safe_zone_popup(&mut commands, spot);
+        true
+      }
+      Some(&Step::PlayMusic(tune)) => {
+        commands.insert_resource(Music(Some(tune)));
+        true
+      }
+      Some(Step::StopMusic) => {
+        commands.insert_resource(Music(None));
+        true
+      }
       Some(&Step::AfterFirstRescue(seconds)) => {
         tally.first_saved.is_some_and(|at| time.elapsed_secs() - at >= seconds)
       }
       Some(Step::StartRescue) => {
+        make_controls_popup(&time, &mut commands);
         next.set(Stage::Rescue);
         true
       }
@@ -809,7 +859,7 @@ fn greet(
         info!("penguin {entity} approached, says something: {says}");
         if says && let Some(&line) = SAYINGS.get(pick.min(SAYINGS.len().saturating_sub(1))) {
           happened.write(Happened(format!("Penguin: {line}")));
-          make_speech_bubble(&time, &mut commands, entity, line)
+          make_speech_bubble(&time, &mut commands, entity, line, true)
         }
       }
     })
@@ -1067,8 +1117,8 @@ fn move_bears(
       let mut xz = transform.translation.xz() + push;
       // Kept out of the shelter's yard.
       let from_shelter = xz - shelter.xz;
-      if from_shelter.length() < SHELTER_RADIUS {
-        xz = shelter.xz + from_shelter.normalize_or(Vec2::X) * SHELTER_RADIUS
+      if from_shelter.length() < BEAR_KEEP_OUT {
+        xz = shelter.xz + from_shelter.normalize_or(Vec2::X) * BEAR_KEEP_OUT
       }
       transform.translation = Vec3::new(xz.x, terrain.height(xz), xz.y)
     }
@@ -1081,7 +1131,8 @@ fn tally_up(
   mut values: ResMut<UiValues>,
   mut shown: ResMut<ShownScreens>,
   mut happened: MessageWriter<Happened>,
-  mut next: ResMut<NextState<Stage>>
+  mut next: ResMut<NextState<Stage>>,
+  mut commands: Commands
 ) {
   let Tally { penguins, saved, caught, .. } = *tally;
   COUNTS.iter().zip([penguins, saved, caught, tally.left()]).for_each(
@@ -1095,7 +1146,7 @@ fn tally_up(
       "Rescue over: {saved} of {penguins} penguins saved, {caught} caught"
     )));
     shown.remove(RESCUE_SCREEN);
-    shown.insert(OVER_SCREEN.into());
+    end_screen(&mut commands, caught as u32, saved as u32);
     next.set(Stage::AfterRescue)
   }
 }
@@ -1109,6 +1160,38 @@ fn finish(mut values: ResMut<UiValues>, mut commands: Commands) {
   commands.remove_resource::<Tally>();
   commands.remove_resource::<Ways>();
   commands.remove_resource::<Welcomed>()
+}
+
+/// Each hunting bear growls every [`GROWL_SECONDS`] or so, heard from where it is.
+fn growl(
+  time: Res<Time>,
+  settings: Res<SceneSettings>,
+  asset_server: Res<AssetServer>,
+  mut bears: Query<(Entity, &mut Bear)>,
+  mut commands: Commands
+) {
+  let SoundSettings { master, growls, .. } = settings.sound;
+  let sound = audio::file(GROWL_SOUND);
+  bears
+    .iter_mut()
+    .filter(|(_, bear)| matches!(bear.doing, BearDoing::Hunting(_) | BearDoing::CantReach(_)))
+    .for_each(|(entity, mut bear)| {
+      bear.growl -= time.delta_secs();
+      if bear.growl <= 0.0 {
+        let spread = snow::hash(entity.to_bits() as i32, time.elapsed_secs() as i32);
+        bear.growl = GROWL_SECONDS + spread * GROWL_SPREAD;
+        sound.iter().for_each(|path| {
+          commands.entity(entity).with_child((
+            AudioPlayer::new(asset_server.load(path)),
+            PlaybackSettings::DESPAWN
+              .with_volume(Volume::Linear(master * growls))
+              .with_spatial(true)
+              .with_spatial_scale(SpatialScale::new(1.0 / GROWL_LOUD_WITHIN)),
+            Transform::default()
+          ));
+        })
+      }
+    })
 }
 
 /// The rescue's systems during play, in order, to run after the snow's.
@@ -1125,7 +1208,9 @@ pub fn update() -> impl IntoScheduleConfigs<bevy::ecs::system::ScheduleSystem, (
       search_ways,
       brief.run_if(in_state(Stage::Briefing)),
       move_penguins,
-      move_bears.run_if(in_state(Stage::Rescue).or_else(in_state(Stage::AfterRescue))),
+      (move_bears, growl)
+        .chain()
+        .run_if(in_state(Stage::Rescue).or_else(in_state(Stage::AfterRescue))),
       follow_beacons,
       fade_remains,
       tally_up.run_if(in_state(Stage::Rescue)),

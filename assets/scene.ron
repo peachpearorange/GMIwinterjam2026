@@ -103,9 +103,10 @@
     ),
     sound: (
         master: 1.0,
-        music: 1.0,
+        music: 0.5,
         wind: 1.0,
         steps: 1.0,
         digging: 1.0,
+        growls: 1.0,
     ),
 )
