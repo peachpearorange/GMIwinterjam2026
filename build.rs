@@ -9,6 +9,9 @@ use std::{env, fs,
 const ASSETS_DIR: &str = "assets";
 /// Extensions of asset files that RON files may name, by their path in `assets/`.
 const NAMEABLE: [&str; 6] = ["png", "glb", "gltf", "ron", "ttf", "otf"];
+/// The start of music files' paths in `assets/`. On the web, music plays in the page,
+/// from files beside it, so it's left out there.
+const MUSIC: &str = "sounds/music ";
 
 /// Every file in `dir` and its subfolders, leaving out hidden ones like `.gitkeep`.
 fn files(dir: &Path) -> Vec<PathBuf> {
@@ -68,8 +71,10 @@ fn embedded() -> String {
   }
 
   let root = env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
+  let web = env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|arch| arch == "wasm32");
   files
     .iter()
+    .filter(|path| !(web && relative(path).to_string_lossy().starts_with(MUSIC)))
     .map(|path| {
       format!(
         "({:?}, include_bytes!({:?})),\n",

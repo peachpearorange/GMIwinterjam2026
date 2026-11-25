@@ -25,6 +25,7 @@ use {crate::{Mode, START_MARKER},
             input::mouse::AccumulatedMouseMotion,
             prelude::*,
             ui_widgets::Dialog,
+            winit::RawWinitWindowEvent,
             window::{CursorGrabMode, CursorOptions, PrimaryWindow}},
      winterjam2026::{billboard::{Billboard, BillboardMode, WorldCamera},
                      human_written_code::timed_despawn,
@@ -189,6 +190,34 @@ impl Swing {
     pull(looking, focus_velocity, focus);
     pull(was_up, up_velocity, up)
   }
+}
+
+/// Whether each Shift key, left and right, is held, from the keyboard's own presses and
+/// releases. Bevy's [`ButtonInput`] lets Shift go whenever anything says it's up, and
+/// in a browser moving the mouse while it's held in the window does, Shift held or not.
+#[derive(Resource, Default)]
+struct HeldShift([bool; 2]);
+
+/// Keeps [`HeldShift`] up to date, letting go of both when the window loses focus, as
+/// their releases go elsewhere.
+fn hold_shift(mut events: MessageReader<RawWinitWindowEvent>, mut held: ResMut<HeldShift>) {
+  use winit::{event::{KeyEvent, WindowEvent},
+              keyboard::{KeyCode, PhysicalKey}};
+  events.read().for_each(|RawWinitWindowEvent { event, .. }| match event {
+    WindowEvent::KeyboardInput {
+      event: KeyEvent { physical_key: PhysicalKey::Code(code), state, .. },
+      ..
+    } => {
+      let side = match code {
+        KeyCode::ShiftLeft => Some(0),
+        KeyCode::ShiftRight => Some(1),
+        _ => None
+      };
+      side.into_iter().for_each(|side| held.0[side] = state.is_pressed())
+    }
+    WindowEvent::Focused(false) => held.0 = [false; 2],
+    _ => ()
+  })
 }
 
 /// Where the camera looks from and toward.
@@ -544,6 +573,7 @@ fn aim_camera(
 fn move_player(
   follow: Res<FollowCamera>,
   keys: Res<ButtonInput<KeyCode>>,
+  shift: Res<HeldShift>,
   time: Res<Time>,
   terrain: Res<Terrain>,
   snow: Option<Res<snow::Snow>>,
@@ -559,7 +589,7 @@ fn move_player(
     axis([KeyCode::KeyS, KeyCode::ArrowDown], [KeyCode::KeyW, KeyCode::ArrowUp])
   );
   let direction = (Quat::from_rotation_y(follow.yaw) * input).xz().normalize_or_zero();
-  let speed = if keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
+  let speed = if shift.0.contains(&true) {
     RUN_SPEED
   } else {
     WALK_SPEED
@@ -767,6 +797,7 @@ fn finish(
   shown.clear();
   commands.remove_resource::<audio::Footsteps>();
   commands.remove_resource::<audio::Music>();
+  commands.remove_resource::<snowfall::Started>();
   commands.remove_resource::<Cutscene>();
   commands.remove_resource::<LookAt>();
   commands.remove_resource::<Overview>();
@@ -779,8 +810,9 @@ pub fn plugin(app: &mut App) {
     .add_sub_state::<Stage>()
     .add_plugins((snow::plugin, rescue::plugin, shots::plugin, happenings::plugin))
     .init_resource::<FollowCamera>()
+    .init_resource::<HeldShift>()
     .add_message::<shovel::ShovelHit>()
-    .add_systems(OnEnter(Mode::Play), (start, audio::start, snowfall::start))
+    .add_systems(OnEnter(Mode::Play), (start, audio::start))
     .add_systems(OnExit(Mode::Play), finish)
     .add_systems(
       Update,
@@ -792,6 +824,7 @@ pub fn plugin(app: &mut App) {
         shots::update(),
         toggle_overview,
         aim_camera,
+        hold_shift,
         move_player
           .run_if(not(resource_exists::<Cutscene>))
           .run_if(not(resource_exists::<Overview>))
@@ -805,6 +838,7 @@ pub fn plugin(app: &mut App) {
         shovel::update,
         follow_player,
         letterbox,
+        snowfall::start.run_if(not(resource_exists::<snowfall::Started>)),
         snowfall::update
       )
         .chain()

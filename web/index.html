@@ -29,6 +29,27 @@
     const resume = () => contexts.forEach(context => context.state !== "running" && context.resume());
     ["pointerdown", "keydown", "touchstart"].forEach(event => document.addEventListener(event, resume, true));
   })();
+  // Browsers only go fullscreen in answer to a click or key press: a click goes
+  // fullscreen whenever it isn't, as it also takes the mouse back, and F goes in or out.
+  (() => {
+    const page = document.documentElement;
+    // Going fullscreen uses up the click, so the game's own request to hold the mouse,
+    // which comes a moment later, would fail: hold it here first, on the same click,
+    // and again once fullscreen in case going fullscreen let it go.
+    const holdMouse = () => {
+      const canvas = document.querySelector("canvas");
+      if (canvas && document.pointerLockElement !== canvas) {
+        Promise.resolve(canvas.requestPointerLock?.()).catch(() => {});
+      }
+    };
+    const enter = () => !document.fullscreenElement && page.requestFullscreen?.().catch(() => {});
+    document.addEventListener("pointerdown", () => { holdMouse(); enter(); }, true);
+    document.addEventListener("fullscreenchange", () => document.fullscreenElement && holdMouse());
+    document.addEventListener("keydown", event => {
+      if (event.code !== "KeyF" || event.repeat) return;
+      if (document.fullscreenElement) document.exitFullscreen?.(); else enter();
+    }, true);
+  })();
   // Hide the spinner once Bevy has put its canvas in the page.
   new MutationObserver((_, observer) => {
     if (document.querySelector("canvas")) { document.getElementById("loading").remove(); observer.disconnect(); }

@@ -12,6 +12,12 @@ serde = { version = "1.0.229", features = ["derive"] }
 bevy_mod_openxr = { path = "vendor/bevy_oxr/crates/bevy_openxr", optional = true, features = ["window_support"] }
 bevy_mod_xr = { path = "vendor/bevy_oxr/crates/bevy_xr", optional = true }
 openxr = { version = "0.21.1", optional = true }
+# Bevy's own, for its raw keyboard events.
+winit = { version = "0.30", default-features = false }
+
+# On the web, music plays in the page, through these.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["HtmlAudioElement", "HtmlMediaElement"] }
 
 [build-dependencies]
 ron = "0.12.3"

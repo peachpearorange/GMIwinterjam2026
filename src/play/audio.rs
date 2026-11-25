@@ -6,7 +6,8 @@
 //! missing is silent:
 //! - `wind` and `digging` loop.
 //! - `music welcome` and `music bears` are the [`Tune`]s, each looping from its start
-//!   while it's the [`Music`] playing.
+//!   while it's the [`Music`] playing. On the web they play in the page instead, from
+//!   copies beside it.
 //! - `step snow` plays for steps on fallen snow, `step <material>` for steps on ground
 //!   painted with that material, and `step` when there's neither.
 //! - Footsteps can have variants, `step snow 1`, `step snow 2` and on, picked between.
@@ -112,6 +113,7 @@ pub struct Music(pub Option<Tune>);
 
 /// Plays a tune from its start, looping, and fades it out once it's not the [`Music`]
 /// any more.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Component)]
 pub struct PlayingTune {
   tune: Tune,
@@ -234,6 +236,7 @@ pub fn update(
 
 /// Starts the [`Music`] from its start when it isn't playing yet, and fades out any
 /// other tune still playing.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn play_music(
   time: Res<Time>,
   settings: Res<SceneSettings>,
@@ -266,5 +269,49 @@ pub fn play_music(
     } else if let Some(mut sink) = sink {
       sink.set_volume(Volume::Linear(playing.level * volume * master * playing.tune.loudness()))
     }
+  })
+}
+
+/// Where tunes' files are on the web, beside the page.
+#[cfg(target_arch = "wasm32")]
+const PAGE_MUSIC_DIR: &str = "sounds";
+
+thread_local! {
+  /// On the web, each tune playing in the page, and how loud it still is, 0..1.
+  #[cfg(target_arch = "wasm32")]
+  static PAGE_TUNES: std::cell::RefCell<Vec<(Tune, web_sys::HtmlAudioElement, f32)>> =
+    Default::default();
+}
+
+/// On the web, plays the [`Music`] in the page rather than in the game, from its file in
+/// [`PAGE_MUSIC_DIR`], so a slow frame can't make it stutter: the browser plays it by
+/// itself. Starts it from its start when it isn't playing yet, and fades out any other
+/// tune still playing.
+#[cfg(target_arch = "wasm32")]
+pub fn play_music(time: Res<Time>, settings: Res<SceneSettings>, music: Res<Music>) {
+  let SoundSettings { master, music: volume, .. } = settings.sound;
+  let &Music(wanted) = &*music;
+  let fade = time.delta_secs() / MUSIC_FADE_SECONDS;
+  PAGE_TUNES.with_borrow_mut(|tunes| {
+    if let Some(tune) = wanted
+      && !tunes.iter().any(|(playing, ..)| *playing == tune)
+      && let Ok(page) =
+        web_sys::HtmlAudioElement::new_with_src(&format!("{PAGE_MUSIC_DIR}/{}.ogg", tune.name()))
+    {
+      page.set_loop(true);
+      tunes.push((tune, page, 1.0))
+    }
+    tunes.retain_mut(|(tune, page, level)| {
+      *level = if wanted == Some(*tune) { 1.0 } else { *level - fade };
+      page.set_volume((*level * volume * master * tune.loudness()).clamp(0.0, 1.0) as f64);
+      // Browsers refuse to play until the player clicks or presses a key, so it keeps
+      // asking until then.
+      if *level > 0.0 && page.paused() {
+        page.play().ok();
+      } else if *level <= 0.0 {
+        page.pause().ok();
+      }
+      *level > 0.0
+    })
   })
 }

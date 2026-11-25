@@ -66,7 +66,12 @@ fn flake_scale() -> f32 {
   if widest.is_finite() && widest > 0.0 { FLAKE_SIZE / widest } else { 1.0 }
 }
 
-/// Scatters the flakes through the box around the camera.
+/// Snow has started falling this play.
+#[derive(Resource)]
+pub struct Started;
+
+/// Scatters the flakes through the box around the camera, once there's a camera: play
+/// can start before it's made, when the game starts straight into it.
 pub fn start(
   camera: Single<&Transform, With<WorldCamera>>,
   mut model_meshes: ResMut<ModelMeshes>,
@@ -76,6 +81,7 @@ pub fn start(
   mut images: ResMut<Assets<Image>>,
   mut commands: Commands
 ) {
+  commands.insert_resource(Started);
   let parts = model_meshes
     .get(FLAKE_MODEL, &model_materials, &mut meshes)
     .iter()
