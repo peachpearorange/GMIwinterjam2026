@@ -307,9 +307,12 @@ const BACK_FROM_OVERVIEW_SECONDS: f32 = 1.4;
 /// How much of the most the [`Overview`] could see without seeing past the world's edge
 /// it sees, so it doesn't quite reach it.
 const OVERVIEW_MARGIN: f32 = 0.97;
+/// Radians the [`Overview`] leans back from looking straight down, so it sees the
+/// ground a little from the side.
+const OVERVIEW_TILT: f32 = 0.35;
 
-/// The camera up high over the middle of the world, looking straight down, seeing as
-/// much of it as it can without seeing past its edge. `up` is the way along the ground
+/// The camera up high over the player, looking down at him, leaning back a little by
+/// [`OVERVIEW_TILT`], as high as it would see the whole world from over its middle. `up` is the way along the ground
 /// that's up the screen: the way the player faced, to the nearest of x and z. The player
 /// stands still meanwhile, and while the camera is `leaving` it to fly back to his eyes.
 #[derive(Resource)]
@@ -327,17 +330,24 @@ struct Leaving {
 }
 
 impl Overview {
-  /// Where the camera looks down from, at what, for terrain `extent` wide along x and z
-  /// whose lowest ground is at `lowest`, seen with vertical field of view `fov` in
-  /// radians and screen width per height `aspect`.
-  fn looking(&self, extent: Vec2, lowest: f32, fov: f32, aspect: f32) -> (Vec3, Vec3) {
+  /// Where the camera looks down from, at what, for the player at `player` on terrain
+  /// `extent` wide along x and z whose lowest ground is at `lowest`, seen with vertical
+  /// field of view `fov` in radians and screen width per height `aspect`.
+  fn looking(
+    &self,
+    player: Vec3,
+    extent: Vec2,
+    lowest: f32,
+    fov: f32,
+    aspect: f32
+  ) -> (Vec3, Vec3) {
     let half = extent / 2.0;
     // Half the screen's height and width along the ground, per unit of height.
     let (tall, wide) = ((fov / 2.0).tan(), (fov / 2.0).tan() * aspect);
     let (along_up, across) = if self.up.x != 0.0 { (half.x, half.y) } else { (half.y, half.x) };
     let height = (along_up / tall).min(across / wide) * OVERVIEW_MARGIN;
-    let below = Vec3::Y * lowest;
-    (below + Vec3::Y * height, below)
+    let above = player.with_y(lowest) + Vec3::Y * height;
+    (above - self.up * height * OVERVIEW_TILT.tan(), player)
   }
 }
 
@@ -673,7 +683,7 @@ fn follow_player(
         }
       });
       let lowest = terrain.heights.iter().flatten().copied().fold(f32::INFINITY, f32::min);
-      let (at, below) = overview.looking(terrain.size(), lowest, fov, aspect);
+      let (at, below) = overview.looking(player.translation, terrain.size(), lowest, fov, aspect);
       (at, below, overview.up)
     });
     let (goal, goal_focus, goal_up) = shot

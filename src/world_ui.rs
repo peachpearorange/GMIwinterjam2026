@@ -66,6 +66,19 @@ pub fn render_in_world_sized(
     .id();
   let root = commands.spawn_scene(ui).insert(ChildOf(canvas)).id();
   commands.queue(move |world: &mut World| {
+    // Replacing what was shown above it already, which would otherwise hang in the
+    // same place, covering it.
+    let shown = world
+      .query::<&InWorld>()
+      .iter(world)
+      .filter(|shown| shown.over == over)
+      .map(|shown| shown.root)
+      .collect::<Vec<_>>();
+    shown.into_iter().for_each(|old| {
+      if let Ok(old) = world.get_entity_mut(old) {
+        old.despawn()
+      }
+    });
     let Extent3d { width, height, .. } = picture_size(size, world.resource::<UiScale>().0);
     let image = world.resource_mut::<Assets<Image>>().add(Image::new_target_texture(
       width,

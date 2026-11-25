@@ -132,7 +132,8 @@ pub fn make_speech_bubble(
     }
   };
   if show_in_ui {
-    c.spawn_scene(ui());
+    make_ui_popup(time, c, msg.to_string());
+    // c.spawn_scene(ui());
   }
   render_in_world(c, e, ui());
 }

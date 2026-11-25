@@ -1,8 +1,9 @@
 //! The rescue, once the snow is deep. When play starts, the penguin nearest the guy
-//! comes over to [`WELCOME`] him and goes home again. Once the snow is deep, the [`BRIEFING`]: the penguin nearest the
-//! guy wades over to tell him what's going on, goes home to give him time to start
-//! digging, and comes back to warn him of the bears [`BEARS_AFTER_FIRST_RESCUE`]
-//! seconds after the first penguin is saved. Then the bears come. Penguins are snowed in where they stand and can
+//! comes over to [`WELCOME`] him and goes home again. Once the snow is deep, the
+//! [`BRIEFING`]: the penguin nearest the guy wades over to tell him what's going on and
+//! goes home to give him time to start digging. [`BEARS_AFTER_FIRST_RESCUE`] seconds
+//! after the first penguin is saved, the penguin nearest him then comes to give the
+//! [`WARNING`] of the bears, and goes back to where it was. Then the bears come. Penguins are snowed in where they stand and can
 //! only waddle through snow the guy has dug down, so he digs ways for them to the
 //! shelter, whose yard is always kept clear. Freed penguins head for the shelter when a
 //! dug way leads there, and otherwise follow the guy along his trenches. Polar bears
@@ -161,8 +162,6 @@ enum Step {
   PlayMusic(Tune),
   /// The music fades out.
   StopMusic,
-  /// Nothing happens until this many seconds after the first penguin is saved.
-  AfterFirstRescue(f32),
   /// The rescue starts, and how to fight the bears is shown.
   StartRescue
 }
@@ -171,23 +170,27 @@ enum Step {
 const WELCOME: [Step; 4] =
   [Step::ComeToGuy, Step::PlayMusic(Tune::Welcome), Step::Say(S8), Step::GoHome];
 
-/// What the messenger penguin does in the briefing, in order, ending with the rescue
-/// starting.
-const BRIEFING: [Step; 14] = [
+/// What the messenger penguin does in the briefing, in order.
+const BRIEFING: [Step; 7] = [
   Step::ComeToGuy,
   Step::ShowSafeZone,
   Step::Say(S1),
   Step::ShowPenguins,
   Step::Say(S2),
   Step::ShowShovel,
-  Step::GoHome,
-  Step::AfterFirstRescue(BEARS_AFTER_FIRST_RESCUE),
+  Step::GoHome
+];
+
+/// What the messenger penguin does to warn of the bears, in order, starting the rescue
+/// and going back to where it was.
+const WARNING: [Step; 7] = [
   Step::ComeToGuy,
   Step::StopMusic,
   Step::Say(S3),
   Step::PlayMusic(Tune::Bears),
   Step::ShowBears,
-  Step::StartRescue
+  Step::StartRescue,
+  Step::GoHome
 ];
 
 /// The chance a penguin says one of the [`SAYINGS`], picked at random, the first time
@@ -534,9 +537,14 @@ fn appoint_messenger(
   commands: &mut Commands
 ) -> bool {
   let chosen = players.single().ok().and_then(|guy| {
-    penguins.iter_mut().min_by(|a, b| {
-      a.1.translation.distance(guy.translation).total_cmp(&b.1.translation.distance(guy.translation))
-    })
+    penguins
+      .iter_mut()
+      .filter(|(_, _, penguin, _)| {
+        !matches!(penguin.doing, PenguinDoing::Attacked | PenguinDoing::Dead)
+      })
+      .min_by(|a, b| {
+        a.1.translation.distance(guy.translation).total_cmp(&b.1.translation.distance(guy.translation))
+      })
   });
   let found = chosen.is_some();
   if let Some((penguin, at, mut chosen, messenger)) = chosen {
@@ -582,6 +590,24 @@ fn choose_messenger(
   }
 }
 
+/// Has a penguin come to give the [`WARNING`] of the bears once they're due, after the
+/// briefing's messenger has gone home, or starts the rescue straight away without one.
+fn warn(
+  time: Res<Time>,
+  tally: Res<Tally>,
+  players: Query<&Transform, With<Player>>,
+  mut penguins: Query<(Entity, &Transform, &mut Penguin, Option<&Messenger>)>,
+  mut next: ResMut<NextState<Stage>>,
+  mut commands: Commands
+) {
+  if tally.first_saved.is_some_and(|at| time.elapsed_secs() - at >= BEARS_AFTER_FIRST_RESCUE)
+    && penguins.iter().all(|(.., messenger)| messenger.is_none())
+    && !appoint_messenger(&WARNING, &players, &mut penguins, &mut commands)
+  {
+    next.set(Stage::Rescue)
+  }
+}
+
 /// Walks the messenger through its script, and lets it go after.
 fn brief(
   time: Res<Time>,
@@ -592,7 +618,6 @@ fn brief(
   penguins: Query<(&Transform, &Penguin), Without<Messenger>>,
   mut bears: Query<(&Transform, &mut Visibility), (With<Bear>, Without<Messenger>)>,
   cutscene: Option<Res<Cutscene>>,
-  tally: Res<Tally>,
   shelter: Res<Shelter>,
   mut happened: MessageWriter<Happened>,
   mut next: ResMut<NextState<Stage>>,
@@ -671,9 +696,6 @@ fn brief(
       Some(Step::StopMusic) => {
         commands.insert_resource(Music(None));
         true
-      }
-      Some(&Step::AfterFirstRescue(seconds)) => {
-        tally.first_saved.is_some_and(|at| time.elapsed_secs() - at >= seconds)
       }
       Some(Step::StartRescue) => {
         make_controls_popup(&time, &mut commands);
@@ -1206,7 +1228,9 @@ pub fn update() -> impl IntoScheduleConfigs<bevy::ecs::system::ScheduleSystem, (
     start_when_deep.run_if(in_state(Stage::Snowfall)),
     (
       search_ways,
-      brief.run_if(in_state(Stage::Briefing)),
+      warn.run_if(in_state(Stage::Briefing)),
+      // Going on once the rescue starts, so the messenger gets back and is let go.
+      brief,
       move_penguins,
       (move_bears, growl)
         .chain()
