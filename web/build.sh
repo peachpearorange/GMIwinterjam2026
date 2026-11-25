@@ -9,8 +9,9 @@ rm -rf web/dist && mkdir -p web/dist
 wasm-bindgen --target web --no-typescript --out-dir web/dist --out-name game \
   target/wasm32-unknown-unknown/web/winterjam2026.wasm
 cp web/index.html web/dist/
-# The music plays in the page, from files beside it, rather than in the game.
-mkdir -p web/dist/sounds && cp assets/sounds/music\ *.ogg web/dist/sounds/
+# The music and the bears' growl play in the page, from files beside it, rather than in
+# the game.
+mkdir -p web/dist/sounds && cp assets/sounds/music\ *.ogg assets/sounds/bear.ogg web/dist/sounds/
 rm -f web/winterjam2026-web.zip
 (cd web/dist && zip -9 -q -r ../winterjam2026-web.zip .)
 ls -la web/winterjam2026-web.zip

@@ -21,6 +21,8 @@ use {super::{PlayOnly, Player,
      winterjam2026::{assets,
                      scene::{SceneSettings, SoundSettings},
                      terrain::Terrain}};
+#[cfg(target_arch = "wasm32")]
+use winterjam2026::billboard::WorldCamera;
 
 /// Directory sounds live in, in the assets.
 const SOUNDS_DIR: &str = "sounds";
@@ -272,7 +274,7 @@ pub fn play_music(
   })
 }
 
-/// Where tunes' files are on the web, beside the page.
+/// Where tunes' and other sounds' files are on the web, beside the page.
 #[cfg(target_arch = "wasm32")]
 const PAGE_MUSIC_DIR: &str = "sounds";
 
@@ -312,6 +314,53 @@ pub fn play_music(time: Res<Time>, settings: Res<SceneSettings>, music: Res<Musi
         page.pause().ok();
       }
       *level > 0.0
+    })
+  })
+}
+
+thread_local! {
+  /// On the web, each sound playing in the page from something in the world: what it
+  /// comes from, the sound, how loud it is at its loudest, and how near it's that loud.
+  #[cfg(target_arch = "wasm32")]
+  static PAGE_SOUNDS: std::cell::RefCell<Vec<(Entity, web_sys::HtmlAudioElement, f32, f32)>> =
+    Default::default();
+}
+
+/// On the web, plays the sound called `name` once in the page rather than in the game,
+/// so a slow frame can't make it stutter, coming from `from`: as loud as `volume` within
+/// `loud_within` world units of the camera, and quieter with the square of the distance
+/// farther off, as [`follow_page_sounds`] keeps it.
+#[cfg(target_arch = "wasm32")]
+pub fn play_in_page(from: Entity, name: &str, volume: f32, loud_within: f32) {
+  if let Ok(page) = web_sys::HtmlAudioElement::new_with_src(&format!("{PAGE_MUSIC_DIR}/{name}.ogg"))
+  {
+    page.set_volume(0.0);
+    page.play().ok();
+    PAGE_SOUNDS.with_borrow_mut(|sounds| sounds.push((from, page, volume, loud_within)))
+  }
+}
+
+/// On the web, sets how loud each sound playing in the page is by how far what it comes
+/// from is from the camera, and forgets those that have ended. One whose source is gone
+/// stops.
+#[cfg(target_arch = "wasm32")]
+pub fn follow_page_sounds(
+  cameras: Query<&GlobalTransform, With<WorldCamera>>,
+  sources: Query<&GlobalTransform>
+) {
+  let camera = cameras.iter().next().map(GlobalTransform::translation);
+  PAGE_SOUNDS.with_borrow_mut(|sounds| {
+    sounds.retain(|&(from, ref page, volume, loud_within)| {
+      let away = camera
+        .zip(sources.get(from).ok())
+        .map(|(camera, source)| camera.distance(source.translation()));
+      if let Some(away) = away {
+        let falloff = (loud_within / away.max(f32::EPSILON)).powi(2).min(1.0);
+        page.set_volume((volume * falloff).clamp(0.0, 1.0) as f64)
+      } else {
+        page.pause().ok();
+      }
+      away.is_some() && !page.ended()
     })
   })
 }

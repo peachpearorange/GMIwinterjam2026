@@ -806,6 +806,8 @@ fn finish(
 }
 
 pub fn plugin(app: &mut App) {
+  #[cfg(target_arch = "wasm32")]
+  app.add_systems(Update, audio::follow_page_sounds.run_if(in_state(Mode::Play)));
   app
     .add_sub_state::<Stage>()
     .add_plugins((snow::plugin, rescue::plugin, shots::plugin, happenings::plugin))

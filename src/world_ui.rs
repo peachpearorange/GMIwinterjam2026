@@ -83,7 +83,8 @@ pub fn render_in_world_sized(
     let image = world.resource_mut::<Assets<Image>>().add(Image::new_target_texture(
       width,
       height,
-      TextureFormat::Bgra8UnormSrgb,
+      // Not Bgra8, which WebGL can't upload to.
+      TextureFormat::Rgba8UnormSrgb,
       None
     ));
     world.entity_mut(camera).insert((

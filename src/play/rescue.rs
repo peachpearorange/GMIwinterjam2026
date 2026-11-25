@@ -36,7 +36,7 @@ use {super::{Cutscene, Digs, Framing, HiddenInPlay, LookAt, PlayOnly, Player, RU
              shovel::{Shovel, ShovelHit},
              snow::{self, MAX_DEPTH, Snow}},
      crate::{Mode, START_MARKER},
-     bevy::{audio::{SpatialScale, Volume}, prelude::*},
+     bevy::prelude::*,
      winterjam2026::{scene::{SceneSettings, SoundSettings},
                      human_written_code::{S1, S2, S3, S8, SAYINGS, end_screen, make_controls_popup, make_speech_bubble, safe_zone_popup,
                                           popup_penguin_killed, popup_penguin_rescued},
@@ -1193,6 +1193,7 @@ fn growl(
   mut commands: Commands
 ) {
   let SoundSettings { master, growls, .. } = settings.sound;
+  #[cfg(not(target_arch = "wasm32"))]
   let sound = audio::file(GROWL_SOUND);
   bears
     .iter_mut()
@@ -1202,7 +1203,9 @@ fn growl(
       if bear.growl <= 0.0 {
         let spread = snow::hash(entity.to_bits() as i32, time.elapsed_secs() as i32);
         bear.growl = GROWL_SECONDS + spread * GROWL_SPREAD;
+        #[cfg(not(target_arch = "wasm32"))]
         sound.iter().for_each(|path| {
+          use bevy::audio::{SpatialScale, Volume};
           commands.entity(entity).with_child((
             AudioPlayer::new(asset_server.load(path)),
             PlaybackSettings::DESPAWN
@@ -1211,7 +1214,10 @@ fn growl(
               .with_spatial_scale(SpatialScale::new(1.0 / GROWL_LOUD_WITHIN)),
             Transform::default()
           ));
-        })
+        });
+        // On the web, in the page, so a slow frame can't make it stutter.
+        #[cfg(target_arch = "wasm32")]
+        audio::play_in_page(entity, GROWL_SOUND, master * growls, GROWL_LOUD_WITHIN)
       }
     })
 }
