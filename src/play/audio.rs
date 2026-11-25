@@ -305,7 +305,9 @@ pub fn play_music(time: Res<Time>, settings: Res<SceneSettings>, music: Res<Musi
     }
     tunes.retain_mut(|(tune, page, level)| {
       *level = if wanted == Some(*tune) { 1.0 } else { *level - fade };
-      page.set_volume((*level * volume * master * tune.loudness()).clamp(0.0, 1.0) as f64);
+      // Not clamp, which keeps NaN: the browser throws at a volume that isn't a number,
+      // which would leave winit's event loop stuck mid-frame.
+      page.set_volume((*level * volume * master * tune.loudness()).max(0.0).min(1.0) as f64);
       // Browsers refuse to play until the player clicks or presses a key, so it keeps
       // asking until then.
       if *level > 0.0 && page.paused() {
@@ -356,7 +358,8 @@ pub fn follow_page_sounds(
         .map(|(camera, source)| camera.distance(source.translation()));
       if let Some(away) = away {
         let falloff = (loud_within / away.max(f32::EPSILON)).powi(2).min(1.0);
-        page.set_volume((volume * falloff).clamp(0.0, 1.0) as f64)
+        // As in play_music, max and min turn NaN into silence rather than a throw.
+        page.set_volume((volume * falloff).max(0.0).min(1.0) as f64)
       } else {
         page.pause().ok();
       }
